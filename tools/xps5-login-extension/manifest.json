@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "XPS5 Login",
+  "short_name": "XPS5 Login",
+  "description": "Links the X account signed in to this browser to XPS5 on your PS5, over your home network.",
+  "version": "1.1.0",
+  "minimum_chrome_version": "121",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "Link X to XPS5",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js",
+    "scripts": ["background.js"]
+  },
+  "permissions": ["activeTab", "cookies", "storage"],
+  "host_permissions": ["https://x.com/*"],
+  "optional_host_permissions": ["http://*/*"],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "xps5-login@xps5",
+      "strict_min_version": "128.0",
+      "data_collection_permissions": {
+        "required": ["authenticationInfo"]
+      }
+    },
+    "gecko_android": {
+      "strict_min_version": "128.0"
+    }
+  }
+}

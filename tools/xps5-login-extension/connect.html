@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>XPS5 Login</title>
+  <link rel="stylesheet" href="connect.css">
+  <script src="connect.js" defer></script>
+</head>
+<body>
+  <main class="card">
+    <header class="head">
+      <h1 data-i18n="title">Link your X account to XPS5</h1>
+      <p class="lead" data-i18n="lead">This browser's x.com session goes to your PS5, so XPS5 opens signed in. No FTP, no files to copy.</p>
+    </header>
+
+    <ol class="steps">
+      <li data-i18n="step1">On the PS5, open XPS5, then Settings, X account, and press ✕. Or press Link from a PC where XPS5 says the session is missing.</li>
+      <li data-i18n="step2">Make sure x.com is open in this browser with the account you want on the PS5.</li>
+      <li data-i18n="step3">Scan the PS5's QR and press this extension's button on the page it opens, or type the address and the code the PS5 shows. Then press Link.</li>
+    </ol>
+
+    <form id="link" novalidate>
+      <div class="fields">
+        <div class="field">
+          <label for="address" data-i18n="addressLabel">PS5 address</label>
+          <input id="address" name="address" type="text" inputmode="decimal" autocomplete="off"
+                 spellcheck="false" placeholder="192.168.1.70" required aria-describedby="address-hint">
+          <p id="address-hint" class="hint" data-i18n="addressHint">As on the PS5's screen, for example 192.168.1.70</p>
+        </div>
+        <div class="field field-code">
+          <label for="code" data-i18n="codeLabel">Code</label>
+          <input id="code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code"
+                 spellcheck="false" maxlength="7" placeholder="000 000" required aria-describedby="code-hint">
+          <p id="code-hint" class="hint" data-i18n="codeHint">Six digits, changed each time the screen opens</p>
+        </div>
+      </div>
+      <button id="send" type="submit">
+        <span class="spinner" aria-hidden="true"></span>
+        <span id="send-label" data-i18n="send">Link</span>
+      </button>
+    </form>
+
+    <div id="status" class="status" role="status" aria-live="polite" hidden>
+      <span class="mark" aria-hidden="true"></span>
+      <p id="status-text"></p>
+      <button id="open-x" class="secondary" type="button" hidden data-i18n="openX">Open x.com</button>
+    </div>
+
+    <aside class="notes">
+      <p data-i18n="noteSignOut">Do not sign out of X in this browser afterwards: X then ends the session on the PS5 as well. Closing the tab or the browser is fine.</p>
+      <p data-i18n="notePrivacy">The extension reads only x.com's auth_token and ct0 cookies, sends them only to the address you type, over your home network, and keeps nothing but that address and the PS5's language.</p>
+    </aside>
+  </main>
+</body>
+</html>
