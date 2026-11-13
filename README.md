@@ -4,7 +4,7 @@
 ![Firmware](https://img.shields.io/badge/tested-FW%2013.60%20%2B%20etaHEN-555)
 ![Language](https://img.shields.io/badge/code-C-3a3a3a)
 ![License](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)
-![Version](https://img.shields.io/badge/version-1.0.0-orange)
+![Release](https://img.shields.io/github/v/release/ramalhoboss/XPS5?color=orange&label=release)
 
 XPS5 is an unofficial X (Twitter) client for jailbroken PS5 consoles. It is a **real native title** (`TWPS00001`) in the home screen's Media tab, beside your game. It is not a browser and not a web view: every pixel is drawn by XPS5's own renderer, and you use it with the controller.
 
@@ -62,6 +62,7 @@ XPS5 is an unofficial X (Twitter) client for jailbroken PS5 consoles. It is a **
 - **Videos** in the sharpest MP4 X offers for each one, with sound, in the timeline and full screen.
 - **7 languages** (English, Português, Español, Français, Deutsch, Italiano, Nederlands), following your PS5's language.
 - **Day and Night themes**, rendered at your TV's resolution, up to 4K. The controller's light bar takes the colour of the banner on screen.
+- **Updates itself** (from 1.0.1): it tells you when a new version is out, and installs it from *Settings → Updates*.
 
 ---
 
@@ -85,6 +86,7 @@ XPS5 is an unofficial X (Twitter) client for jailbroken PS5 consoles. It is a **
 | **Languages** | 7 |
 | **Install size** | `XPS5.elf` 52.2 MiB, `XPS5-uninstall.elf` 109 KiB |
 | **Tested on** | PS5 firmware 13.60 with etaHEN and ShadowMountPlus |
+| **Updates** | `update.json` (version, file, size, SHA-256) and the installer on GitHub Pages, filled from each release by a GitHub Actions workflow; the download is checked by size and SHA-256 before the ELF loader gets it |
 | **Host testing** | Every module that does not need the console is tested on a PC with AddressSanitizer and UndefinedBehaviorSanitizer |
 
 ### Where the code goes
@@ -216,7 +218,7 @@ sequenceDiagram
 
 ## Installation
 
-1. **Download** `XPS5-1.0.0.zip` from the [Releases](../../releases) page and unzip it.
+1. **Download** the latest `XPS5-<version>.zip` from the [Releases](../../releases) page and unzip it.
 2. **Check the files** (optional, recommended). In PowerShell, in the unzipped folder:
 
    ```powershell
@@ -295,12 +297,17 @@ The left stick moves a pointer, and ✕ presses what is under it. The right stic
 | Spoiler shield, light bar colour, rising posts | On or off |
 | Video sound, videos in the timeline, data saver | On or off |
 | Break reminder | Off, 30, 60 or 120 min |
+| Updates | Your version; ✕ looks for a new one, or installs the one found |
 
 ---
 
 ## Updating and uninstalling
 
-**Updating**: send the newer `XPS5.elf` the same way. The installer closes XPS5 by itself if it is open. Your accounts and settings stay, and the login window is only written again when it changed. A running background payload from an older version is replaced the next time XPS5 opens.
+**Updating inside XPS5** (from 1.0.1): XPS5 looks for a new version each time it opens, and again when you press ✕ on *Settings → Updates*. When one is out, that row says so: press ✕ and XPS5 downloads it from the project's GitHub Pages, checks its size and SHA-256 against `update.json`, and hands it to the ELF loader on port 9021. The installer then closes XPS5 and writes the new version: open it again from the home screen. Version 1.0.0 does not look for updates, so install 1.0.1 by hand once.
+
+**Updating by hand**: send the newer `XPS5.elf` the same way as the first time. The installer closes XPS5 by itself if it is open.
+
+Either way, your accounts and settings stay, and the login window is only written again when it changed. A running background payload from an older version is replaced the next time XPS5 opens.
 
 **Uninstalling**: send `XPS5-uninstall.elf` the same way:
 
@@ -328,6 +335,7 @@ It closes XPS5, gives each X profile that shows a game the location it had befor
 ## Privacy and security
 
 - XPS5 talks **only to X**: x.com and X's servers for pictures, videos and uploads, and, in the login window, whatever X's own login page loads.
+- The one exception is its own updates: it reads `update.json` from `ramalhoboss.github.io` when it opens and when you look for updates, and downloads the installer from there when you choose to install. Those requests carry no account data or cookies.
 - Your sessions, settings and history **stay on your console**.
 - HTTPS certificates are always verified. There is no "accept any certificate" mode.
 - The console's log (klog) only gets **status codes and counts**: never your session, posts, messages, addresses or what you type.
@@ -365,6 +373,8 @@ For developers. You need:
 
 Without `-Wsl`, `build.ps1` reuses the title already in `build\title`.
 
+**Publishing a release**: set the version in `src/update.h` (`XPS5_VERSION`), build, run `tools\release.ps1`, then publish a GitHub release tagged `v<version>` with `XPS5.elf` attached (and the rest of `build\release\XPS5-<version>\`). The workflow `.github/workflows/pages.yml` then puts that `XPS5.elf` and its `update.json` on GitHub Pages, where every XPS5 from 1.0.1 on finds it. It can also be run by hand from the Actions tab. Pages must be set to deploy from GitHub Actions (*Settings → Pages → Source*). A fork points `XPS5_UPDATE_URL` in `src/update.h` at its own Pages.
+
 The login window is built separately in WSL by `tools/login-engine`: `build-engine.sh build` (WebKit), `build-login.sh` (the window), then `pack-engine.sh`, which `build.ps1 -Wsl` runs and which puts the packed engine in `build\engine`. Without it, the installer installs XPS5 without its login window.
 
 Tests run on the PC, in WSL, with the address and undefined-behaviour sanitizers:
@@ -380,6 +390,7 @@ sh tests/preview.sh <out dir>   # draws XPS5's screens into PNG files with made-
 
 ```
 XPS5/
+├── .github/workflows/pages.yml  puts each release's installer and update.json on GitHub Pages
 ├── build.ps1                 builds everything (Windows + WSL)
 ├── send.ps1                  sends an ELF to the PS5's ELF loader
 ├── certs/                    Let's Encrypt root certificates bundled into the payloads
@@ -415,7 +426,7 @@ XPS5/
 - [ ] Test more firmware versions
 - [ ] Invites to play: a DM that opens the game on your friend's PS5 (in testing)
 - [ ] Send a capture straight into a DM (in testing)
-- [ ] Update check inside XPS5, from the GitHub releases
+- [x] Update check inside XPS5, from the GitHub releases (1.0.1)
 - [ ] Sign in with Google and Apple in the login window
 - [ ] More PSN-style social features on top of X
 - [ ] Your ideas: open an issue
