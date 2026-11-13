@@ -1,0 +1,83 @@
+# XPS5's updates on GitHub Pages: https://ramalhoboss.github.io/XPS5/
+#
+# XPS5 reads update.json there (src/update.h) and fetches the installer beside
+# it. This writes both from a release that carries XPS5.elf: when a release is
+# published, and by hand from the Actions tab (a tag, or the latest release).
+#
+# A release's run is on its tag, which the github-pages environment does not
+# let deploy, so it hands the work to a run on the default branch.
+
+name: Updates on GitHub Pages
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (empty: the latest release)"
+        required: false
+        default: ""
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  hand-over:
+    if: github.event_name == 'release' && !github.event.release.prerelease
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Run this workflow on the default branch for the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+        run: gh workflow run pages.yml --repo "$GITHUB_REPOSITORY" --ref "$BRANCH" -f tag="$TAG"
+
+  publish:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: update.json and XPS5.elf from the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -eu
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+          fi
+          VERSION=${TAG#v}
+          # what XPS5 takes as a version: up to 4 numbers of up to 5 digits
+          if ! printf '%s\n' "$VERSION" | grep -Eq '^[0-9]{1,5}(\.[0-9]{1,5}){0,3}$'; then
+            echo "::error::the tag $TAG is not a version XPS5 reads"
+            exit 1
+          fi
+          mkdir site
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern XPS5.elf --dir site
+          SIZE=$(stat -c %s site/XPS5.elf)
+          # XPS5 refuses an installer over 64 MiB (UPDATE_MAX)
+          if [ "$SIZE" -gt 67108864 ]; then
+            echo "::error::XPS5.elf is $SIZE bytes, over the 64 MiB XPS5 takes"
+            exit 1
+          fi
+          SHA=$(sha256sum site/XPS5.elf | cut -d ' ' -f 1)
+          printf '{"version":"%s","file":"XPS5.elf","size":%s,"sha256":"%s"}\n' \
+            "$VERSION" "$SIZE" "$SHA" > site/update.json
+          cat site/update.json
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v4
