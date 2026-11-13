@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="color-scheme" content="dark light">
+  <title>XPS5 Login</title>
+  <link rel="stylesheet" href="link.css">
+  <script src="link.js" defer></script>
+</head>
+<body>
+  <main>
+    <p class="brand">XPS5</p>
+    <h1 data-t="title">Link your X account to XPS5</h1>
+
+    <section class="code" aria-labelledby="code-label">
+      <span id="code-label" data-t="code">Code</span>
+      <strong id="code">&#8212;</strong>
+    </section>
+    <p id="no-code" class="hint" data-t="noCode" hidden>Use the code the PS5 shows on screen.</p>
+
+    <ol id="steps" class="steps">
+      <li><span data-t="step1">Tap the XPS5 Login extension's button.</span> <small id="where"></small></li>
+      <li data-t="step2">Check the address and the code, then tap Link.</li>
+    </ol>
+
+    <div id="warn" class="warn" role="note" hidden>
+      <p id="warn-text"></p>
+      <a id="firefox" class="button" hidden data-t="openFirefox">Open in Firefox</a>
+    </div>
+
+    <p id="pc" class="pc" hidden><span id="pc-text"></span></p>
+
+    <footer>
+      <p data-t="install">No extension yet? Install XPS5 Login in Chrome, Edge or Firefox (Firefox for Android too), then open this page again.</p>
+      <p data-t="note">The session goes over your home network and stays on the PS5. Do not sign out of X in this browser: that also signs the PS5 out.</p>
+    </footer>
+  </main>
+</body>
+</html>
