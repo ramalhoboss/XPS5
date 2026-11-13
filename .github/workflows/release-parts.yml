@@ -1,0 +1,57 @@
+# Joins a release's big files from the parts they were uploaded in.
+#
+# The browser upload of a release takes files of up to a few MB at a time, so
+# XPS5.elf and XPS5-<version>.zip may go up split (split -b 9500000 -d -a 2:
+# XPS5.elf.part00, XPS5.elf.part01, ...). Run by hand from the Actions tab on
+# the release's tag (a draft works): it joins the parts, checks XPS5.elf
+# against the release's SHA256SUMS.txt and the zip against the SHA-256 given,
+# attaches both and removes the parts. Then publish the release.
+
+name: Join release parts
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (a draft works)"
+        required: true
+      zip_sha256:
+        description: "SHA-256 of XPS5-<version>.zip"
+        required: true
+
+jobs:
+  join:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Join, check and attach
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          ZIP_SHA: ${{ inputs.zip_sha256 }}
+        run: |
+          set -eu
+          VERSION=${TAG#v}
+          if ! printf '%s\n' "$VERSION" | grep -Eq '^[0-9]{1,5}(\.[0-9]{1,5}){0,3}$'; then
+            echo "::error::the tag $TAG is not a version"
+            exit 1
+          fi
+          if ! printf '%s\n' "$ZIP_SHA" | grep -Eq '^[0-9a-f]{64}$'; then
+            echo "::error::zip_sha256 is not a SHA-256 in hex"
+            exit 1
+          fi
+          ZIP="XPS5-$VERSION.zip"
+          mkdir parts
+          cd parts
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'XPS5.elf.part*' --pattern "$ZIP.part*" --pattern SHA256SUMS.txt
+          ls -l
+          cat $(ls XPS5.elf.part* | sort) > XPS5.elf
+          cat $(ls "$ZIP".part* | sort) > "$ZIP"
+          tr -d '\r' < SHA256SUMS.txt | grep -E '^[0-9a-f]{64}  XPS5\.elf$' | sha256sum -c -
+          printf '%s  %s\n' "$ZIP_SHA" "$ZIP" | sha256sum -c -
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber XPS5.elf "$ZIP"
+          for p in XPS5.elf.part* "$ZIP".part*; do
+            gh release delete-asset "$TAG" "$p" --repo "$GITHUB_REPOSITORY" -y
+          done
