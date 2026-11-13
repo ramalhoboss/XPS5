@@ -1,23 +1,29 @@
 /* XPS5's own updates. update.json, published in a folder that XPS5_UPDATE_URL
-names (GitHub Pages, whose certificates are the Let's Encrypt ones of tls.h),
-says the newest version, the install ELF's file in that same folder, its
-size and its SHA-256:
+names, says the newest version, the install ELF's file in that same folder,
+its size and its SHA-256:
 
   {"version":"1.1.0","file":"XPS5.elf","size":21378312,"sha256":"<64 hex>"}
 
 The title compares the version with its own, fetches the file over verified
 TLS, checks its size and SHA-256, and hands it to the ELF loader, which runs
-the installer (src/install.c): that closes XPS5 and writes the new one. */
+the installer (src/install.c): that closes XPS5 and writes the new one.
+
+Both live on the project's GitHub Pages, which .github/workflows/pages.yml
+fills from each published release. Pages is used because its certificate is
+a Let's Encrypt one of tls.h (*.github.io <- YR1 <- Root YR <- ISRG Root X1,
+checked 2026-11-13); github.com, and so a release's download links, is
+Sectigo's, which XPS5 does not carry. */
 
 #pragma once
 
 #include <stddef.h>
 
-#define XPS5_VERSION "1.0.0"
+#define XPS5_VERSION "1.0.1"
 
-// update.json's address (https); empty, this build does not look for updates
+// update.json's address (https); empty, this build does not look for updates.
+// A fork points it at its own Pages
 #ifndef XPS5_UPDATE_URL
-#define XPS5_UPDATE_URL ""
+#define XPS5_UPDATE_URL "https://ramalhoboss.github.io/XPS5/update.json"
 #endif
 
 #define UPDATE_VERSION 24          // "1.10.3", with room

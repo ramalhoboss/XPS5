@@ -382,6 +382,36 @@ content_length(int req) {
 }
 
 
+/**
+ * whether the answer says its body is encoded (gzip, br…), not as stored
+ **/
+static int
+encoded(int req) {
+  char *block, *line, *end, *eol, *colon;
+  const char *p, *stop;
+  size_t size;
+
+  if(sceHttpGetAllResponseHeaders(req, &block, &size) || !block) {
+    return 0;
+  }
+  for(line=block, end=block + size; line < end; line = eol ? eol + 1 : end) {
+    eol = memchr(line, '\n', end - line);
+    stop = eol ? eol : end;
+    if(!(colon=memchr(line, ':', stop - line)) ||
+       !is_name(line, (size_t)(colon - line), "content-encoding")) {
+      continue;
+    }
+    for(p=colon + 1; p < stop && (*p == ' ' || *p == '\t'); p++) {
+    }
+    while(stop > p && (stop[-1] == '\r' || stop[-1] == ' ' || stop[-1] == '\t')) {
+      stop--;
+    }
+    return stop > p && !is_name(p, (size_t)(stop - p), "identity");
+  }
+  return 0;
+}
+
+
 static int
 stream_end(https_stream_t *st, int ret) {
   st->error = ret;
@@ -405,6 +435,15 @@ https_get_stream(const char *url, size_t max, https_stream_t *st) {
     log_line("https: request 0x%08x", (unsigned)ret);
     goto out;
   }
+  // the bytes as stored: a gzipped answer's Content-Length is not the length
+  // of what comes once inflated, and GitHub Pages gzips an .elf when asked
+  if((ret=sceHttpSetInflateGZIPEnabled(req, 0))) {
+    log_line("https: gzip off 0x%08x (going on)", (unsigned)ret);
+  }
+  if((ret=sceHttpAddRequestHeader(req, "Accept-Encoding", "identity", HEADER_OVERWRITE))) {
+    log_line("https: header Accept-Encoding 0x%08x", (unsigned)ret);
+    goto out;
+  }
   if((ret=sceHttpSendRequest(req, NULL, 0))) {
     if(!sceHttpsGetSslError(req, &err, &detail) && err) {
       log_line("https: send 0x%08x, SSL error 0x%08x, detail 0x%x",
@@ -419,6 +458,11 @@ https_get_stream(const char *url, size_t max, https_stream_t *st) {
     goto out;
   }
   log_headers(req, st->status);
+  if(st->status == 200 && encoded(req)) {
+    log_line("https: a stream came encoded, not as stored: not read");
+    ret = -1;
+    goto out;
+  }
   len = st->status == 200 ? content_length(req) : 0;
   if(!len || len > max || !(body=mem_alloc(len + 1))) {
     if(st->status == 200) {
