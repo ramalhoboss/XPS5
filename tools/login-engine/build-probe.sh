@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# The login engine's first test on the PS5 (phase 2, 2026-11-13), built from
+# probe/ after build-engine.sh:
+#   xps5-engine-install.elf  files-install.c: the tar below, sent after it on
+#                            the same connection (send-files.ps1), into
+#                            /data/TwitterPS5/engine
+#   xps5-login-probe.elf     probe.c: the launcher, which runs the test
+#   engine-files.tar         what the engine needs there: libWebKitXps5,
+#                            Mesa's libEGL and libvulkan (v1's build, which
+#                            the engine is linked with), the two processes,
+#                            login-ui.elf, Ubuntu's CA list (Mozilla's) and
+#                            fonts.conf (the console's own fonts)
+# probe.c starts processes with v1's copy of elfldr (John Törnblom's, GPLv3+,
+# read from v1's poc/common/elfldr) changed here in one line: the children get
+# an environment (execve's envp) instead of none. v1's files are only read.
+#
+# Run inside WSL:  bash tools/login-engine/build-probe.sh
+set -euo pipefail
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+V1=${V1:-$(cd "$(dirname "$0")/../../.." && pwd)/BrowserPS5-WebKit/poc} # beside the project folder
+V1_WORK=${V1_WORK:-$HOME/browserps5-build}
+WORK=${XPS5_WORK:-$HOME/xps5-build}
+BUILD=$WORK/webkit-build
+OUT=$WORK/probe
+MESA=$V1_WORK/mesa-browser/stage/user/homebrew/lib
+CA_BUNDLE=${CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}
+export PS5_PAYLOAD_SDK=${PS5_PAYLOAD_SDK:-/opt/ps5-payload-sdk}
+source "$PS5_PAYLOAD_SDK/toolchain/prospero.sh"
+
+need() {
+    [[ -e "$1" ]] || { echo "error: $1 not found${2:+ ($2)}" >&2; exit 1; }
+}
+need "$WORK/out/libWebKitXps5.so.SOVERSION" "run build-engine.sh first"
+need "$BUILD/lib/libWebKit.so.SOVERSION" "run build-engine.sh first"
+need "$MESA/libEGL.so.1"
+need "$MESA/libvulkan.so.1"
+need "$CA_BUNDLE"
+mkdir -p "$OUT/elfldr" "$OUT/stage"
+# the engine reads XPS5's files, not BrowserPS5's (build-engine.sh own_paths);
+# its strings once, in a file (grep -q on a pipe ends strings with SIGPIPE)
+strings -a "$WORK/out/libWebKitXps5.so.SOVERSION" > "$OUT/engine-strings.txt"
+for s in /data/TwitterPS5/engine/cert.pem /data/TwitterPS5/engine/env.txt; do
+    grep -q -x -F "$s" "$OUT/engine-strings.txt" ||
+        { echo "error: the engine does not read $s (build-engine.sh build)" >&2; exit 1; }
+done
+for s in /user/homebrew/etc/ssl/cert.pem /user/homebrew/browserps5/data/env.txt \
+         /user/homebrew/browserps5-rn/data/env.txt /user/homebrew/browserps5-rn/engine-env.txt; do
+    if grep -q -x -F "$s" "$OUT/engine-strings.txt"; then
+        echo "error: the engine still reads $s" >&2; exit 1
+    fi
+done
+rm -f "$OUT/engine-strings.txt"
+
+rm -f "$OUT"/stage/*
+
+# elfldr, with an environment for the processes it starts
+for f in elfldr.c elfldr.h pt.c pt.h log.h asset.h; do
+    sed 's/\r$//' "$V1/common/elfldr/$f" > "$OUT/elfldr/$f" # v1's have CRLF
+done
+n=$(grep -c '^  execve(SceSpZeroConf, argv, 0);$' "$OUT/elfldr/elfldr.c" || true)
+[[ "$n" = 1 ]] || { echo "elfldr.c: $n execve lines, expected 1" >&2; exit 1; }
+sed -i -e 's|^  execve(SceSpZeroConf, argv, 0);$|  execve(SceSpZeroConf, argv, elfldr_child_envp);|' \
+       -e '1i char** elfldr_child_envp; // XPS5 (build-probe.sh): the environment of the processes it starts' \
+       "$OUT/elfldr/elfldr.c"
+
+"$CC" -Wall -Werror -O2 -o "$OUT/xps5-engine-install.elf" "$HERE/probe/files-install.c"
+"$CC" -Wall -Werror -O2 -I"$OUT/elfldr" -I"$V1/webkit/process-launcher" \
+    -o "$OUT/xps5-login-probe.elf" "$HERE/probe/probe.c" "$OUT/elfldr/elfldr.c" "$OUT/elfldr/pt.c"
+"$CXX" -Wall -Werror -O2 -std=c++20 \
+    -I"$BUILD/WebKit/Headers" -I"$BUILD/JavaScriptCore/Headers" \
+    -o "$OUT/login-ui.elf" "$HERE/probe/login-ui.cpp" "$BUILD/lib/libWebKit.so.SOVERSION"
+readelf -d "$OUT/login-ui.elf" | grep -q "\[libWebKitXps5.so.SOVERSION\]" ||
+    { echo "login-ui.elf does not load libWebKitXps5.so.SOVERSION" >&2; exit 1; }
+
+strip=$(ls "$PS5_PAYLOAD_SDK"/bin/*strip* 2>/dev/null | head -1)
+[[ -n "$strip" ]] || strip=llvm-strip-20
+cp "$WORK/out/libWebKitXps5.so.SOVERSION" "$WORK/out/WebProcess.elf" "$WORK/out/NetworkProcess.elf" "$OUT/stage/"
+"$strip" --strip-debug -o "$OUT/stage/login-ui.elf" "$OUT/login-ui.elf"
+"$strip" --strip-unneeded -o "$OUT/stage/libEGL.so.1" "$(readlink -f "$MESA/libEGL.so.1")"
+"$strip" --strip-unneeded -o "$OUT/stage/libvulkan.so.1" "$(readlink -f "$MESA/libvulkan.so.1")"
+cp "$CA_BUNDLE" "$OUT/stage/cert.pem"
+cp "$HERE/probe/fonts.conf" "$OUT/stage/fonts.conf"
+
+(cd "$OUT/stage" && tar --format=ustar --owner=0 --group=0 -cf "$OUT/engine-files.tar" \
+    libWebKitXps5.so.SOVERSION libEGL.so.1 libvulkan.so.1 WebProcess.elf NetworkProcess.elf \
+    login-ui.elf cert.pem fonts.conf)
+for f in "$OUT/stage"/* "$OUT/engine-files.tar" "$OUT/xps5-engine-install.elf" "$OUT/xps5-login-probe.elf"; do
+    printf '%-28s %10s bytes\n' "$(basename "$f")" "$(stat -c %s "$f")"
+done
