@@ -78,6 +78,9 @@ main(void) {
   CHECK(update_file_url("https://a.io/u.json", "../a.elf", url, sizeof url) == -1);
   CHECK(update_file_url("https://a.io/u.json", "a.elf", url, 16) == -1);
   CHECK(update_file_url("", "a.elf", url, sizeof url) == -1);
+  // this build's own address, and the installer the Pages workflow puts beside it
+  CHECK(!update_file_url(XPS5_UPDATE_URL, "XPS5.elf", url, sizeof url) &&
+        !strcmp(url, "https://ramalhoboss.github.io/XPS5/XPS5.elf"));
 
   if(g_failed) {
     return 1;
