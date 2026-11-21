@@ -484,7 +484,7 @@ XPS5/
 - [ ] More PSN-style social features on top of X
 - [ ] Your ideas: open an issue
 
-**Next release: BrowserPS5 RN** 👀
+**Also from me:** [BrowserPS5](https://github.com/ramalhoboss/BrowserPS5), a real, full web browser for the PS5, and [PlayBridge](https://github.com/ramalhoboss/PlayBridge), your PS5 games on your Windows PC, up to 4K.
 
 ---
 
