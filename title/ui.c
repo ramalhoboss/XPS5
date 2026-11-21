@@ -14,6 +14,9 @@ once; a frame copies them and draws the rest on top. */
 #include <string.h>
 #include <time.h>
 
+#include "cards.h"
+#include "dictproto.h"
+#include "clip.h"
 #include "draw.h"
 #include "fonts.h"
 #include "game.h"
@@ -22,16 +25,25 @@ once; a frame copies them and draws the rest on top. */
 #include "lang.h"
 #include "link.h"
 #include "mem.h"
+#include "phone.h"
 #include "player.h"
 #include "qr.h"
 #include "loginproto.h"
+#include "seen.h"
+#include "sessions.h"
+#include "space.h"
 #include "ui.h"
 #include "update.h"
+#include "voice.h"
 #include "workers.h"
+#include "xchatopen.h" // whether the account's X Chat keys are in hand, to open its conversations
 
-#define MAX_LINES   60 // of a post's text, when ✕ opens it
+#define MAX_LINES   100 // of a post's text, when ✕ opens it (a long post of Premium)
 #define SHORT_LINES 10 // of a long post until then
 #define QUOTE_LINES 5
+#define NOTE_LINES      4  // of a Community Note, until ✕ opens the post
+#define NOTE_LINES_OPEN 14
+#define NOTE_TITLE_H    44 // "Readers added context" over it
 
 // the bar of X's sections down the left, as x.com has it (the app's logo on
 // top, an icon and the name of each, the Post button under them, the
@@ -217,12 +229,22 @@ typedef struct card {
   int             poll_y, poll_h;
   uint16_t        quote_start[QUOTE_LINES];
   uint16_t        quote_len[QUOTE_LINES];
+  int             note_y, note_h, note_lines, note_more; // its Community Note
+  uint16_t        note_start[NOTE_LINES_OPEN];
+  uint16_t        note_len[NOTE_LINES_OPEN];
   int             actions_y;
   int             meta;   // the line of counts under the buttons
   int             rising; // climbing fast among the list's posts (see mark_rising)
   int             spoiler; // covered: it may give the game that runs away (see covered)
   int             bubble_x, bubble_y, bubble_w, bubble_h; // of a message, from the card's top
+  int             run;     // of a message: RUN_* (see dm_runs)
+  int             pending; // of a message: the bubble of the one written here, before X has it (g_dm)
 } card_t;
+
+// a message among others of the same person sent close together: the
+// next one is theirs too (its time and picture go under that one), the one
+// before it is (no name over it, less room)
+enum { RUN_NEXT = 1, RUN_PREV = 2 };
 
 enum { LOAD_NONE, LOAD_TOP, LOAD_MORE };
 
@@ -243,6 +265,9 @@ typedef struct tab {
   char      cursor[X_CURSOR_MAX];   // of the posts after these, or empty
   int       loading;                // LOAD_*
   int       wanted;                 // □ asked for the top
+  long long asked_at;               // when the top was last asked for (g_now), or 0
+  int       quiet;                  // that reading is the list's own (an open conversation's),
+                                    // not asked by the user: no spinner, nothing moves
   int       has_user;               // the profile, of UI_ME and UI_USER
   x_user_t  user;
   int       bio_lines;
@@ -252,6 +277,9 @@ typedef struct tab {
   int       latest;                 // its latest posts, not the top ones
   int       seen_at;                // of Following: the first post that was on top the
                                     // last time, under "You left off here", or 0
+  int       xchat;                  // a UI_DM conversation that is on X Chat (read encrypted)
+  char      xchat_id[X_ID_MAX];     // a UI_DM of the inbox's that goes on on X Chat too: its
+                                    // number there (its messages join the inbox's)
 } tab_t;
 
 // what the pointer can press
@@ -260,22 +288,34 @@ enum {
   Z_SIDE_TREND, Z_SIDE_MORE, // a trend of the side column, and Explore over them
   Z_SIDE_USER, Z_SIDE_FOLLOW, // someone to follow, and their Follow button
   Z_SIDE_PLAYER, Z_SIDE_INVITE, // someone who plays now, and inviting them
-  Z_SCHED_ROW, Z_SCHED_CLOSE, // a scheduled post, and closing their sheet
   Z_NAV_POST, Z_NAV_ME, // the bar's Post button and account
   Z_FOLLOW, Z_UMENU,    // a profile's Follow button and its menu
   Z_LINK,               // linking the account from a PC, where its session is missing
   Z_GROK,               // asking Grok for a hint
+  Z_MIC,                // testing the controller's microphone, on Calls
+  Z_SIDE_GAME,          // a button of the game's box in the side column (GAME_*)
+  Z_DM_VOICE,           // a voice note to the conversation shown
+  Z_PARTY_ROW, Z_PARTY_INVITE, // someone of the group's side card, and inviting the group
+  Z_ACTIVITY, Z_GAMER,  // a change of the friends' activity, a button of the player card (GAMER_*)
   Z_MINI, Z_MINI_CLOSE, // the small video in the corner: back to its post, and closing it
   // the sheets (Z_SHEET: around one, Z_PANE: the pane itself) and the
   // viewer's video
   Z_SHEET, Z_PANE, Z_C_CLOSE, Z_C_TEXT, Z_C_MEDIA, Z_C_REMOVE, Z_C_ADD, Z_C_SEND, Z_C_SCHEDULE, Z_C_GAME,
   Z_C_POLL, Z_C_CHOICE, Z_C_CHOICE_ADD, Z_C_LENGTH, // the composer's poll
   Z_C_DM, // the composer's capture, sent in a message
+  Z_C_VOICE, // the composer's voice note
+  Z_C_DICTATE, // the composer's dictation
+  Z_C_PHONE, // the composer's writing on the phone
+  Z_PHONE_USE, Z_PHONE_CLOSE, // the phone's window: using what it wrote, and closing it
+  Z_GCARD_CLOSE, Z_GCARD_RETRY, // Grok's card: closing it, asking again after it failed
   Z_G_BACK, Z_G_ADD,
   Z_G_TILE, Z_S_ROW, Z_S_CLOSE, Z_S_PAGE, Z_V_PLAY, Z_V_SOUND, Z_V_BAR,
   Z_M_ROW, Z_Q_YES, Z_Q_NO, // a menu's rows, the question's buttons
   Z_L_PREV, Z_L_NEXT, Z_L_CLOSE, // the linking's account, and closing it
   Z_R_CLOSE, // closing the thread's reader
+  Z_SCHED_ROW, Z_SCHED_CLOSE, // a scheduled post, and closing their sheet
+  Z_TR_ROW, Z_TR_CLOSE, // a trophy of their sheet, and closing it
+  Z_VOICE_STOP, Z_VOICE_CLOSE, // the voice note's sheet: stopping it for the post, and closing it
   Z_LG_PAGE, Z_LG_CLOSE, Z_LG_PREV, Z_LG_NEXT, // the login window's page, closing it, and its account
   Z_CARD, Z_AUTHOR, Z_LIKE, Z_REPLY, Z_REPOST, Z_BOOKMARK, Z_MORE, Z_MEDIA, // of the post arg
   Z_DOTS, // its menu
@@ -423,12 +463,29 @@ static struct {
   char text[PLAY_INVITE];
   char game[PLAY_GAME];
   char id[16];
+  int  group; // the invite went to a group's conversation (party_invite)
+  int  join;  // a request to join the game they play (friend_join), not an invite
 } g_play_act;
 
-// the message being written to a conversation, kept when it did not go
+// how the message written last stands, while its bubble shows at the end of
+// its conversation: going, gone (until X has it), or not gone
+enum { DM_NONE, DM_SENDING, DM_SENT, DM_FAILED };
+
+#define DM_EVERY     15        // seconds between two readings of the conversation shown, by itself
+#define CHATS_EVERY  30        // and of the conversations, when the payload does not look at them
+#define DM_RETRY     60        // after one did not come
+#define DM_RUN_GAP   (5 * 60)  // messages of one person closer than this go together
+#define DM_SENT_KEEP 120       // seconds a sent message's own bubble waits for X to list it
+
+// the message being written to a conversation, kept when it did not go;
+// and the one that went last, shown before X has it
 static struct {
-  char conv[X_ID_MAX];
-  char text[X_REPLY_MAX + 1];
+  char      conv[X_ID_MAX];
+  char      text[X_REPLY_MAX + 1];
+  int       state;                  // DM_*, of the one that went last
+  char      sent_conv[X_ID_MAX];    // where it went
+  char      sent[X_REPLY_MAX + 1];  // its words
+  long long at;                     // when (g_now)
 } g_dm;
 
 // the game that runs beside the app, as the payload says (ui_game), and
@@ -451,6 +508,164 @@ static struct {
   int  error, code, x_code;
   int  fresh;
 } g_grok = {.fresh = 1};
+
+// Grok's card over the panel (SHEET_GROK): a post translated into the app's
+// language, or what came in Following since last time; its words while they
+// come, or why they did not. What UI_ACT_GROK asks is g_grok_what's
+#define GC_W         1000
+#define GC_H         780
+#define GC_LINES     11  // the lines of its words shown; ↑ ↓ the rest
+#define GC_MOST      96  // and in all
+#define CATCHUP_LEAST 3  // posts with words, to sum up
+#define CATCHUP_NEW   8  // new posts in Following for a catch-up of its own when XPS5 opens
+static struct {
+  int  what;            // UI_GROK_TRANSLATE or UI_GROK_CATCHUP, or 0 for none yet
+  int  pending;         // asked, and sent once nothing else is being sent
+  int  asking;          // sent, and no answer yet
+  int  by_itself;       // the catch-up when XPS5 opens: shown when it comes
+  int  error, code, x_code;
+  int  count;           // a catch-up's posts
+  int  since;           // and they are the ones since last time, not only the newest
+  int  scroll;          // the first of its lines shown
+  char id[X_ID_MAX];    // the post translated, and who wrote it
+  char user[64], name[64];
+  char input[X_GROK_INPUT]; // what goes to Grok: the post's words, or the posts' lines
+  char answer[X_GROK_ANSWER];
+} g_gcard;
+static int g_grok_what;      // UI_GROK_* of the UI_ACT_GROK being sent
+static int g_catchup_asked;  // the catch-up of its own, once a run
+
+// the microphone's test on Calls (ui_mic): asked, asked again after it
+// failed, and how it is as main.c says
+static struct {
+  int   want, retry;
+  int   state, code, silent;
+  float level, peak;
+} g_mic;
+
+// the game's trophies, as the payload lists them (ui_trophies), the ones
+// still to get first, and their sheet's selection; count 0 while they are
+// the search of the posts looking for a group (lfg_find), by its query:
+// there R1 invites a post's author to the game that runs
+static char g_lfg_query[X_QUERY_MAX + 1];
+
+static int lfg_invite(const tab_t *t);
+
+
+static int
+is_lfg(const tab_t *t) {
+  return t->feed == UI_SEARCH && g_lfg_query[0] && !strcmp(t->query, g_lfg_query);
+}
+
+// read, -1 when the game has none the PS5 knows of
+static struct {
+  char             id[GAME_ID];
+  ui_trophy_row_t *rows;
+  int              count, earned;
+  int              sel, wanted;
+} g_tr;
+
+// a card being made for a post (cards.h): what it shows, the pictures it
+// waits for (CARD_WAIT_US at most), the post's words, and its pixels once
+// drawn, until main.c takes them for the JPEG (taken)
+#define CARD_WAIT_US (6 * 1000000ull)
+static struct {
+  int       kind; // CARD_*
+  int       taken;
+  uint64_t  since_us;
+  session_t session;
+  week_t    week;
+  char      game[GAME_NAME], trophy[UI_TROPHY_NAME];
+  int       earned, all, grade; // a trophy's: how many of the game's the user has, and its grade
+  char      icons[CARD_GAMES][IMAGES_URL_MAX], photo[IMAGES_URL_MAX];
+  char      text[400];
+  float     bars[CARD_VOICE_BARS]; // a voice note's: its loudness, how long, who speaks
+  int       bar_count, seconds;
+  char      name[128], handle[64];
+  uint32_t *pixels;
+} g_card;
+// a card made while a post was going: offered once it went
+static struct {
+  int       ready;
+  capture_t c;
+  char      text[400], game[GAME_NAME];
+} g_card_wait;
+
+// a voice note for the post (ui_voice_*): its sheet tapes the microphone
+// until ✕ stops it, then its card and MP4 are made (src/voice.h); how the
+// microphone is, as main.c says, and the loudness of the last seconds
+#define VOICE_TRAIL    40           // bars of the loudness heard of late
+#define VOICE_TRAIL_US (100 * 1000) // one every 100 ms
+enum { VOICE_OFF, VOICE_TAPING, VOICE_MAKING };
+static struct {
+  int      state;             // VOICE_*
+  int      take, retry;       // for main.c: stopped to be made; the microphone asked again
+  int      mic, code, silent; // UI_MIC_*, its error and flags
+  float    level;
+  size_t   samples;           // taped, at VOICE_RATE
+  float    trail[VOICE_TRAIL];
+  int      trail_at;          // where the next goes
+  uint64_t trail_us;
+  // a note for a conversation instead of the post (R2 in it): its number,
+  // and who it is with
+  char     dm[sizeof ((x_post_t *)0)->id];
+  char     dm_name[128];
+  // dictation instead of a note: its words go into the post's text, made
+  // on the console (main.c, src/dictproto.h)
+  int      dictate;
+} g_voice;
+
+// the voice note UI_ACT_VOICE_DM sends (ui_voice_dm_get)
+static capture_t g_voice_dm;
+
+// the people of the group conversation read last (ui_party), the user left
+// out, those playing first and then those on XPS5: its side card, with an
+// invite to the game that runs for all of them at once
+#define PARTY_ROWS 4 // shown, then how many more
+static struct {
+  char     conv[sizeof ((x_post_t *)0)->id];
+  x_post_t items[UI_PARTY_MAX];
+  int      count;
+} g_party;
+
+
+/**
+ * whether the list t is a group's conversation whose people came
+ **/
+static int
+is_party(const tab_t *t) {
+  return t->feed == UI_DM && !t->user.id[0] && g_party.count > 0 && !strcmp(g_party.conv, t->arg);
+}
+
+
+/**
+ * s into dst, cut on a whole character to fit size
+ **/
+static void
+copy_whole(char *dst, size_t size, const char *s) {
+  size_t n = s ? strlen(s) : 0;
+
+  if(!size) {
+    return;
+  }
+  if(n >= size) {
+    for(n=size - 1; n && ((unsigned char)s[n] & 0xC0) == 0x80; n--) {
+    }
+  }
+  if(n) {
+    memcpy(dst, s, n);
+  }
+  dst[n] = 0;
+}
+static int          g_week_wanted;
+
+// the buttons of the game's box in the side column
+enum { GAME_TROPHIES, GAME_WEEK, GAME_LFG, GAME_GROUPS, GAME_BUTTONS };
+// the trophies' grades, bronze to platinum
+static const uint32_t g_grade_colours[4] = {
+  RGBA(205, 132, 72, 255), RGBA(196, 202, 212, 255), RGBA(236, 192, 64, 255), RGBA(168, 206, 240, 255),
+};
+static text_font_t *g_card_fonts[CARD_FONTS], *g_card_fallbacks[CARD_FONTS];
 
 // XPS5's updates (Settings' last row): how they go, as main.c says, and
 // what the row asked of main.c
@@ -478,6 +693,9 @@ static struct {
   int  frames;
 } g_toast;
 
+// what the controller feels next (UI_RUMBLE_*), taken by ui_rumble
+static int g_rumble;
+
 
 static void paint_backdrop(void);
 static int  backdrop_move(void);
@@ -496,12 +714,41 @@ static void read_account(int at);
 static int  own_post(const x_post_t *p);
 static int  pointer_turn(void);
 static int  ask_unschedule(int i);
+static int  open_trophies(void);
+static int  trophies_keys(unsigned keys);
+static int  trophy_tip(int i);
+static int  game_button(int which);
+static void draw_trophies(unsigned frame);
+static void card_step(void);
+static int  voice_open(void);
+static int  dictate_open(void);
+static int  voice_stop(void);
+static int  voice_cancel(void);
+static int  voice_keys(unsigned keys);
+static void voice_attach(const capture_t *c);
+static void draw_voice(unsigned frame);
 struct side_box;
 static void side_keep(struct side_box *b, const x_post_t *posts, int count, int kind);
 
 // the sheets over the panel
 enum { SHEET_NONE, SHEET_COMPOSE, SHEET_GALLERY, SHEET_SETTINGS, SHEET_MENU, SHEET_CONFIRM, SHEET_SCHEDULED,
-       SHEET_LINK, SHEET_READER, SHEET_LOGIN };
+       SHEET_LINK, SHEET_READER, SHEET_LOGIN, SHEET_TROPHIES, SHEET_VOICE,
+       SHEET_PHONE,   // writing on the phone (phone_open)
+       SHEET_GROK };  // Grok's card: a post translated, what the user missed (g_gcard)
+static int  gcard_keys(unsigned keys);
+static int  gcard_close(void);
+static int  gcard_retry(void);
+static void draw_gcard(unsigned frame);
+static void gcard_go(void);
+static void gcard_done(int error, int code, int x_code);
+static int  translate_post(const x_post_t *p);
+static int  catchup_ask(const tab_t *t, int count, int by_itself, int since);
+static int  catchup_open(void);
+static int  phone_open_dm(tab_t *t);
+static int  phone_open_compose(void);
+static int  phone_use(void);
+static int  phone_close(void);
+static int  phone_keys(unsigned keys);
 static void mini_keep(const x_post_t *p, const x_media_t *m);
 static int  mini_back(tab_t *t);
 static int  mini_close(void);
@@ -531,11 +778,31 @@ typedef struct side_box {
 } side_box_t;
 static side_box_t g_trends, g_who;
 
-// "Playing now": the people the user follows whose profile says a game,
-// read every SIDE_PLAYING_EVERY seconds for the user whose number is in who
-#define SIDE_PLAYING_EVERY (5 * 60)
+// "Playing now": the people the user follows whose profile says a game, and
+// then those it says are on XPS5 ("Friends online"), read every
+// SIDE_PLAYING_EVERY seconds for the user whose number is in who
+#define SIDE_PLAYING_EVERY 60
 static side_box_t g_playing;
 static char       g_playing_who[24];
+
+// the people the user follows as XPS5 saw them around (seen.h): the
+// account's file as main.c read it, and whether a look was noted into it
+static seen_t g_seen;
+static int    g_seen_dirty;
+
+// the user's week of play, for the card on their own profile: asked for
+// WEEK_INFO_EVERY seconds at most while it shows
+#define WEEK_INFO_EVERY (10 * 60)
+#define WEEK_INFO_WAIT  20 // seconds it is waited for before it did not come
+static struct {
+  week_t    week;
+  int       ok;    // 1: it came, -1: it did not, 0: not yet
+  int       want;  // to be asked for (ui_week_info_wanted)
+  long long asked; // when it was last asked for, or 0
+} g_week_info;
+
+// the buttons of the player card, in the side column of a profile
+enum { GAMER_INVITE, GAMER_JOIN, GAMER_CHAT, GAMER_WEEK };
 
 // the user's scheduled posts, in their sheet (from More), soonest first
 static struct {
@@ -548,6 +815,14 @@ static const char *list_title(const struct tab *t);
 static int g_sheet;
 
 static int  open_composer(const x_post_t *to);
+static int  voice_open_dm(const struct tab *t);
+static int  party_invite(struct tab *t);
+static int  friend_chat(const x_post_t *p);
+static int  friend_join(const x_post_t *p);
+static int  join_answer(const x_post_t *p);
+static int  open_dm_media(const x_post_t *p);
+static int  xchat_ask_pin(int loud);
+static int  invite(const char *id, const char *user, const char *theirs);
 static int  open_settings(void);
 static int  sheet_keys(unsigned keys);
 static int  sheet_click(const zone_t *z);
@@ -563,6 +838,7 @@ static unsigned g_frame_no; // ui_draw's frame, for the spinners drawn deep down
 static int      g_inline_sound; // the timeline's videos play with their sound, once it was turned on
 static int      g_spinning; // a video's spinner was drawn: the next frame too
 static void spinner(float cx, float cy, float r, float t, unsigned frame, uint32_t color);
+static void clock_text(int ms, char *buf, size_t size);
 static const char *video_of(const x_media_t *m);
 static void draw_viewer_video(const x_media_t *m, const char *still, unsigned frame);
 static void draw_sheet(long long now, unsigned frame);
@@ -674,6 +950,15 @@ ui_init(const settings_t *s, int system_lang) {
     }
     text_font_set_fallback(g_fonts[i], g_fallbacks[i]);
   }
+  for(int i=0; i < CARD_FONTS; i++) {
+    // the cards' own, at their scale
+    const card_font_spec_t *c = &card_font_specs[i];
+    if(!(g_card_fonts[i]=text_font_open_scaled(c->bold ? inter_bold : inter_regular, c->px, CARD_SCALE)) ||
+       !(g_card_fallbacks[i]=text_font_open_scaled(c->bold ? dejavu_sans_bold : dejavu_sans, c->px, CARD_SCALE))) {
+      return -1;
+    }
+    text_font_set_fallback(g_card_fonts[i], g_card_fallbacks[i]);
+  }
   text_set_emoji(emoji_picture);
   paint_backdrop();
   for(int i=0; i < SECTIONS; i++) {
@@ -722,9 +1007,26 @@ ui_session_info(int found, const char *path) {
 }
 
 
+/**
+ * the colour of an account (1 to SETTINGS_ACCOUNTS) in the notifications of
+ * every account: a stripe on its posts, a dot by its name on top
+ **/
+static uint32_t
+account_color(int account) {
+  static const uint32_t colors[SETTINGS_ACCOUNTS] = {ACCENT, BLUE, PINK, GREEN, GOLD};
+  return account >= 1 && account <= SETTINGS_ACCOUNTS ? colors[account - 1] : GREY;
+}
+
+static void reset_search(tab_t *t);
+
 void
 ui_accounts(unsigned present) {
   g_accounts = present;
+  if(!(present & (present - 1)) && g_tabs[UI_NOTIFICATIONS].latest) {
+    // one account left: Notifications is its own again
+    g_tabs[UI_NOTIFICATIONS].latest = 0;
+    reset_search(&g_tabs[UI_NOTIFICATIONS]);
+  }
 }
 
 
@@ -984,6 +1286,21 @@ layout_notice(card_t *c) {
 #define BUBBLE_R   26
 #define GROUP_FACE 46 // the two people of a group without a picture
 #define DM_TIME_H  32
+#define DM_EVENT_H   46 // a line of who did what to the group
+#define DM_EVENT_PAD 20
+#define DM_REPLY_H   84 // the box of the message a reply answers, and the room under it
+#define DM_REPLY_PAD 18
+#define DM_REACT_H   40 // the pill of a message's reactions
+
+
+/**
+ * what a message carries as it shows: a request to join the user sent is
+ * only its words
+ **/
+static int
+dm_what(const x_post_t *p) {
+  return p->icon == X_DM_JOIN && p->mine ? X_DM_TEXT : p->icon;
+}
 
 
 /**
@@ -1001,16 +1318,229 @@ dm_carries(int what, int *icon) {
   case X_DM_GIF:
     *icon = ICON_VIDEO;
     return "GIF";
+  case X_DM_VOICE:
+    *icon = ICON_MIC;
+    return L("Nota de voz", "Voice note");
   case X_DM_POST:
     *icon = ICON_SHARE;
     return L("Post partilhado", "Shared post");
   case X_DM_INVITE:
     *icon = ICON_GAME;
     return L("\xe2\x9c\x95 Abrir o jogo", "\xe2\x9c\x95 Open the game");
+  case X_DM_JOIN:
+    *icon = ICON_GAME;
+    return L("\xe2\x9c\x95 Convidar para o jogo", "\xe2\x9c\x95 Invite to the game");
+  case X_DM_FILE:
+    *icon = ICON_ARTICLE;
+    return L("Ficheiro", "File");
+  case X_DM_DELETED:
+    *icon = ICON_TRASH;
+    return L("Mensagem apagada", "Message deleted");
+  case X_DM_CALL:
+    *icon = ICON_CALL;
+    return L("Chamada", "Call");
   default:
     *icon = -1;
     return "";
   }
+}
+
+
+/**
+ * a time of seconds in a few words: "45 s", "3 min", "2 h 5 min", "7 d"
+ **/
+static void
+dm_duration(long long s, char *buf, size_t size) {
+  if(s < 60) {
+    snprintf(buf, size, "%lld s", s < 0 ? 0 : s);
+  } else if(s < 3600) {
+    snprintf(buf, size, "%lld min", s / 60);
+  } else if(s < 86400) {
+    snprintf(buf, size, s % 3600 >= 60 ? "%lld h %lld min" : "%lld h", s / 3600, s % 3600 / 60);
+  } else {
+    snprintf(buf, size, "%lld d", s / 86400);
+  }
+}
+
+
+/**
+ * a file's size in a few words: "820 KB", "2,4 MB"
+ **/
+static void
+dm_size(long long bytes, char *buf, size_t size) {
+  if(bytes < 1000000) {
+    snprintf(buf, size, "%lld KB", (bytes + 999) / 1000);
+  } else {
+    const long long tenths = (bytes + 50000) / 100000;
+    snprintf(buf, size, "%lld%s%lld MB", tenths / 10, L(",", "."), tenths % 10);
+  }
+}
+
+
+/**
+ * what a message carries besides its text, as its bubble says it: X Chat's
+ * still encrypted says so, and that ✕ opens it while the PIN was not given;
+ * a call, how it went; a file, its name and size; one taken back, so
+ **/
+static const char *dm_event_text(const x_post_t *p, int *icon);
+
+static const char *
+dm_label(const x_post_t *p, int *icon) {
+  static char line[256];
+  char n[48];
+
+  if(p->icon == X_DM_EVENT) {
+    return dm_event_text(p, icon); // a screenshot, as the last of a conversation in Chat
+  }
+  if(p->sealed && p->xchat) {
+    *icon = ICON_LOCK;
+    return xchat_open_ready(g_settings.ids[g_settings.account - 1]) ?
+           L("Mensagem cifrada", "Encrypted message") :
+           L("Cifrada \xc2\xb7 \xe2\x9c\x95 para abrir com o PIN", "Encrypted \xc2\xb7 \xe2\x9c\x95 to open with your PIN");
+  }
+  if(p->icon == X_DM_CALL) {
+    *icon = ICON_CALL;
+    switch(p->event) {
+    case X_EV_CALL_STARTED:
+      return p->event_video ? L("Chamada de v\xc3\xad" "deo iniciada", "Video call started") :
+             L("Chamada de voz iniciada", "Voice call started");
+    case X_EV_CALL_ENDED:
+      dm_duration(p->event_n, n, sizeof n);
+      snprintf(line, sizeof line, "%s \xc2\xb7 %s", p->event_video ? L("Chamada de v\xc3\xad" "deo", "Video call") :
+               L("Chamada de voz", "Voice call"), n);
+      return line;
+    case X_EV_CALL_MISSED:
+      return p->mine ? L("Chamada sem resposta", "Call not answered") :
+             p->event_video ? L("Chamada de v\xc3\xad" "deo perdida", "Missed video call") :
+             L("Chamada de voz perdida", "Missed voice call");
+    default:
+      break;
+    }
+  }
+  if(p->icon == X_DM_FILE && p->file_name[0]) {
+    *icon = ICON_ARTICLE;
+    if(p->file_size > 0) {
+      dm_size(p->file_size, n, sizeof n);
+      snprintf(line, sizeof line, "%s \xc2\xb7 %s", p->file_name, n);
+      return line;
+    }
+    return p->file_name;
+  }
+  if(p->icon == X_DM_DELETED) {
+    *icon = ICON_TRASH;
+    return p->mine ? L("Apagaste esta mensagem", "You deleted this message") :
+           L("Esta mensagem foi apagada", "This message was deleted");
+  }
+  return dm_carries(dm_what(p), icon);
+}
+
+
+/**
+ * who did what in a conversation of X Chat, as its line says it (an
+ * X_DM_EVENT): by the user, by who sent it, or by someone; and its icon
+ **/
+static const char *
+dm_event_text(const x_post_t *p, int *icon) {
+  static char line[400];
+  const char *who = p->mine ? L("ti", "you") : p->name[0] ? p->name : p->user[0] ? p->user :
+                    L("algu\xc3\xa9m", "someone");
+  char n[48];
+
+  *icon = ICON_PERSON;
+  line[0] = 0;
+  switch(p->event) {
+  case X_EV_SCREENSHOT:
+    *icon = ICON_SCREEN;
+    snprintf(line, sizeof line, p->event_n == 2 ? L("Ecr\xc3\xa3 gravado por %s", "Screen recorded by %s") :
+             L("Captura de ecr\xc3\xa3 tirada por %s", "Screenshot taken by %s"), who);
+    break;
+  case X_EV_GROUP_MADE:
+    if(p->text[0]) {
+      snprintf(line, sizeof line, L("Grupo \xc2\xab%s\xc2\xbb criado por %s", "Group \xe2\x80\x9c%s\xe2\x80\x9d made by %s"),
+               p->text, who);
+    } else {
+      snprintf(line, sizeof line, L("Grupo criado por %s", "Group made by %s"), who);
+    }
+    break;
+  case X_EV_TITLE:
+    snprintf(line, sizeof line, L("Nome do grupo mudado para \xc2\xab%s\xc2\xbb por %s",
+                                  "Group renamed to \xe2\x80\x9c%s\xe2\x80\x9d by %s"), p->text, who);
+    break;
+  case X_EV_PICTURE:
+    snprintf(line, sizeof line, L("Imagem do grupo mudada por %s", "Group picture changed by %s"), who);
+    break;
+  case X_EV_DESCRIPTION:
+    snprintf(line, sizeof line, L("Descri\xc3\xa7\xc3\xa3o do grupo mudada por %s", "Group description changed by %s"),
+             who);
+    break;
+  case X_EV_ADDED:
+    if(p->event_n == 1) {
+      snprintf(line, sizeof line, L("1 pessoa adicionada por %s", "1 person added by %s"), who);
+    } else {
+      snprintf(line, sizeof line, L("%lld pessoas adicionadas por %s", "%lld people added by %s"), p->event_n, who);
+    }
+    break;
+  case X_EV_REMOVED:
+    if(p->event_n == 1) {
+      snprintf(line, sizeof line, L("1 pessoa removida por %s", "1 person removed by %s"), who);
+    } else {
+      snprintf(line, sizeof line, L("%lld pessoas removidas por %s", "%lld people removed by %s"), p->event_n, who);
+    }
+    break;
+  case X_EV_LEFT:
+    if(p->mine) {
+      snprintf(line, sizeof line, "%s", L("Sa\xc3\xadste do grupo", "You left the group"));
+    } else {
+      snprintf(line, sizeof line, L("%s saiu do grupo", "%s left the group"), who);
+    }
+    break;
+  case X_EV_ADMINS:
+    snprintf(line, sizeof line, L("Administradores do grupo mudados por %s", "Group admins changed by %s"), who);
+    break;
+  case X_EV_JOIN_ASKED:
+    *icon = ICON_PLUS;
+    snprintf(line, sizeof line, "%s", L("Um pedido para entrar no grupo", "A request to join the group"));
+    break;
+  case X_EV_DISAPPEAR:
+    *icon = ICON_CLOCK;
+    if(p->event_n > 0) {
+      dm_duration(p->event_n, n, sizeof n);
+      snprintf(line, sizeof line, L("Mensagens tempor\xc3\xa1rias (%s) ativadas por %s",
+                                    "Disappearing messages (%s) turned on by %s"), n, who);
+    } else {
+      snprintf(line, sizeof line, L("Mensagens tempor\xc3\xa1rias desativadas por %s",
+                                    "Disappearing messages turned off by %s"), who);
+    }
+    break;
+  default:
+    break;
+  }
+  return line;
+}
+
+
+/**
+ * whether a message of X Chat replies to another, shown in a box at the
+ * top of its bubble
+ **/
+static int
+dm_replies(const x_post_t *p) {
+  return p->kind == X_KIND_DM && p->xchat && p->icon != X_DM_EVENT && p->icon != X_DM_DELETED &&
+         (p->quote_text[0] || p->quote_name[0] || p->quote_badge);
+}
+
+
+/**
+ * whose message a reply answers, as its box names it
+ **/
+static const char *
+dm_reply_name(const x_post_t *p) {
+  const tab_t *me = &g_tabs[UI_ME];
+
+  if(me->has_user && p->quote_user[0] && !strcmp(p->quote_user, me->user.id)) {
+    return L("Tu", "You");
+  }
+  return p->quote_name[0] ? p->quote_name : L("Mensagem", "Message");
 }
 
 
@@ -1022,10 +1552,61 @@ static int
 dm_shown(const x_post_t *p) {
   const char *tag = NULL;
 
-  for(const char *s=p->icon == X_DM_INVITE ? strstr(p->text, " (XPS5") : NULL; s; s=strstr(s + 1, " (XPS5")) {
+  for(const char *s=p->icon == X_DM_INVITE || p->icon == X_DM_JOIN ? strstr(p->text, " (XPS5") : NULL; s;
+      s=strstr(s + 1, " (XPS5")) {
     tag = s;
   }
   return tag ? (int)(tag - p->text) : (int)strlen(p->text);
+}
+
+
+#define DM_MEDIA_PAD 8   // around a message's picture or video, inside its bubble
+#define DM_MEDIA_W   480 // the most a message's picture or video takes
+#define DM_MEDIA_H   400
+#define DM_MEDIA_R   20
+#define DM_VOICE_W   440 // a voice note's row: its button, how far it played, how long
+#define DM_VOICE_H   76
+
+
+/**
+ * the picture, video or voice note a message of X Chat shows in its bubble
+ * (xchat.c's put_media), or NULL
+ **/
+static const x_media_t *
+dm_media(const x_post_t *p) {
+  const x_media_t *m = &p->media[0];
+
+  if(p->kind != X_KIND_DM || !p->xchat || p->media_count < 1 || !m->url[0] ||
+     ((m->video || m->voice) && !m->video_url[0])) {
+    return NULL;
+  }
+  return m;
+}
+
+
+/**
+ * how big a message's media shows: a voice note's row, or the picture or
+ * video as wide as it is, within DM_MEDIA_W x DM_MEDIA_H
+ **/
+static void
+dm_media_size(const x_media_t *m, int *w, int *h) {
+  if(m->voice) {
+    *w = DM_VOICE_W;
+    *h = DM_VOICE_H;
+    return;
+  }
+  *w = DM_MEDIA_W;
+  *h = DM_MEDIA_W * 2 / 3;
+  if(m->width > 0 && m->height > 0) {
+    if((long long)m->width * DM_MEDIA_H > (long long)m->height * DM_MEDIA_W) {
+      *h = (int)((long long)DM_MEDIA_W * m->height / m->width);
+    } else {
+      *h = DM_MEDIA_H;
+      *w = (int)((long long)DM_MEDIA_H * m->width / m->height);
+    }
+  }
+  *w = *w < 200 ? 200 : *w;
+  *h = *h < 140 ? 140 : *h;
 }
 
 
@@ -1047,18 +1628,47 @@ layout_chat(card_t *c) {
 /**
  * a message: a bubble as wide as its longest line, the user's own on the
  * right, the others' on the left beside their picture (in a group, under
- * their name), and when it was sent under it
+ * their name), and when it was sent under it; in a run of one person's
+ * (RUN_*), the name over the first only, and the time and picture by the
+ * last only
  **/
 static void
 layout_dm(card_t *c) {
   const x_post_t *p = c->post;
   text_font_t *f = font(F_BODY);
-  int w = 0, y = 8, lw, icon;
-  const char *carries = dm_carries(p->icon, &icon);
+  int w = 0, y = c->run & RUN_PREV ? 2 : 8, lw, icon, mw = 0, mh = 0, reply = 0;
+  const char *carries = dm_label(p, &icon);
   char shown[sizeof p->text];
+  const x_media_t *m = dm_media(p);
 
-  if(p->group && !p->mine) {
+  // who did what to the group: a line in the middle, not a bubble
+  if(p->icon == X_DM_EVENT) {
+    const char *says = dm_event_text(p, &icon);
+    w = DM_EVENT_PAD * 2 + 34 + width_of(font(F_SMALL), says);
+    c->bubble_w = w < MAIN_W - 2 * CARD_PAD ? w : MAIN_W - 2 * CARD_PAD;
+    c->bubble_h = DM_EVENT_H;
+    c->bubble_x = MAIN_X + (MAIN_W - c->bubble_w) / 2;
+    c->bubble_y = 12;
+    c->lines = c->more = c->quote_lines = 0;
+    c->media_h = c->quote_h = c->meta = 0;
+    c->avatar_y = c->body_y = c->bubble_y;
+    c->actions_y = c->bubble_y + c->bubble_h;
+    c->height = c->actions_y + 12 + CARD_GAP;
+    return;
+  }
+  if(p->group && !p->mine && !(c->run & RUN_PREV)) {
     y += 36;
+  }
+  // the message it replies to: a box at the top of the bubble, as wide as
+  // what it says
+  if(dm_replies(p)) {
+    int bi;
+    const char *said = p->quote_text[0] ? p->quote_text : dm_carries(p->quote_badge, &bi);
+    reply = DM_REPLY_H;
+    lw = width_of(font(F_SMALL_BOLD), dm_reply_name(p));
+    lw = width_of(font(F_SMALL), said) > lw ? width_of(font(F_SMALL), said) : lw;
+    w = lw + 2 * DM_REPLY_PAD - 2 * BUBBLE_PAD + 24;
+    w = w > BUBBLE_MAX - 2 * BUBBLE_PAD ? BUBBLE_MAX - 2 * BUBBLE_PAD : w;
   }
   // the lines of what shows, at the same places as in the text
   snprintf(shown, sizeof shown, "%.*s", dm_shown(p), p->text);
@@ -1068,22 +1678,35 @@ layout_dm(card_t *c) {
     lw = text_width(f, p->text + c->start[i], c->len[i]);
     w = lw > w ? lw : w;
   }
-  c->quote_lines = carries[0] ? 1 : 0;
+  // X Chat's picture, video or voice note shows in the bubble, over the words,
+  // instead of its label
+  c->quote_lines = carries[0] && !m ? 1 : 0;
   if(c->quote_lines) {
     lw = 40 + width_of(f, carries);
     w = lw > w ? lw : w;
   }
   c->bubble_w = w + 2 * BUBBLE_PAD;
   c->bubble_w = c->bubble_w < 2 * BUBBLE_R + 20 ? 2 * BUBBLE_R + 20 : c->bubble_w;
-  c->bubble_h = (c->lines + c->quote_lines) * LINE_H + 2 * BUBBLE_PAD - 16;
+  c->bubble_h = (c->lines + c->quote_lines) * LINE_H + 2 * BUBBLE_PAD - 16 + reply;
+  if(m) {
+    dm_media_size(m, &mw, &mh);
+    c->bubble_w = mw + 2 * DM_MEDIA_PAD > c->bubble_w ? mw + 2 * DM_MEDIA_PAD : c->bubble_w;
+    c->bubble_h = DM_MEDIA_PAD + reply + mh + (c->lines ? 4 + c->lines * LINE_H + BUBBLE_PAD - 8 : DM_MEDIA_PAD);
+    c->media[0] = (rect_t){DM_MEDIA_PAD, DM_MEDIA_PAD + reply, mw, mh};
+  }
   c->bubble_h = c->bubble_h < 2 * BUBBLE_R ? 2 * BUBBLE_R : c->bubble_h;
   c->bubble_x = p->mine ? MAIN_X + MAIN_W - CARD_PAD - c->bubble_w : MAIN_X + CARD_PAD + FACE + 14;
   c->bubble_y = y;
   c->avatar_y = y + c->bubble_h - FACE;
-  c->body_y = y + BUBBLE_PAD - 8;
-  c->media_h = c->quote_h = c->meta = 0;
+  c->body_y = y + reply + (m ? DM_MEDIA_PAD + mh + 4 : BUBBLE_PAD - 8);
+  c->media_h = c->meta = 0;
+  c->quote_h = reply;
   c->actions_y = y + c->bubble_h + 4;
-  c->height = c->actions_y + DM_TIME_H + 4 + CARD_GAP;
+  // the reactions, on a pill over the bubble's lower edge
+  if(p->reaction_count > 0 && p->reactions[0]) {
+    c->actions_y += DM_REACT_H - 14;
+  }
+  c->height = c->run & RUN_NEXT ? c->actions_y : c->actions_y + DM_TIME_H + 4 + CARD_GAP;
 }
 
 
@@ -1198,8 +1821,8 @@ layout_card(card_t *c) {
     layout_list(c);
     return;
   }
-  if(p->kind == X_KIND_CHAT) {
-    layout_chat(c);
+  if(p->kind == X_KIND_CHAT || p->kind == X_KIND_USER) {
+    layout_chat(c); // a friend: their names over what they do
     return;
   }
   if(p->kind == X_KIND_DM) {
@@ -1252,6 +1875,17 @@ layout_card(card_t *c) {
                                  QUOTE_LINES, c->quote_start, c->quote_len, &c->quote_more);
     c->quote_h = QUOTE_PAD + QUOTE_NAME_H + c->quote_lines * QUOTE_LINE_H + QUOTE_PAD - 4;
     y += c->quote_h;
+  }
+  // the Community Note, as x.com puts it under the post; all of it once ✕ opened it
+  c->note_h = 0;
+  if(p->note[0] && !c->spoiler) {
+    y += GAP - 6;
+    c->note_y = y;
+    c->note_lines = break_lines(font(F_QUOTE), p->note, TEXT_W - 2 * QUOTE_PAD,
+                                c->open ? NOTE_LINES_OPEN : NOTE_LINES, c->note_start, c->note_len,
+                                &c->note_more);
+    c->note_h = QUOTE_PAD + NOTE_TITLE_H + c->note_lines * QUOTE_LINE_H + QUOTE_PAD - 4;
+    y += c->note_h;
   }
 
   c->actions_y = y + 4;
@@ -1462,13 +2096,236 @@ dm_mark(const tab_t *t, x_post_t *posts, int count) {
   tab_t *chat = &g_tabs[UI_CHAT];
 
   for(int i=0; i < count; i++) {
-    posts[i].mine = me->has_user && !strcmp(posts[i].user_id, me->user.id);
-    posts[i].group = !t->user.user[0];
+    x_post_t *p = &posts[i];
+    p->mine = me->has_user && !strcmp(p->user_id, me->user.id);
+    p->group = !t->user.user[0];
+    // X Chat's say only the sender's number: with one person, it is them
+    // (their name and picture), and so is whom a reply answers
+    if(p->xchat && !p->group && t->user.id[0]) {
+      if(!p->mine && !p->name[0] && !strcmp(p->user_id, t->user.id)) {
+        snprintf(p->user, sizeof p->user, "%s", t->user.user);
+        snprintf(p->name, sizeof p->name, "%s", t->user.name);
+        snprintf(p->avatar, sizeof p->avatar, "%s", t->user.avatar);
+      }
+      if(dm_replies(p) && !p->quote_name[0] && !strcmp(p->quote_user, t->user.id)) {
+        snprintf(p->quote_name, sizeof p->quote_name, "%s", t->user.name);
+      }
+    }
   }
   for(int i=0; i < chat->count; i++) {
     if(!strcmp(chat->posts[i].id, t->arg)) {
       chat->posts[i].unread = 0;
     }
+  }
+}
+
+
+/**
+ * a conversation of the inbox whose newest message came on X Chat,
+ * encrypted (its row in Chat says so): that message at the end, from who
+ * sent it, saying what can be said of it; returns how many posts there are
+ **/
+static int
+dm_sealed(const tab_t *t, x_post_t **posts, int count) {
+  const tab_t *chat = &g_tabs[UI_CHAT], *me = &g_tabs[UI_ME];
+  const x_post_t *row = NULL;
+  const x_user_t *who;
+  x_post_t *grown, *p;
+
+  for(int i=0; i < chat->count && !row; i++) {
+    row = chat->posts[i].sealed && !chat->posts[i].xchat && !strcmp(chat->posts[i].id, t->arg) ?
+          &chat->posts[i] : NULL;
+  }
+  if(!row || (count && (*posts)[count - 1].time >= row->time) ||
+     !(grown=mem_realloc(*posts, (size_t)(count + 1) * sizeof *grown))) {
+    return count;
+  }
+  *posts = grown;
+  p = &grown[count];
+  memset(p, 0, sizeof *p);
+  p->kind = X_KIND_DM;
+  p->replies = p->reposts = p->likes = p->views = -1;
+  p->time = row->time;
+  p->sealed = 1;
+  who = row->mine && me->has_user ? &me->user : &t->user;
+  if(row->group && !row->mine) {
+    snprintf(p->name, sizeof p->name, "%s", row->quote_name);
+  } else {
+    snprintf(p->user_id, sizeof p->user_id, "%s", who->id);
+    snprintf(p->user, sizeof p->user, "%s", who->user);
+    snprintf(p->name, sizeof p->name, "%s", who->name);
+    snprintf(p->avatar, sizeof p->avatar, "%s", who->avatar);
+  }
+  snprintf(p->text, sizeof p->text, "%s", !xchat_open_ready(g_settings.ids[g_settings.account - 1]) ?
+           L("A \xc3\xbaltima mensagem veio pelo X Chat, cifrada: \xe2\x9c\x95 para a abrir com o teu PIN.",
+             "The last message came on X Chat, encrypted: \xe2\x9c\x95 to open it with your PIN.") :
+           L("A \xc3\xbaltima mensagem veio pelo X Chat e ainda n\xc3\xa3o abriu: \xe2\x96\xa1 para atualizar.",
+             "The last message came on X Chat and has not opened yet: \xe2\x96\xa1 to refresh."));
+  return count + 1;
+}
+
+
+static tab_t *list_at(int i);
+
+
+/**
+ * whether a message is the user's, before dm_mark says so
+ **/
+static int
+dm_is_mine(const x_post_t *p) {
+  const tab_t *me = &g_tabs[UI_ME];
+
+  return p->mine || (me->has_user && p->user_id[0] && !strcmp(p->user_id, me->user.id));
+}
+
+
+/**
+ * whether the message that went last (g_dm) still wants a bubble of its own
+ * at the end of the conversation t, whose posts (count of them) X sent: while
+ * it goes and when it did not go; once gone, until X lists it (a message of
+ * the user's with its words, or from then on) or a while passed
+ **/
+static int
+dm_pending_wanted(const tab_t *t, const x_post_t *posts, int count) {
+  char sent[sizeof posts->text];
+
+  if(t->feed != UI_DM || g_dm.state == DM_NONE || strcmp(g_dm.sent_conv, t->arg)) {
+    return 0;
+  }
+  if(g_dm.state != DM_SENT) {
+    return 1;
+  }
+  if(g_now - g_dm.at > DM_SENT_KEEP) {
+    return 0;
+  }
+  copy_whole(sent, sizeof sent, g_dm.sent);
+  for(int i=0; i < count; i++) {
+    if(dm_is_mine(&posts[i]) && posts[i].id[0] && (!strcmp(posts[i].text, sent) || posts[i].time >= g_dm.at - 15)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+
+/**
+ * the bubble of the message that went last, as a message of the user's to
+ * the conversation t
+ **/
+static void
+dm_pending_fill(const tab_t *t, x_post_t *p) {
+  const tab_t *me = &g_tabs[UI_ME];
+
+  memset(p, 0, sizeof *p);
+  p->kind = X_KIND_DM;
+  p->replies = p->reposts = p->likes = p->views = p->bookmarks = -1;
+  p->time = g_dm.at;
+  p->mine = 1;
+  p->group = !t->user.user[0];
+  p->icon = X_DM_TEXT;
+  if(me->has_user) {
+    snprintf(p->user_id, sizeof p->user_id, "%s", me->user.id);
+    snprintf(p->user, sizeof p->user, "%s", me->user.user);
+    snprintf(p->name, sizeof p->name, "%s", me->user.name);
+    snprintf(p->avatar, sizeof p->avatar, "%s", me->user.avatar);
+  }
+  copy_whole(p->text, sizeof p->text, g_dm.sent);
+}
+
+
+/**
+ * whether two messages, a then b, go together: the same person's, sent
+ * close together
+ **/
+static int
+dm_together(const x_post_t *a, const x_post_t *b) {
+  if(a->sealed || b->sealed || a->mine != b->mine || (!a->mine && (!a->user_id[0] || strcmp(a->user_id, b->user_id)))) {
+    return 0;
+  }
+  // a line of the group's stands alone; under one edited, reacted to or
+  // whose signature failed, its time says so, and the pill needs the room
+  if(a->icon == X_DM_EVENT || b->icon == X_DM_EVENT || a->edited || a->reaction_count ||
+     a->signature == XCHAT_SIG_BAD) {
+    return 0;
+  }
+  return b->time >= a->time && b->time - a->time < DM_RUN_GAP;
+}
+
+
+/**
+ * the conversation t's messages as they show: the last one the bubble of
+ * the message that went last when pending, the runs of each person's
+ * (RUN_*), laid out and placed again
+ **/
+static void
+dm_dress(tab_t *t, int pending) {
+  for(int i=0; i < t->count; i++) {
+    t->cards[i].pending = pending && i == t->count - 1;
+  }
+  if(pending && t->count) {
+    t->posts[t->count - 1].mine = 1;
+  }
+  for(int i=0; i < t->count; i++) {
+    card_t *c = &t->cards[i];
+    c->run = (i + 1 < t->count && dm_together(c->post, t->cards[i + 1].post) ? RUN_NEXT : 0) |
+             (i > 0 && dm_together(t->cards[i - 1].post, c->post) ? RUN_PREV : 0);
+    layout_card(c);
+  }
+  place(t);
+}
+
+
+/**
+ * the bubble of the message that went last, at the end of each list of its
+ * conversation, with the newest message shown; the one of a message before
+ * it goes
+ **/
+static void
+dm_pending_show(void) {
+  tab_t *t;
+
+  for(int i=0; (t=list_at(i)); i++) {
+    x_post_t *posts;
+    card_t *cards;
+    int n;
+
+    if(t->feed != UI_DM) {
+      continue;
+    }
+    if(t->count && t->cards && t->cards[t->count - 1].pending) {
+      t->count--;
+      t->sel = t->sel < t->count ? t->sel : t->count ? t->count - 1 : 0;
+      t->error = t->count || t->error ? t->error : ERR_EMPTY;
+    }
+    if(!dm_pending_wanted(t, NULL, 0)) {
+      if(t->cards) {
+        dm_dress(t, 0);
+        clamp_target(t);
+      }
+      continue;
+    }
+    n = t->count;
+    if(!(posts=mem_realloc(t->posts, (size_t)(n + 1) * sizeof *posts))) {
+      continue;
+    }
+    t->posts = posts;
+    if(!(cards=mem_realloc(t->cards, (size_t)(n + 1) * sizeof *cards))) {
+      continue;
+    }
+    t->cards = cards;
+    for(int k=0; k < n; k++) {
+      cards[k].post = &posts[k];
+    }
+    dm_pending_fill(t, &posts[n]);
+    memset(&cards[n], 0, sizeof cards[n]);
+    cards[n].post = &posts[n];
+    t->count = n + 1;
+    if(t->error == ERR_EMPTY) {
+      t->error = ERR_NONE; // its first message
+    }
+    dm_dress(t, 1);
+    t->sel = n;
+    show_selected(t);
   }
 }
 
@@ -1531,6 +2388,15 @@ mark_seen(tab_t *t) {
           t->count);
   }
   t->seen_at = at > 0 ? at : 0;
+  // the first look of a run, when a good few came since last time: Grok
+  // sums them up, when the settings say so (not the very first time, which
+  // has no last time)
+  if(!g_catchup_asked) {
+    g_catchup_asked = 1;
+    if(g_settings.catchup && (at >= CATCHUP_NEW || (at < 0 && seen[0] && t->count >= CATCHUP_NEW))) {
+      catchup_ask(t, at > 0 ? at : t->count, 1, 1);
+    }
+  }
 
   for(int i=0; i < t->count && kept < SEEN_IDS; i++) {
     const char *id = t->posts[i].id;
@@ -1607,10 +2473,151 @@ mark_rising(tab_t *t, long long now) {
 }
 
 
+/**
+ * of the people the user follows, the ones who play, then the ones on XPS5,
+ * for the side column's "Playing now" ("Friends online")
+ **/
+static void
+playing_keep(const x_post_t *posts, int count) {
+  int n = 0;
+
+  for(int pass=0; pass < 2; pass++) {
+    for(int i=0; posts && i < count && n < SIDE_ITEMS; i++) {
+      if(posts[i].kind == X_KIND_USER && (pass ? !posts[i].playing[0] && posts[i].online : posts[i].playing[0])) {
+        g_playing.items[n++] = posts[i];
+      }
+    }
+  }
+  g_playing.count = n;
+  g_playing.at = g_now;
+}
+
+
+static x_post_t *friends_sorted(x_post_t *posts, int count);
+
+
+/**
+ * Friends, while it has a list, from a newer look at the same people
+ * (posts, count: the side column's box reads them as Friends does): what
+ * each one plays or is, and their order again, with the one chosen still
+ * chosen where it was on the screen
+ **/
+static void
+friends_fresh(const x_post_t *posts, int count, long long when) {
+  tab_t *t = &g_tabs[UI_FRIENDS];
+  char chosen[sizeof t->posts->user_id] = "";
+  x_post_t *copy, *sorted;
+  int at = 0;
+
+  if(!posts || count < 1 || !t->posts || !t->cards || t->count < 1 || t->loading) {
+    return;
+  }
+  if(t->sel >= 0 && t->sel < t->count) {
+    snprintf(chosen, sizeof chosen, "%s", t->posts[t->sel].user_id);
+    at = t->cards[t->sel].y - t->scroll;
+  }
+  for(int i=0; i < t->count; i++) {
+    for(int k=0; t->posts[i].kind == X_KIND_USER && t->posts[i].user_id[0] && k < count; k++) {
+      if(posts[k].kind == X_KIND_USER && !strcmp(posts[k].user_id, t->posts[i].user_id)) {
+        t->posts[i] = posts[k];
+        break;
+      }
+    }
+  }
+  if(!(copy=mem_calloc(t->count, sizeof *copy))) {
+    return;
+  }
+  memcpy(copy, t->posts, t->count * sizeof *copy);
+  sorted = friends_sorted(copy, t->count);
+  memcpy(t->posts, sorted, t->count * sizeof *sorted);
+  mem_free(sorted);
+  for(int i=0; i < t->count; i++) {
+    memset(&t->cards[i], 0, sizeof t->cards[i]);
+    t->cards[i].post = &t->posts[i];
+    layout_card(&t->cards[i]);
+  }
+  place(t);
+  for(int i=0; chosen[0] && i < t->count; i++) {
+    if(!strcmp(t->posts[i].user_id, chosen)) {
+      t->sel = i;
+      break;
+    }
+  }
+  t->sel = t->sel < t->count ? t->sel : t->count - 1;
+  t->target = t->cards[t->sel].y - at;
+  clamp_target(t);
+  t->scroll = t->target;
+  t->fetched_at = when > 0 ? when : g_now;
+}
+
+
+/**
+ * a look at the people the user follows, noted into who XPS5 saw around,
+ * for main.c to keep
+ **/
+static void
+friends_noted(const x_post_t *posts, int count, long long when) {
+  if(posts && count > 0) {
+    seen_note(&g_seen, posts, count, when > 0 ? when : g_now);
+    g_seen_dirty = 1;
+  }
+}
+
+
+/**
+ * Friends in the order of a PS5's friends: who plays the game that runs
+ * here, who plays, who is on XPS5, the ones XPS5 saw around last, then the
+ * rest as X listed them. posts (mem_alloc'd) is let go of for the array
+ * returned, or returned when there is no memory for another
+ **/
+static x_post_t *
+friends_sorted(x_post_t *posts, int count) {
+  long long *key;
+  int *order, k;
+  x_post_t *out;
+
+  if(!posts || count < 2) {
+    return posts;
+  }
+  key = mem_calloc(count, sizeof *key);
+  order = mem_calloc(count, sizeof *order);
+  out = mem_calloc(count, sizeof *out);
+  if(!key || !order || !out) {
+    mem_free(key);
+    mem_free(order);
+    mem_free(out);
+    return posts;
+  }
+  for(int i=0; i < count; i++) {
+    const x_post_t *p = &posts[i];
+    const seen_person_t *s = p->kind == X_KIND_USER ? seen_find(&g_seen, p->user_id) : NULL;
+    const long long rank = p->kind != X_KIND_USER ? 4 :
+      p->playing[0] && g_game.name[0] && !strcmp(p->playing, g_game.name) ? 0 : p->playing[0] ? 1 :
+      p->online ? 2 : s && s->at > 0 ? 3 : 4;
+    // the ones seen around, the last seen first; the others as listed
+    key[i] = (rank << 40) + (rank == 3 ? (1LL << 34) - s->at : i);
+    // in that order, as they come (an insertion: a hundred of them at most)
+    for(k=i; k > 0 && key[order[k - 1]] > key[i]; k--) {
+      order[k] = order[k - 1];
+    }
+    order[k] = i;
+  }
+  for(int i=0; i < count; i++) {
+    out[i] = posts[order[i]];
+  }
+  mem_free(key);
+  mem_free(order);
+  mem_free(posts);
+  return out;
+}
+
+
 void
 ui_result(const ui_request_t *req, x_post_t *posts, int count, const char *cursor,
           const x_user_t *user, int error, int code, int x_code, long long when) {
   tab_t *t = find_view(req->view);
+  char keep[X_ID_MAX] = ""; // of a conversation read again: the message the user was at
+  int pending = 0, had = 0, keep_off = 0, old_scroll = 0, quiet;
 
   g_under_stale = 1;
 
@@ -1625,18 +2632,14 @@ ui_result(const ui_request_t *req, x_post_t *posts, int count, const char *curso
     return;
   }
   if(req->view == SIDE_VIEW && req->side == UI_SIDE_PLAYING) {
-    // of the people the user follows, the ones playing; none is an answer too
-    int n = 0;
+    // of the people the user follows, the ones playing, then the ones on
+    // XPS5; none is an answer too. The look is noted for Friends
     g_playing.loading = 0;
     g_playing.error = posts || error == ERR_EMPTY ? ERR_NONE : error;
-    for(int i=0; posts && i < count && n < SIDE_ITEMS; i++) {
-      if(posts[i].kind == X_KIND_USER && posts[i].playing[0]) {
-        g_playing.items[n++] = posts[i];
-      }
-    }
     if(posts || error == ERR_EMPTY) {
-      g_playing.count = n;
-      g_playing.at = g_now;
+      playing_keep(posts, count);
+      friends_noted(posts, count, when);
+      friends_fresh(posts, count, when); // Friends shows them as they are now
     }
     mem_free(posts);
     return;
@@ -1685,11 +2688,57 @@ ui_result(const ui_request_t *req, x_post_t *posts, int count, const char *curso
     return;
   }
   t->loading = LOAD_NONE;
+  quiet = t->quiet;
+  t->quiet = 0;
   t->error = error;
   t->code = code;
   t->x_code = x_code;
+  if(quiet && t->feed == UI_CHAT && t->count && t->cards && t->sel >= 0 && t->sel < t->count) {
+    // the conversations read again by themselves: the one the user is on stays put
+    snprintf(keep, sizeof keep, "%s", t->posts[t->sel].id);
+    keep_off = t->cards[t->sel].y - t->scroll;
+    old_scroll = t->scroll;
+  }
+  if(!posts && t->feed == UI_DM && error == ERR_EMPTY && dm_pending_wanted(t, NULL, 0) &&
+     (posts=mem_calloc(1, sizeof *posts))) {
+    // no message yet, but the one that goes
+    count = 0;
+    t->error = ERR_NONE;
+  }
   if(!posts) {
     return;
+  }
+  if(t->feed == UI_DM) {
+    x_post_t *grown;
+    count = dm_sealed(t, &posts, count);
+    // what the user was reading, read again: the newest message, or one
+    // further up, which stays where it was on the screen
+    if(t->count && t->cards) {
+      const int last = t->count - 1 - (t->count > 1 && t->cards[t->count - 1].pending);
+      had = 1;
+      old_scroll = t->scroll;
+      if(t->sel >= 0 && t->sel < last && t->posts[t->sel].id[0]) {
+        snprintf(keep, sizeof keep, "%s", t->posts[t->sel].id);
+        keep_off = t->cards[t->sel].y - t->scroll;
+      }
+    }
+    // the message that went last, until X lists it
+    if(dm_pending_wanted(t, posts, count) && (grown=mem_realloc(posts, (size_t)(count + 1) * sizeof *grown))) {
+      posts = grown;
+      dm_pending_fill(t, &posts[count++]);
+      pending = 1;
+    } else if(g_dm.state == DM_SENT && !strcmp(g_dm.sent_conv, t->arg)) {
+      g_dm.state = DM_NONE; // X has it
+    }
+  }
+  if(t->feed == UI_FRIENDS) {
+    // a look of its own: noted, the side column's box from it too, and in
+    // the order of a PS5's friends
+    friends_noted(posts, count, when);
+    if(!strcmp(req->id, g_playing_who)) {
+      playing_keep(posts, count);
+    }
+    posts = friends_sorted(posts, count);
   }
 
   mem_free(t->cards);
@@ -1729,10 +2778,40 @@ ui_result(const ui_request_t *req, x_post_t *posts, int count, const char *curso
     focus(t);
   }
   if(t->feed == UI_DM && count) {
-    // the newest message, at the bottom, as a conversation opens
-    t->sel = count - 1;
-    show_selected(t);
-    t->scroll = t->target;
+    int found = -1;
+    dm_dress(t, pending);
+    for(int i=0; keep[0] && i < count && found < 0; i++) {
+      found = !strcmp(posts[i].id, keep) ? i : -1;
+    }
+    if(found >= 0) {
+      // read again with the user further up: that message stays put
+      t->sel = found;
+      t->target = t->cards[found].y - keep_off;
+      clamp_target(t);
+      t->scroll = t->target;
+    } else {
+      // the newest message, at the bottom, as a conversation opens; read
+      // again, the list glides down to a new one
+      t->sel = count - 1;
+      show_selected(t);
+      t->scroll = had && old_scroll < t->target ? old_scroll : t->target;
+    }
+  }
+  for(int i=0; t->feed == UI_CHAT && keep[0] && i < count; i++) {
+    if(!strcmp(posts[i].id, keep)) {
+      // the cursor stays on that conversation; at the top of the list, a new
+      // one shows above it, otherwise it stays where it was on the screen
+      t->sel = i;
+      if(old_scroll <= 0) {
+        t->target = 0;
+        show_selected(t);
+      } else {
+        t->target = t->cards[i].y - keep_off;
+        clamp_target(t);
+      }
+      t->scroll = t->target;
+      break;
+    }
   }
 }
 
@@ -1870,8 +2949,10 @@ ui_wanted(ui_request_t *req) {
     }
     return want_me(req) || want_side(req);
   }
-  // whose conversations Chat reads: the signed-in user's number first
-  if(t->feed == UI_CHAT && t->wanted && !me->has_user) {
+  // whose conversations Chat reads: the signed-in user's number first;
+  // whose follows Friends reads, when the settings do not have it yet
+  if((t->feed == UI_CHAT || (t->feed == UI_FRIENDS && !g_settings.ids[g_settings.account - 1][0])) && t->wanted &&
+     !me->has_user) {
     if(me->loading) {
       return 0;
     }
@@ -1881,12 +2962,33 @@ ui_wanted(ui_request_t *req) {
   }
   req->view = t->serial;
   req->feed = t->feed;
+  req->xchat = t->xchat; // a conversation on X Chat is read there, encrypted
+  snprintf(req->xchat_id, sizeof req->xchat_id, "%s", t->feed == UI_DM ? t->xchat_id : "");
   snprintf(req->id, sizeof req->id, "%s", t->feed == UI_ME ? t->user.id :
-           t->feed == UI_ARTICLES || t->feed == UI_CHAT ? (me->has_user ? me->user.id : "") : t->arg);
+           t->feed == UI_FRIENDS && g_settings.ids[g_settings.account - 1][0] ? g_settings.ids[g_settings.account - 1] :
+           t->feed == UI_ARTICLES || t->feed == UI_CHAT || t->feed == UI_FRIENDS ?
+           (me->has_user ? me->user.id : "") : t->arg);
   snprintf(req->query, sizeof req->query, "%s", t->query);
   req->latest = t->latest;
+  // a conversation shown reads its new messages by itself now and then, as
+  // x.com's does, also when the payload does not look at the inbox (its
+  // notifications off); more seldom after a reading that did not come, and
+  // not while a message is written or goes
+  if(t->feed == UI_DM && !t->wanted && g_now > 0 && !g_act.kind &&
+     g_now - t->asked_at >= (t->error ? DM_RETRY : DM_EVERY)) {
+    t->wanted = 1;
+    t->quiet = 1;
+  }
+  // and the conversations, when nothing else tells of new ones (the
+  // payload's look at the inbox goes with its notifications)
+  if(t->feed == UI_CHAT && !g_settings.notify && me->has_user && !g_pick && !t->wanted && g_now > 0 && !g_act.kind &&
+     (t->fetched_at || t->error) && g_now - t->asked_at >= (t->error ? DM_RETRY : CHATS_EVERY)) {
+    t->wanted = 1;
+    t->quiet = 1;
+  }
   if(t->wanted) {
     t->wanted = 0;
+    t->asked_at = g_now;
     t->loading = LOAD_TOP;
     req->profile = t->feed == UI_ME || t->feed == UI_USER || (t->feed == UI_ARTICLES && !req->id[0]);
     return 1;
@@ -1975,6 +3077,8 @@ move(tab_t *t, unsigned keys) {
     } else if(t->more_error && t->cursor[0]) {
       // ↓ at the end tries the posts after it again
       t->more_error = ERR_NONE;
+    } else if(!t->cursor[0] && !t->loading) {
+      g_rumble = UI_RUMBLE_EDGE; // nothing more below: the triggers tell
     }
   }
   if(keys & UI_UP) {
@@ -2054,6 +3158,9 @@ toast(int error, const char *fmt, ...) {
   va_end(args);
   g_toast.error = error;
   g_toast.frames = TOAST_FRAMES;
+  if(error) {
+    g_rumble = UI_RUMBLE_ERROR;
+  }
 }
 
 
@@ -2221,10 +3328,22 @@ ui_search(const char *text) {
  * the search's tab of top posts, or with latest of the latest ones; the
  * one shown goes back to its top
  **/
+static void fill_history(void);
+
 static int
 set_product(int latest) {
   tab_t *t = &g_tabs[UI_SEARCH];
 
+  if(g_section == UI_HISTORY) {
+    // History's tabs: what was opened, or Read later
+    g_tabs[UI_HISTORY].latest = latest;
+    fill_history();
+    return 1;
+  }
+  if(g_section == UI_NOTIFICATIONS) {
+    // Notifications' tabs: the account in use, or every account in one
+    t = &g_tabs[UI_NOTIFICATIONS];
+  }
   if(t->latest == latest) {
     t->sel = 0;
     t->target = 0;
@@ -2384,15 +3503,100 @@ history_add(const x_post_t *p) {
 }
 
 
+/*
+ * Read later: posts kept to read after playing (from a post's •••),
+ * newest first, on the console until they are taken out; History's
+ * second tab.
+ */
+
+#define LATER_MAX UI_LATER_MAX
+
+static x_post_t *g_later; // mem_alloc'd, LATER_MAX of them
+static int       g_later_count;
+static int       g_later_changed; // since ui_later_get
+
+
+int
+ui_later_get(const x_post_t **posts, int *changed) {
+  *posts = g_later;
+  *changed = g_later_changed;
+  g_later_changed = 0;
+  return g_later ? g_later_count : 0;
+}
+
+
+void
+ui_later_set(const x_post_t *posts, int count) {
+  int n = 0;
+
+  if(count <= 0 || (!g_later && !(g_later=mem_calloc(LATER_MAX, sizeof *g_later)))) {
+    return;
+  }
+  for(int i=0; i < count && n < LATER_MAX; i++) {
+    if(posts[i].kind == X_KIND_POST && posts[i].id[0]) {
+      g_later[n++] = posts[i];
+    }
+  }
+  g_later_count = n;
+}
+
+
+static int
+is_later(const char *id) {
+  for(int i=0; id[0] && i < g_later_count; i++) {
+    if(!strcmp(g_later[i].id, id)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+
 /**
- * the History section's list, from what was opened
+ * p on top of Read later: 1, 0 when it is there already, -1 when it is full
+ **/
+static int
+later_add(const x_post_t *p) {
+  if(!p->id[0] || p->kind != X_KIND_POST || is_later(p->id)) {
+    return 0;
+  }
+  if((!g_later && !(g_later=mem_calloc(LATER_MAX, sizeof *g_later))) || g_later_count >= LATER_MAX) {
+    return -1;
+  }
+  memmove(&g_later[1], &g_later[0], (size_t)g_later_count * sizeof *g_later);
+  g_later[0] = *p;
+  g_later[0].reposter[0] = g_later[0].reposter_name[0] = 0;
+  g_later[0].pinned = 0;
+  g_later_count++;
+  g_later_changed = 1;
+  return 1;
+}
+
+
+static void
+later_remove(const char *id) {
+  for(int i=0; i < g_later_count; i++) {
+    if(!strcmp(g_later[i].id, id)) {
+      memmove(&g_later[i], &g_later[i + 1], (size_t)(g_later_count - i - 1) * sizeof *g_later);
+      g_later_count--;
+      g_later_changed = 1;
+      return;
+    }
+  }
+}
+
+
+/**
+ * the History section's list, from what was opened, or (its second tab)
+ * from Read later
  **/
 static void
 fill_history(void) {
   tab_t *t = &g_tabs[UI_HISTORY];
+  const x_post_t *from = t->latest ? g_later : g_history;
   x_post_t *posts = NULL;
   card_t *cards = NULL;
-  int n = g_history_count;
+  int n = t->latest ? g_later_count : g_history_count;
 
   mem_free(t->cards);
   mem_free(t->posts);
@@ -2401,7 +3605,7 @@ fill_history(void) {
   t->count = t->sel = t->scroll = t->target = 0;
   t->error = ERR_NONE;
   if(n && (posts=mem_calloc(n, sizeof *posts)) && (cards=mem_calloc(n, sizeof *cards))) {
-    memcpy(posts, g_history, (size_t)n * sizeof *posts);
+    memcpy(posts, from, (size_t)n * sizeof *posts);
     t->posts = posts;
     t->cards = cards;
     t->count = n;
@@ -2484,6 +3688,38 @@ open_list(const x_post_t *p) {
 
 
 /**
+ * the X Chat PIN asked for while the account's keys are not in hand: the
+ * keyboard, masked, whose PIN main.c recovers the keys with (it is never
+ * kept). loud: a toast when it cannot be asked now. Returns 1 when it was
+ * asked (or said why not), 0 when the keys are in hand
+ **/
+static int
+xchat_ask_pin(int loud) {
+  const char *me = g_settings.ids[g_settings.account - 1];
+
+  if(xchat_open_ready(me)) {
+    return 0;
+  }
+  if(!me[0]) {
+    // without the account's number there is no way to recover its keys
+    toast(0, "%s", L("Abre primeiro o X Chat para teres o teu n\xc3\xbamero.",
+                     "Open X Chat first so your number is known."));
+    return 1;
+  }
+  if(g_act.kind) {
+    if(loud) {
+      toast(1, "%s", L("Espera que acabe o que est\xc3\xa1 a ser enviado", "Wait for what is being sent"));
+    }
+    return loud;
+  }
+  memset(&g_act, 0, sizeof g_act);
+  g_act.kind = UI_ACT_XCHAT_PIN;
+  snprintf(g_act.id, sizeof g_act.id, "%s", me);
+  return 1;
+}
+
+
+/**
  * a conversation of Chat, its messages to be read
  **/
 static int
@@ -2496,6 +3732,14 @@ open_chat(const x_post_t *p) {
   }
   copy = *p;
   t = push(UI_DM, copy.id);
+  t->xchat = copy.xchat; // its page is read on X Chat, encrypted, and opened with the key
+  // one of the inbox's that goes on on X Chat (xchat_merge keeps its number
+  // there in reposter): its messages there join the inbox's, and it is
+  // answered as before
+  snprintf(t->xchat_id, sizeof t->xchat_id, "%s", !copy.xchat ? copy.reposter : "");
+  if(copy.xchat || copy.reposter[0]) {
+    xchat_ask_pin(0); // still locked: the PIN, over the conversation
+  }
   // who it is with, for its title; a group has no screen name
   snprintf(t->user.id, sizeof t->user.id, "%s", copy.group ? "" : copy.user_id);
   snprintf(t->user.user, sizeof t->user.user, "%s", copy.group ? "" : copy.user);
@@ -2537,6 +3781,20 @@ grok_fresh(void) {
 
 
 /**
+ * ✕ on Calls: the microphone's test on or off, or again after it failed
+ **/
+static int
+mic_toggle(void) {
+  if(g_mic.want && g_mic.state == UI_MIC_FAILED) {
+    g_mic.retry = 1;
+  } else {
+    g_mic.want = !g_mic.want;
+  }
+  return 1;
+}
+
+
+/**
  * the keyboard for a message to the conversation shown, starting with what
  * was written to it and did not go
  **/
@@ -2548,6 +3806,10 @@ dm_write(tab_t *t) {
   if(strcmp(g_dm.conv, t->arg)) {
     snprintf(g_dm.conv, sizeof g_dm.conv, "%s", t->arg);
     g_dm.text[0] = 0;
+  }
+  // the words of a message that did not go to it, written again
+  if(!g_dm.text[0] && g_dm.state == DM_FAILED && !strcmp(g_dm.sent_conv, t->arg)) {
+    snprintf(g_dm.text, sizeof g_dm.text, "%s", g_dm.sent);
   }
   memset(&g_act, 0, sizeof g_act);
   g_act.kind = UI_ACT_DM_TEXT;
@@ -2566,6 +3828,7 @@ static int
 invite(const char *id, const char *user, const char *theirs) {
   const char *me = g_settings.ids[g_settings.account - 1];
   const char *game = g_game.name[0] ? g_game.name : theirs;
+  const tab_t *shown = view();
   char conv[X_ID_MAX];
 
   if(g_act.kind) {
@@ -2577,7 +3840,14 @@ invite(const char *id, const char *user, const char *theirs) {
                      "Open a game first: the invite is for the game that runs."));
     return 1;
   }
-  if(play_conversation(me, id, conv, sizeof conv) ||
+  // their conversation: the one shown, when it is theirs, else the one
+  // X names after the two numbers
+  if(shown->feed == UI_DM && shown->user.id[0] && !strcmp(shown->user.id, id) && shown->arg[0]) {
+    snprintf(conv, sizeof conv, "%s", shown->arg);
+  } else if(play_conversation(me, id, conv, sizeof conv)) {
+    conv[0] = 0;
+  }
+  if(!conv[0] ||
      play_invite(game, g_game.name[0] && game_id_ok(g_game.id) ? g_game.id : NULL, L("bora jogar?", "let's play?"),
                  g_play_act.text, sizeof g_play_act.text)) {
     toast(1, "%s", L("Este convite n\xc3\xa3o se pode enviar.", "This invite cannot be sent."));
@@ -2587,6 +3857,165 @@ invite(const char *id, const char *user, const char *theirs) {
   g_act.kind = UI_ACT_INVITE;
   snprintf(g_act.id, sizeof g_act.id, "%s", conv);
   snprintf(g_act.user, sizeof g_act.user, "%s", user);
+  g_play_act.group = 0;
+  g_play_act.join = 0;
+  return 1;
+}
+
+
+/**
+ * the one-to-one conversation with someone the user follows (L2 on a
+ * friend), opened even before it has a message
+ **/
+static int
+friend_chat(const x_post_t *p) {
+  static x_post_t chat;
+  const char *me = g_settings.ids[g_settings.account - 1];
+
+  memset(&chat, 0, sizeof chat);
+  if(!p->user_id[0] || play_conversation(me, p->user_id, chat.id, sizeof chat.id)) {
+    toast(1, "%s", L("Esta conversa n\xc3\xa3o se deixa abrir", "This conversation cannot be opened"));
+    return 1;
+  }
+  chat.kind = X_KIND_CHAT;
+  snprintf(chat.user_id, sizeof chat.user_id, "%s", p->user_id);
+  snprintf(chat.user, sizeof chat.user, "%s", p->user);
+  snprintf(chat.name, sizeof chat.name, "%s", p->name);
+  snprintf(chat.avatar, sizeof chat.avatar, "%s", p->avatar);
+  chat.badge = p->badge;
+  return open_chat(&chat);
+}
+
+
+/**
+ * R2 on a friend who plays: a message that asks them to let the user into
+ * their game, as PSN's "Request to join" does; their XPS5 offers to invite
+ * the user back with ✕
+ **/
+static int
+friend_join(const x_post_t *p) {
+  const char *me = g_settings.ids[g_settings.account - 1];
+  char conv[X_ID_MAX];
+
+  if(g_act.kind) {
+    toast(1, "%s", L("Espera que acabe o que est\xc3\xa1 a ser enviado", "Wait for what is being sent"));
+    return 1;
+  }
+  if(!p->playing[0]) {
+    toast(1, L("@%s n\xc3\xa3o est\xc3\xa1 a jogar agora: R1 convida para o teu jogo.",
+               "@%s is not playing now: R1 invites them to your game."), p->user);
+    return 1;
+  }
+  if(play_conversation(me, p->user_id, conv, sizeof conv) ||
+     play_join(p->playing, L("posso entrar?", "can I join?"), g_play_act.text, sizeof g_play_act.text)) {
+    toast(1, "%s", L("Este pedido n\xc3\xa3o se pode enviar.", "This request cannot be sent."));
+    return 1;
+  }
+  memset(&g_act, 0, sizeof g_act);
+  g_act.kind = UI_ACT_INVITE; // a message as an invite is, in other words
+  snprintf(g_act.id, sizeof g_act.id, "%s", conv);
+  snprintf(g_act.user, sizeof g_act.user, "%s", p->user);
+  g_play_act.group = 0;
+  g_play_act.join = 1;
+  return 1;
+}
+
+
+/**
+ * a change of the friends' activity: the profile of who it was
+ **/
+static int
+open_event(const seen_event_t *e) {
+  static x_post_t p;
+
+  memset(&p, 0, sizeof p);
+  p.kind = X_KIND_USER;
+  snprintf(p.user_id, sizeof p.user_id, "%s", e->id);
+  snprintf(p.user, sizeof p.user, "%s", e->user);
+  snprintf(p.name, sizeof p.name, "%s", e->name);
+  snprintf(p.avatar, sizeof p.avatar, "%s", e->avatar);
+  return open_user(&p);
+}
+
+
+/**
+ * a button of the player card on the profile t (GAMER_*)
+ **/
+static int
+gamer_button(const tab_t *t, int which) {
+  static x_post_t p;
+
+  if(which == GAMER_WEEK) {
+    return game_button(GAME_WEEK);
+  }
+  if(!t->has_user || !t->user.id[0]) {
+    return 0;
+  }
+  memset(&p, 0, sizeof p);
+  p.kind = X_KIND_USER;
+  snprintf(p.user_id, sizeof p.user_id, "%s", t->user.id);
+  snprintf(p.user, sizeof p.user, "%s", t->user.user);
+  snprintf(p.name, sizeof p.name, "%s", t->user.name);
+  snprintf(p.avatar, sizeof p.avatar, "%s", t->user.avatar);
+  p.badge = t->user.badge;
+  play_game_of(t->user.location, p.playing, sizeof p.playing);
+  p.online = !p.playing[0] && play_online_of(t->user.location);
+  switch(which) {
+  case GAMER_INVITE:
+    return invite(p.user_id, p.user, p.playing);
+  case GAMER_JOIN:
+    return friend_join(&p);
+  case GAMER_CHAT:
+    return friend_chat(&p);
+  }
+  return 0;
+}
+
+
+/**
+ * ✕ on a friend's request to join: an invite back, to the game that runs
+ * here, else to the one they asked to join
+ **/
+static int
+join_answer(const x_post_t *p) {
+  char game[PLAY_GAME];
+
+  if(!p->user_id[0] || !play_join_parse(p->text, game, sizeof game)) {
+    return 0;
+  }
+  return invite(p->user_id, p->user, game);
+}
+
+
+/**
+ * R1 in a group's conversation: an invite to the game that runs here, one
+ * message to the whole group, as a party's invite goes to all of it
+ **/
+static int
+party_invite(tab_t *t) {
+  if(!is_party(t)) {
+    return 0;
+  }
+  if(g_act.kind) {
+    toast(1, "%s", L("Espera que acabe o que est\xc3\xa1 a ser enviado", "Wait for what is being sent"));
+    return 1;
+  }
+  if(!g_game.name[0]) {
+    toast(1, "%s", L("Abre um jogo primeiro: o convite \xc3\xa9 para o jogo que est\xc3\xa1 a correr.",
+                     "Open a game first: the invite is for the game that runs."));
+    return 1;
+  }
+  if(play_invite(g_game.name, game_id_ok(g_game.id) ? g_game.id : NULL, L("bora jogar?", "let's play?"),
+                 g_play_act.text, sizeof g_play_act.text)) {
+    toast(1, "%s", L("Este convite n\xc3\xa3o se pode enviar.", "This invite cannot be sent."));
+    return 1;
+  }
+  memset(&g_act, 0, sizeof g_act);
+  g_act.kind = UI_ACT_INVITE;
+  snprintf(g_act.id, sizeof g_act.id, "%s", t->arg);
+  copy_whole(g_act.user, sizeof g_act.user, t->user.name[0] ? t->user.name : L("Grupo", "Group"));
+  g_play_act.group = 1;
+  g_play_act.join = 0;
   return 1;
 }
 
@@ -2645,7 +4074,19 @@ open_selected(tab_t *t) {
     return g_pick ? share_to(p) : open_chat(p);
   }
   if(p->kind == X_KIND_DM) {
-    return p->icon == X_DM_INVITE ? launch_invite(p) : dm_write(t);
+    // a message of X Chat still encrypted: ✕ asks for the PIN that opens it
+    if(p->sealed && xchat_ask_pin(1)) {
+      return 1;
+    }
+    // a picture, video or voice note of X Chat: ✕ shows or plays it (L2 writes)
+    if(dm_media(p)) {
+      return open_dm_media(p);
+    }
+    return p->icon == X_DM_INVITE ? launch_invite(p) : p->icon == X_DM_JOIN && !p->mine ? join_answer(p) :
+      dm_write(t);
+  }
+  if(p->kind == X_KIND_USER) {
+    return open_user(p);
   }
   if(p->kind == X_KIND_TREND) {
     return open_trend(p);
@@ -2681,6 +4122,49 @@ open_viewer(const x_post_t *p, int index) {
   g_viewer.index = index >= 0 && index < p->media_count ? index : 0;
   memcpy(g_viewer.media, p->media, sizeof g_viewer.media);
   return 1;
+}
+
+
+/**
+ * a voice note of X Chat played, sound only (its MP4 read by main.c's
+ * media_read, fetched and opened at once): again, it pauses; once more, it
+ * goes on; one that failed is tried again
+ **/
+static int
+dm_voice(const x_media_t *m) {
+  player_status_t st;
+
+  if(!m->video_url[0]) {
+    return 0;
+  }
+  if(player_is(m->video_url)) {
+    player_status(&st);
+    if(st.state == PLAYER_PLAYING || st.state == PLAYER_PAUSED) {
+      player_pause(st.state == PLAYER_PLAYING);
+      return 1;
+    }
+    if(st.state != PLAYER_FAILED) {
+      return 1; // still coming
+    }
+  }
+  player_speaker(g_settings.speaker); // on the controller, when Settings says so
+  player_open(m->video_url, 16, 16, 1, m->duration_ms);
+  return 1;
+}
+
+
+/**
+ * ✕ or the pointer on a message's media: a picture or video over the whole
+ * screen, a voice note played or paused
+ **/
+static int
+open_dm_media(const x_post_t *p) {
+  const x_media_t *m = dm_media(p);
+
+  if(!m) {
+    return 0;
+  }
+  return m->voice ? dm_voice(m) : open_viewer(p, 0);
 }
 
 
@@ -2751,8 +4235,8 @@ act(tab_t *t, int kind) {
   x_post_t *p;
 
   if(t->feed == UI_DM) {
-    // L2 writes to the conversation; R2 does nothing to a message
-    return kind == UI_ACT_REPLY ? dm_write(t) : 0;
+    // L2 writes to the conversation; R2 speaks to it, a voice note
+    return kind == UI_ACT_REPLY ? dm_write(t) : voice_open_dm(t);
   }
   if(!t->count || g_act.kind) {
     return 0;
@@ -2760,6 +4244,9 @@ act(tab_t *t, int kind) {
   p = &t->posts[t->sel];
   if(p->kind == X_KIND_CHAT) {
     return kind == UI_ACT_REPLY ? open_chat(p) : 0;
+  }
+  if(p->kind == X_KIND_USER) {
+    return kind == UI_ACT_REPLY ? friend_chat(p) : friend_join(p);
   }
   if(p->kind == X_KIND_TREND || p->kind == X_KIND_LIST) {
     return 0; // nothing to like or reply to
@@ -2939,6 +4426,17 @@ vote(tab_t *t, int choice) {
 }
 
 
+// the Space heard in the background (space.h), see ui_space
+static struct {
+  char id[X_SPACE_ID];  // the one playing, or empty
+  char host[64];
+  char title[256];
+  int  live;
+  int  state;           // SPACE_* last seen, for the toast when it changes
+  long long shown;      // the second of it, waiting and quiet shown on top
+} g_space;
+
+
 /**
  * kind (UI_ACT_FOLLOW to UI_ACT_UNBLOCK) to the user with the number id,
  * or pinning the post id: on the screen at once, then on X
@@ -3044,8 +4542,28 @@ action_error(int error, int code, int x_code, char *buf, size_t size) {
                                 "X could not process the video"));
   } else if(error == ERR_TOO_BIG) {
     snprintf(buf, size, "%s", L("ficheiro grande demais", "the file is too big"));
+  } else if(error == ERR_CLIP) {
+    snprintf(buf, size, L("o v\xc3\xad" "deo n\xc3\xa3o se deixou cortar (%d); manda-o inteiro",
+                          "the video could not be trimmed (%d); send it whole"), code);
+  } else if(error == ERR_SPACE_OFF) {
+    snprintf(buf, size, "%s", L("o Space n\xc3\xa3o est\xc3\xa1 no ar", "the Space is not on the air"));
   } else if(error == ERR_LAUNCH) {
     snprintf(buf, size, "0x%08X", (unsigned)code);
+  } else if(error == ERR_XCHAT_LOCKED) {
+    snprintf(buf, size, "%s", L("sem tentativas; rep\xc3\xb5" "e o PIN nas apps do X",
+                                "no tries left; reset the PIN in X's apps"));
+  } else if(error == ERR_XCHAT_NONE) {
+    snprintf(buf, size, "%s", L("esta conta n\xc3\xa3o tem chaves do X Chat", "this account has no X Chat keys"));
+  } else if(error == ERR_XCHAT_IDENTITY && code > 0) {
+    // the sizes the check saw (main.c): what to look at when X's keys change
+    snprintf(buf, size, L("a chave n\xc3\xa3o \xc3\xa9 desta conta (%d bytes; o X listou %d chaves, %d lidas)",
+                          "the key is not this account's (%d bytes; X listed %d keys, %d read)"),
+             code, x_code / 100, x_code % 100);
+  } else if(error == ERR_XCHAT_IDENTITY) {
+    snprintf(buf, size, "%s", L("a chave n\xc3\xa3o \xc3\xa9 desta conta", "the key is not this account's"));
+  } else if(error == ERR_XCHAT_NET) {
+    snprintf(buf, size, "%s", L("os servidores do X Chat n\xc3\xa3o responderam",
+                                "the X Chat servers did not answer"));
   } else {
     snprintf(buf, size, L("erro %d", "error %d"), error);
   }
@@ -3093,6 +4611,14 @@ ui_action_done(int error, int code, int x_code) {
     g_sched.sel = g_sched.sel >= g_sched.count && g_sched.count ? g_sched.count - 1 : g_sched.sel;
   }
 
+  // what the controller feels when it went: a tick for a like, a repost or
+  // a bookmark; a run for what the user wrote (an error buzzes with its toast)
+  if(!error && (kind == UI_ACT_LIKE || kind == UI_ACT_REPOST || kind == UI_ACT_BOOKMARK)) {
+    g_rumble = UI_RUMBLE_TICK;
+  } else if(!error && (kind == UI_ACT_POST || kind == UI_ACT_REPLY || kind == UI_ACT_QUOTE ||
+                       kind == UI_ACT_DM || kind == UI_ACT_VOICE_DM || kind == UI_ACT_SHARE_DM)) {
+    g_rumble = UI_RUMBLE_SENT;
+  }
   action_error(error, code, x_code, why, sizeof why);
   if(error == ERR_KEYBOARD) {
     toast(1, L("O teclado da PS5 n\xc3\xa3o abriu (0x%08X)", "The PS5 keyboard did not open (0x%08X)"),
@@ -3194,6 +4720,8 @@ ui_action_done(int error, int code, int x_code) {
         toast(1, L("O voto n\xc3\xa3o foi contado (%s)", "Your vote was not counted (%s)"), why);
       }
     }
+  } else if(kind == UI_ACT_GROK && g_grok_what != UI_GROK_HINT) {
+    gcard_done(error, code, x_code);
   } else if(kind == UI_ACT_GROK) {
     g_grok.asking = 0;
     g_grok.error = error;
@@ -3205,6 +4733,11 @@ ui_action_done(int error, int code, int x_code) {
   } else if(kind == UI_ACT_POLL_TEXT) {
     // the keyboard closed: the choice stays as it was
   } else if(kind == UI_ACT_DM) {
+    // its bubble says how it went: gone, until the conversation read again
+    // has it, or not gone (✕ writes it again, from what did not go)
+    g_dm.state = !error ? DM_SENT : error == ERR_CANCELLED ? DM_NONE : DM_FAILED;
+    g_dm.at = g_now;
+    dm_pending_show();
     if(!error) {
       g_dm.text[0] = 0;
       toast(0, "%s", L("Mensagem enviada.", "Message sent."));
@@ -3220,11 +4753,25 @@ ui_action_done(int error, int code, int x_code) {
     }
   } else if(kind == UI_ACT_INVITE) {
     if(!error) {
-      toast(0, L("Convite enviado a @%s.", "Invite sent to @%s."), g_act.user);
+      if(g_play_act.join) {
+        toast(0, L("Pedido para entrar enviado a @%s.", "Request to join sent to @%s."), g_act.user);
+      } else if(g_play_act.group) {
+        toast(0, L("Convite enviado ao grupo %s.", "Invite sent to the group %s."), g_act.user);
+      } else {
+        toast(0, L("Convite enviado a @%s.", "Invite sent to @%s."), g_act.user);
+      }
+      // the conversation and Chat read again, with it
+      for(int i=0; (t=list_at(i)); i++) {
+        if(t->feed == UI_DM && !strcmp(t->arg, g_act.id)) {
+          t->wanted = 1;
+        }
+      }
       g_tabs[UI_CHAT].wanted = 1;
     } else if(x_code == 349 || x_code == 150) {
       // X: the user does not take messages from the user, or only from who they follow
       toast(1, L("@%s n\xc3\xa3o recebe mensagens tuas.", "@%s does not take your messages."), g_act.user);
+    } else if(error != ERR_CANCELLED && g_play_act.join) {
+      toast(1, L("O pedido n\xc3\xa3o foi enviado (%s)", "The request was not sent (%s)"), why);
     } else if(error != ERR_CANCELLED) {
       toast(1, L("O convite n\xc3\xa3o foi enviado (%s)", "The invite was not sent (%s)"), why);
     }
@@ -3238,6 +4785,19 @@ ui_action_done(int error, int code, int x_code) {
     } else {
       toast(1, L("O jogo n\xc3\xa3o abriu (%s)", "The game did not open (%s)"), why);
     }
+  } else if(kind == UI_ACT_VOICE_DM) {
+    memset(&g_voice_dm, 0, sizeof g_voice_dm);
+    if(!error) {
+      toast(0, L("Nota de voz enviada para %s.", "Voice note sent to %s."), g_act.user);
+      for(int i=0; (t=list_at(i)); i++) {
+        if(t->feed == UI_DM && !strcmp(t->arg, g_act.id)) {
+          t->wanted = 1;
+        }
+      }
+      g_tabs[UI_CHAT].wanted = 1;
+    } else if(error != ERR_CANCELLED) {
+      toast(1, L("A nota de voz n\xc3\xa3o foi enviada (%s)", "The voice note was not sent (%s)"), why);
+    }
   } else if(kind == UI_ACT_SHARE_DM) {
     compose_done(error);
     if(!error) {
@@ -3246,6 +4806,37 @@ ui_action_done(int error, int code, int x_code) {
     } else if(error != ERR_CANCELLED) {
       toast(1, L("A mensagem n\xc3\xa3o foi enviada (%s)", "The message was not sent (%s)"), why);
       g_sheet = SHEET_COMPOSE; // the draft, back where it was
+    }
+  } else if(kind == UI_ACT_XCHAT_PIN || kind == UI_ACT_XCHAT_UNLOCK) {
+    // the unlock's outcome (the keyboard's kind stays until the worker is done)
+    if(!error) {
+      // the account's keys are in hand: the inbox and the conversation shown open now
+      g_tabs[UI_CHAT].wanted = 1;
+      if(view()->feed == UI_DM) {
+        view()->wanted = 1;
+      }
+      toast(0, "%s", L("X Chat aberto. As mensagens cifradas aparecem agora.",
+                       "X Chat unlocked. Encrypted messages now show."));
+    } else if(error == ERR_XCHAT_PIN && x_code >= 0) {
+      toast(1, L("PIN errado. Restam %d tentativas.", "Wrong PIN. %d tries left."), x_code);
+    } else if(error != ERR_CANCELLED) {
+      toast(1, "%s", why);
+    }
+  } else if(kind == UI_ACT_SPACE) {
+    if(!error && g_space.title[0]) {
+      toast(0, L("A ouvir \xc2\xab%s\xc2\xbb de @%s. Continua enquanto navegas; para no \xe2\x80\xa2\xe2\x80\xa2\xe2\x80\xa2 do post.",
+                 "Listening to \xe2\x80\x9c%s\xe2\x80\x9d by @%s. It goes on as you browse; stop it in the post's \xe2\x80\xa2\xe2\x80\xa2\xe2\x80\xa2."),
+            g_space.title, g_space.host);
+    } else if(!error) {
+      toast(0, L("A ouvir o Space de @%s. Continua enquanto navegas; para no \xe2\x80\xa2\xe2\x80\xa2\xe2\x80\xa2 do post.",
+                 "Listening to @%s's Space. It goes on as you browse; stop it in the post's \xe2\x80\xa2\xe2\x80\xa2\xe2\x80\xa2."),
+            g_space.host);
+    } else if(error == ERR_SPACE_OFF) {
+      toast(1, "%s", code == X_SPACE_SOON ? L("Este Space ainda n\xc3\xa3o come\xc3\xa7ou.", "This Space has not started yet.") :
+            code == X_SPACE_ENDED ? L("Este Space acabou e n\xc3\xa3o ficou gravado.", "This Space ended and was not recorded.") :
+            L("Este Space n\xc3\xa3o est\xc3\xa1 no ar.", "This Space is not on the air."));
+    } else if(error != ERR_CANCELLED) {
+      toast(1, L("O Space n\xc3\xa3o se deixou ouvir (%s)", "The Space could not be played (%s)"), why);
     }
   } else if(mark && !error) {
     toast(0, "%s", kind == UI_ACT_BOOKMARK ?
@@ -3390,6 +4981,33 @@ lit_circle(float cx, float cy, float r, int fill) {
 }
 
 
+// the counts of the bar's bell and Chat (ui_badges)
+static struct {
+  int notices, chats;
+} g_counts;
+
+
+/**
+ * a count on an item of the bar, as x.com puts one on the bell: X's blue,
+ * from the middle of the icon (x) up to right at most, over its top; 99+
+ * past that
+ **/
+static void
+nav_badge(int x, int right, int y, int count) {
+  text_font_t *f = font(F_KEY);
+  char n[8];
+  const int h = 28;
+  int w;
+
+  snprintf(n, sizeof n, count > 99 ? "99+" : "%d", count);
+  w = width_of(f, n) + 14;
+  w = w < h ? h : w;
+  x = x + w > right ? right - w : x;
+  draw_box(&g_dst, x, y, w, h, h / 2.0f, 0, BLUE);
+  text(f, x + (w - width_of(f, n)) / 2, baseline(f, y, h), n, WHITE);
+}
+
+
 // the sections of the bar's items, in x.com's order (Home is the timeline
 // last shown); -2 is More, whose menu has the bookmarks and the settings
 static const int g_nav_sections[NAV_ITEMS] = {
@@ -3403,11 +5021,13 @@ static const int g_nav_sections[NAV_ITEMS] = {
  **/
 static int
 nav_item(void) {
+  const int section = g_section == UI_FRIENDS ? UI_CHAT : g_section; // Chat's second tab
+
   if(g_sheet == SHEET_SETTINGS || g_section == UI_BOOKMARKS || g_section == UI_LISTS) {
     return NAV_ITEMS - 1;
   }
   for(int i=1; i < NAV_ITEMS - 1; i++) {
-    if(g_nav_sections[i] == g_section) {
+    if(g_nav_sections[i] == section) {
       return i;
     }
   }
@@ -3422,8 +5042,8 @@ nav_item(void) {
 static int
 section_step(int d) {
   static const int order[] = {
-    UI_FOR_YOU, UI_FOLLOWING, UI_GAME, UI_SEARCH, UI_NOTIFICATIONS, UI_CHAT, UI_CALLS, UI_GROK, UI_PREMIUM,
-    UI_HISTORY, UI_ARTICLES, UI_ME, UI_BOOKMARKS, UI_LISTS,
+    UI_FOR_YOU, UI_FOLLOWING, UI_GAME, UI_SEARCH, UI_NOTIFICATIONS, UI_CHAT, UI_FRIENDS, UI_CALLS, UI_GROK,
+    UI_PREMIUM, UI_HISTORY, UI_ARTICLES, UI_ME, UI_BOOKMARKS, UI_LISTS,
   };
   const int n = sizeof order / sizeof order[0];
 
@@ -3511,6 +5131,20 @@ click(void) {
     return open_signin(SHEET_NONE);
   case Z_GROK:
     return grok_ask();
+  case Z_MIC:
+    return mic_toggle();
+  case Z_SIDE_GAME:
+    return game_button(z->arg);
+  case Z_DM_VOICE:
+    return voice_open_dm(t);
+  case Z_PARTY_ROW:
+    return z->arg < g_party.count ? open_user(&g_party.items[z->arg]) : 0;
+  case Z_PARTY_INVITE:
+    return party_invite(t);
+  case Z_ACTIVITY:
+    return z->arg < g_seen.events ? open_event(&g_seen.event[z->arg]) : 0;
+  case Z_GAMER:
+    return gamer_button(t, z->arg);
   case Z_MINI:
     return mini_back(t);
   case Z_MINI_CLOSE:
@@ -3585,7 +5219,11 @@ click(void) {
     player_sound(g_inline_sound);
     return 1;
   case Z_MEDIA:
-    open_viewer(&t->posts[t->sel], z->sub);
+    if(t->posts[t->sel].kind == X_KIND_DM) {
+      open_dm_media(&t->posts[t->sel]); // X Chat's picture, video or voice note
+    } else {
+      open_viewer(&t->posts[t->sel], z->sub);
+    }
     return 1;
   case Z_POLL:
     return vote(t, z->sub + 1);
@@ -3649,11 +5287,242 @@ session_error(const tab_t *t) {
 }
 
 
+/*
+ * The way in: XPS5's letters (title/art/logo-full.png) start small in the
+ * middle of a dark screen and grow, faster and faster, until they fill it
+ * and go through it, the screen behind showing as they do; a button sends
+ * them on to there. Then each page comes in over the one before: a section
+ * rises into the main column, a list opened slides in from the right (and
+ * back from the left), For you and Following slide as their tabs sit, and a
+ * sheet or the viewer fades in and out over the whole screen.
+ */
+
+#define INTRO_US     1900000 // the letters' way, in microseconds
+#define INTRO_SKIP   0.70f   // where a button sends them: they start to fill the screen
+#define INTRO_W0     0.16f   // their width at first, of the screen's
+#define INTRO_W1     6.0f    // and at the end, far past its edges
+#define INTRO_STEP   50000   // the most a frame moves them on, so a slow start shows them all
+#define INTRO_LEVELS 3       // the letters at full size, at half and at a quarter
+
+#define TRANS_PAGE_US  320000 // a page's coming in
+#define TRANS_SHEET_US 220000 // a sheet's or the viewer's
+#define TRANS_SLIDE    56     // points a page comes from, across
+#define TRANS_RISE     28     // and a section, from below
+
+enum { INTRO_OFF, INTRO_WAIT, INTRO_RUN };
+enum { TRANS_NONE, TRANS_PAGE, TRANS_SCREEN };
+
+static float smooth(float t);
+
+static int g_motion; // the way in and the transitions, which the title turns on (ui_motion)
+
+static struct {
+  int       state; // INTRO_*
+  uint64_t  us;    // how far into it
+  uint32_t *level[INTRO_LEVELS]; // premultiplied; the first by image_fit, the others by draw_half
+  int       w[INTRO_LEVELS], h[INTRO_LEVELS];
+} g_intro;
+
+static struct {
+  int       kind;           // TRANS_*
+  uint64_t  at;             // g_ui_us when it began
+  float     dx, dy;         // where the new page comes from, in points
+  long long page;           // what showed last: the list,
+  int       depth, section; // how deep, in which section,
+  int       screen;         // and the sheet or the viewer over it
+  int       drawn;          // a frame was drawn: there is one before the next
+  uint32_t *old, *scratch;  // the frame before, and room for the new one's main column
+} g_trans;
+
+
+/**
+ * 0 to 1 slowing down to its end
+ **/
+static float
+ease_out(float u) {
+  u = 1 - (u < 0 ? 0 : u > 1 ? 1 : u);
+  return 1 - u * u * u;
+}
+
+
+void
+ui_motion(void) {
+  g_motion = 1;
+  g_intro.state = INTRO_WAIT;
+}
+
+
+/**
+ * the letters, premultiplied at their size, half and a quarter of it
+ **/
+static void
+intro_load(void) {
+  int w, h;
+
+  if(image_size(xps5_logo_full, sizeof xps5_logo_full, &w, &h) ||
+     !(g_intro.level[0]=image_fit(xps5_logo_full, sizeof xps5_logo_full, w, h))) {
+    return;
+  }
+  draw_premultiply(g_intro.level[0], w, h);
+  g_intro.w[0] = w;
+  g_intro.h[0] = h;
+  for(int i=1; i < INTRO_LEVELS; i++) {
+    if(!(g_intro.level[i]=draw_half(g_intro.level[i - 1], g_intro.w[i - 1], g_intro.h[i - 1]))) {
+      break;
+    }
+    g_intro.w[i] = (g_intro.w[i - 1] + 1) / 2;
+    g_intro.h[i] = (g_intro.h[i - 1] + 1) / 2;
+  }
+}
+
+
+static void
+intro_end(void) {
+  mem_free(g_intro.level[0]);
+  for(int i=1; i < INTRO_LEVELS; i++) {
+    free(g_intro.level[i]);
+  }
+  memset(&g_intro, 0, sizeof g_intro);
+}
+
+
+/**
+ * the dark under the letters (its alpha): whole until they fill the
+ * screen, then gone while they go through it
+ **/
+static unsigned
+intro_cover(void) {
+  const float u = (float)g_intro.us / INTRO_US;
+
+  return (unsigned)(255 * (1 - smooth((u - 0.70f) / 0.24f)) + 0.5f);
+}
+
+
+static void
+draw_intro(void) {
+  const text_surface_t p = text_pixels(&g_dst);
+  const float u = (float)g_intro.us / INTRO_US;
+  float w, h, a;
+  int lv = 0;
+
+  if(g_intro.state == INTRO_WAIT) {
+    g_intro.state = INTRO_RUN;
+    intro_load();
+  }
+  draw_rect(&g_dst, 0, 0, g_dst.width, g_dst.height, RGBA(6, 6, 8, intro_cover()));
+  if(!g_intro.level[0]) {
+    return;
+  }
+  // growing by the same part of itself ever faster: slow at first, then
+  // rushing past the screen's edges, and fading as it goes
+  w = p.width * INTRO_W0 * powf(INTRO_W1 / INTRO_W0, powf(u, 2.4f));
+  h = w * g_intro.h[0] / g_intro.w[0];
+  a = ease_out(u / 0.16f) * (1 - smooth((u - 0.74f) / 0.2f));
+  // the smallest of the letters' sizes still as wide as they show
+  while(lv + 1 < INTRO_LEVELS && g_intro.level[lv + 1] && g_intro.w[lv + 1] >= w) {
+    lv++;
+  }
+  draw_picture_zoom(&g_dst, p.width / 2.0f, p.height / 2.0f, w, h, g_intro.level[lv], g_intro.w[lv],
+                    g_intro.h[lv], (unsigned)(a * 256 + 0.5f));
+}
+
+
+/**
+ * before a frame is drawn: when what shows changed, the frame before is
+ * kept, for the new one to come in over it
+ **/
+static void
+trans_check(const tab_t *t, size_t bytes, int whole) {
+  const long long page = g_depth ? (long long)t->serial : -1 - (long long)g_section;
+  const int screen = g_viewer.open ? 1 << 16 : g_sheet;
+  const int tabs = (g_section == UI_FOR_YOU || g_section == UI_FOLLOWING) &&
+                   (g_trans.section == UI_FOR_YOU || g_trans.section == UI_FOLLOWING);
+  int kind = TRANS_NONE;
+
+  if(g_motion && whole && g_trans.drawn && g_intro.state == INTRO_OFF) {
+    if(screen != g_trans.screen) {
+      kind = TRANS_SCREEN;
+    } else if(page != g_trans.page && !screen) {
+      kind = TRANS_PAGE;
+    }
+  }
+  if(kind && !g_trans.old && !(g_trans.old=mem_alloc(bytes))) {
+    kind = TRANS_NONE;
+  }
+  if(kind == TRANS_PAGE && !g_trans.scratch) {
+    g_trans.scratch = mem_alloc(bytes); // without it, the page comes in where it stays
+  }
+  if(kind) {
+    screen_copy(g_trans.old, g_dst.pixels, bytes);
+    g_trans.kind = kind;
+    g_trans.at = g_ui_us;
+    g_trans.dx = g_trans.dy = 0;
+    if(kind == TRANS_PAGE && g_section != g_trans.section) {
+      if(tabs) {
+        g_trans.dx = g_section > g_trans.section ? TRANS_SLIDE : -TRANS_SLIDE;
+      } else {
+        g_trans.dy = TRANS_RISE;
+      }
+    } else if(kind == TRANS_PAGE) {
+      g_trans.dx = g_depth < g_trans.depth ? -TRANS_SLIDE : TRANS_SLIDE;
+    }
+  }
+  g_trans.page = page;
+  g_trans.depth = g_depth;
+  g_trans.section = g_section;
+  g_trans.screen = screen;
+}
+
+
+/**
+ * after a frame is drawn: the new page mixed over the one before
+ **/
+static void
+draw_trans(int whole) {
+  const uint64_t span = g_trans.kind == TRANS_PAGE ? TRANS_PAGE_US : TRANS_SHEET_US;
+  const uint64_t gone = g_ui_us - g_trans.at;
+  const int x = PANEL_X + 28, y = PANEL_Y + 24;
+  float e;
+
+  if(!g_trans.kind) {
+    return;
+  }
+  if(!whole || gone >= span) {
+    g_trans.kind = TRANS_NONE;
+    return;
+  }
+  e = ease_out((float)gone / span);
+  if(g_trans.kind == TRANS_SCREEN) {
+    draw_mix(&g_dst, 0, 0, UI_WIDTH, UI_HEIGHT, g_trans.old, NULL, NULL, 0, 0, (unsigned)(e * 256 + 0.5f));
+    return;
+  }
+  // the main column, inside the panel's round corners and short of the line
+  // between it and the side column, comes in moving; the rest (the bar of
+  // sections, the side column, the edges) only fades over
+  draw_mix(&g_dst, x, y, DIV_X - 2 - x, PANEL_H - 48, g_trans.old, g_under_used ? NULL : g_backdrop,
+           g_trans.scratch, (int)floorf(g_trans.dx * (1 - e) * g_scale + 0.5f),
+           (int)floorf(g_trans.dy * (1 - e) * g_scale + 0.5f), (unsigned)(e * 256 + 0.5f));
+  draw_mix(&g_dst, 0, 0, x, UI_HEIGHT, g_trans.old, NULL, NULL, 0, 0, (unsigned)(e * 256 + 0.5f));
+  draw_mix(&g_dst, DIV_X - 2, 0, UI_WIDTH - (DIV_X - 2), UI_HEIGHT, g_trans.old, NULL, NULL, 0, 0,
+           (unsigned)(e * 256 + 0.5f));
+  draw_mix(&g_dst, x, 0, DIV_X - 2 - x, y, g_trans.old, NULL, NULL, 0, 0, (unsigned)(e * 256 + 0.5f));
+  draw_mix(&g_dst, x, y + PANEL_H - 48, DIV_X - 2 - x, UI_HEIGHT - (y + PANEL_H - 48), g_trans.old, NULL,
+           NULL, 0, 0, (unsigned)(e * 256 + 0.5f));
+}
+
+
 int
 ui_keys(unsigned keys) {
   tab_t *t = view();
   int changed = 0, s;
 
+  if(g_intro.state != INTRO_OFF) {
+    // a button sends the letters on to where they fill the screen
+    if(g_intro.us < (uint64_t)(INTRO_SKIP * INTRO_US)) {
+      g_intro.us = (uint64_t)(INTRO_SKIP * INTRO_US);
+    }
+    return 1;
+  }
   keys &= ~UI_TOUCHPAD; // the bar is always there
   g_under_stale = 1;     // a button on a sheet may change what is under it
   g_input_us = g_ui_us;
@@ -3675,6 +5544,9 @@ ui_keys(unsigned keys) {
   if((keys & UI_R3) && g_mini.shown) {
     return mini_close();
   }
+  if((keys & UI_R3) && view()->feed == UI_DM) {
+    return phone_open_dm(view()); // the message written on the phone
+  }
   // ← and → go through the sections in the bar's order; ← also closes
   // what was opened from them
   if((keys & UI_LEFT) && g_depth) {
@@ -3691,7 +5563,7 @@ ui_keys(unsigned keys) {
   if(keys & UI_CROSS) {
     t = view();
     // a search without posts: the keyboard for it
-    changed |= g_ptr.shown ? click() : t->feed == UI_GROK ? grok_ask() :
+    changed |= g_ptr.shown ? click() : t->feed == UI_GROK ? grok_ask() : t->feed == UI_CALLS ? mic_toggle() :
       t->feed == UI_SEARCH && !t->count ? ask_search() :
       t->feed == UI_DM && !t->count ? dm_write(t) : !t->count && session_error(t) ? open_signin(SHEET_NONE) :
       open_selected(t);
@@ -3714,6 +5586,22 @@ ui_keys(unsigned keys) {
     t->wanted = 1;
     images_retry();
     changed = 1;
+  }
+  // R1 in a group's conversation: the group invited to the game; on a
+  // friend and in a one-to-one conversation, the one person
+  if((keys & UI_R1) && is_party(t)) {
+    changed |= party_invite(t);
+    keys &= ~UI_R1;
+  } else if((keys & UI_R1) && t->feed == UI_FRIENDS && t->count && t->posts[t->sel].kind == X_KIND_USER) {
+    const x_post_t *p = &t->posts[t->sel];
+    changed |= invite(p->user_id, p->user, p->playing);
+    keys &= ~UI_R1;
+  } else if((keys & UI_R1) && t->feed == UI_DM && t->user.id[0]) {
+    changed |= invite(t->user.id, t->user.user, NULL);
+    keys &= ~UI_R1;
+  } else if((keys & UI_R1) && is_lfg(t)) {
+    changed |= lfg_invite(t);
+    keys &= ~UI_R1;
   }
   if(keys & (UI_UP | UI_DOWN | UI_L1 | UI_R1 | UI_TRIANGLE)) {
     g_ptr.shown = 0;
@@ -3808,6 +5696,21 @@ ui_light(unsigned char rgb[3]) {
 }
 
 
+int
+ui_rumble(void) {
+  int r = g_rumble;
+
+  g_rumble = UI_RUMBLE_NONE;
+  return g_settings.rumble ? r : UI_RUMBLE_NONE;
+}
+
+
+int
+ui_pad_speaker(void) {
+  return g_settings.speaker;
+}
+
+
 void
 ui_pointer(int *x, int *y) {
   *x = g_ptr.shown ? (int)g_ptr.x : -1;
@@ -3853,6 +5756,12 @@ ui_elapsed(unsigned us) {
   }
   break_check();
   g_ui_us += us;
+  if(g_intro.state == INTRO_RUN) {
+    g_intro.us += us < INTRO_STEP ? us : INTRO_STEP;
+    if(g_intro.us >= INTRO_US) {
+      intro_end();
+    }
+  }
   g_step = us / 16667.0f;
   g_step = g_step < 0.5f ? 0.5f : g_step > 3 ? 3 : g_step;
 }
@@ -3881,6 +5790,8 @@ footer_top(const tab_t *t) {
 }
 
 
+static int space_watch(void);
+
 int
 ui_animate(void) {
   tab_t *t = view();
@@ -3888,10 +5799,18 @@ ui_animate(void) {
 
   // a new picture of the video, or its state
   more |= player_changed();
+  // a Space's clock on top, or its end
+  more |= space_watch();
   // the backdrop going over to a banner, or the other theme
   more |= backdrop_move();
   // the pointer turning into its ring, or back
   more |= pointer_turn();
+  // the way in, or a page coming in
+  more |= g_intro.state != INTRO_OFF || g_trans.kind != TRANS_NONE;
+  // a card waiting for its pictures, or a card waiting for the composer
+  more |= (g_card.kind && !g_card.pixels && !g_card.taken) || g_card_wait.ready;
+  // a voice note taped, its clock and loudness
+  more |= g_voice.state != VOICE_OFF && g_sheet == SHEET_VOICE;
 
   if(diff > -3 && diff < 3) {
     t->scroll = t->target;
@@ -4045,13 +5964,27 @@ playing_badge(int x, int y, int size) {
 
 
 /**
+ * the green dot on a picture's corner of someone on XPS5 with no game, where
+ * playing_badge's controller would be
+ **/
+static void
+online_badge(int x, int y, int size) {
+  const float r = 4 + size * 0.1f, cx = x + size * 0.84f, cy = y + size * 0.84f;
+
+  draw_circle(&g_dst, cx, cy, r + 2.5f, INK);
+  draw_circle(&g_dst, cx, cy, r, GREEN);
+  draw_circle(&g_dst, cx - r * 0.3f, cy - r * 0.3f, r * 0.35f, RGBA(255, 255, 255, 90));
+}
+
+
+/**
  * a name row, and after the screen name the game its user plays (playing,
- * or NULL) in green
+ * or NULL) in green, or "On XPS5" when online says they are there with none
  **/
 static void
 draw_name_row_playing(text_font_t *bold, text_font_t *regular, int x, int top, int h, int width,
                       const char *name, int badge, const char *user, long long t, long long now,
-                      const char *playing) {
+                      const char *playing, int online) {
   char handle[96], when[48];
   int size = text_line_height(bold) - 4, base = baseline(bold, top, h), right = x + width;
   int badge_w = badge ? size + 6 : 0, name_w, room;
@@ -4080,14 +6013,20 @@ draw_name_row_playing(text_font_t *bold, text_font_t *regular, int x, int top, i
   x += 12;
   if(x < right) {
     int room_handle = right - x, is = text_line_height(regular) - 6;
-    if(playing && playing[0] && room_handle > 220) {
+    const int game = playing && playing[0];
+    const char *what = game ? playing : online ? L("No XPS5", "On XPS5") : NULL;
+    if(what && room_handle > 220) {
       // the screen name whole when it fits, the game in what is left
       room_handle = width_of(regular, handle) < room_handle - 170 ? width_of(regular, handle) : room_handle - 170;
     }
     x = text_fitted(regular, x, base, handle, room_handle, GREY);
-    if(playing && playing[0] && right - x > 90) {
-      draw_icon(&g_dst, ICON_GAME, x + 16, top + (h - is) / 2, is, GREEN);
-      text_fitted(regular, x + 24 + is, base, playing, right - x - 24 - is, GREEN);
+    if(what && right - x > 90) {
+      if(game) {
+        draw_icon(&g_dst, ICON_GAME, x + 16, top + (h - is) / 2, is, GREEN);
+      } else {
+        draw_circle(&g_dst, x + 16 + is / 2.0f, top + h / 2.0f, is * 0.26f, GREEN);
+      }
+      text_fitted(regular, x + 24 + is, base, what, right - x - 24 - is, GREEN);
     }
   }
 }
@@ -4096,7 +6035,7 @@ draw_name_row_playing(text_font_t *bold, text_font_t *regular, int x, int top, i
 static void
 draw_name_row(text_font_t *bold, text_font_t *regular, int x, int top, int h, int width,
               const char *name, int badge, const char *user, long long t, long long now) {
-  draw_name_row_playing(bold, regular, x, top, h, width, name, badge, user, t, now, NULL);
+  draw_name_row_playing(bold, regular, x, top, h, width, name, badge, user, t, now, NULL, 0);
 }
 
 
@@ -4137,8 +6076,12 @@ draw_media(const card_t *c, int index, int top, unsigned frame) {
     const rect_t *m = &c->media[i];
     int x = TEXT_X + m->x, my = y + m->y;
     over = zone(Z_MEDIA, index, i, x, my, m->w, m->h);
-    if((pixels=picture(media_url(p->media[i].url, p->media_count == 1 ? "medium" : "small", buf,
-                                    sizeof buf), m->w, m->h))) {
+    // X Chat's media is encrypted, fetched and opened by its url and key; the
+    // rest is on pbs.twimg.com, asked for at a size
+    pixels = p->media[i].xchat ?
+      images_get_enc(p->media[i].url, p->media[i].xchat_key, pxs(m->w), pxs(m->h)) :
+      picture(media_url(p->media[i].url, p->media_count == 1 ? "medium" : "small", buf, sizeof buf), m->w, m->h);
+    if(pixels) {
       draw_picture_round(&g_dst, x, my, m->w, m->h, r, pixels);
     } else {
       draw_box(&g_dst, x, my, m->w, m->h, r, 0, PLACEHOLDER);
@@ -4186,6 +6129,34 @@ draw_quote(const card_t *c, int top, long long now) {
     int end = text_draw(f, &g_dst, x, baseline(f, y, QUOTE_LINE_H), p->quote_text + c->quote_start[i],
                         c->quote_len[i], FG);
     if(c->quote_more && i == c->quote_lines - 1) {
+      text(f, end, baseline(f, y, QUOTE_LINE_H), "\xe2\x80\xa6", FG);
+    }
+    y += QUOTE_LINE_H;
+  }
+}
+
+
+/**
+ * the Community Note under a post: a box of its own, with what readers
+ * added under its title
+ **/
+static void
+draw_note(const card_t *c, int top) {
+  const x_post_t *p = c->post;
+  int y = top + c->note_y, x = TEXT_X + QUOTE_PAD;
+  text_font_t *f = font(F_QUOTE), *bold = font(F_QUOTE_BOLD);
+
+  draw_box(&g_dst, TEXT_X, y, TEXT_W, c->note_h, RADIUS, 0, RGBA(29, 155, 240, 22));
+  draw_box(&g_dst, TEXT_X, y, TEXT_W, c->note_h, RADIUS, 1.5f, EDGE);
+  y += QUOTE_PAD;
+  draw_icon(&g_dst, ICON_PERSON, x, y + (NOTE_TITLE_H - 30) / 2, 30, FG);
+  text_fitted(bold, x + 42, baseline(bold, y, NOTE_TITLE_H),
+              L("Os leitores acrescentaram contexto", "Readers added context"), TEXT_W - 2 * QUOTE_PAD - 42, FG);
+  y += NOTE_TITLE_H;
+  for(int i=0; i < c->note_lines; i++) {
+    int end = text_draw(f, &g_dst, x, baseline(f, y, QUOTE_LINE_H), p->note + c->note_start[i],
+                        c->note_len[i], FG);
+    if(c->note_more && i == c->note_lines - 1) {
       text(f, end, baseline(f, y, QUOTE_LINE_H), "\xe2\x80\xa6", FG);
     }
     y += QUOTE_LINE_H;
@@ -4390,6 +6361,30 @@ draw_actions(const card_t *c, int index, int top, int selected) {
  * a notification: its icon, the people in it, what it says and, in grey,
  * the post it is about
  **/
+/**
+ * in the notifications of every account, whose a post is: the account's
+ * screen name in its colour, ending at right; the width it takes with the
+ * gap before it, or 0 for none
+ **/
+static int
+account_tag(text_font_t *f, int right, int base, int account) {
+  char name[24];
+  int w;
+
+  if(account < 1 || account > SETTINGS_ACCOUNTS) {
+    return 0;
+  }
+  if(g_settings.users[account - 1][0]) {
+    snprintf(name, sizeof name, "@%s", g_settings.users[account - 1]);
+  } else {
+    snprintf(name, sizeof name, L("Conta %d", "Account %d"), account);
+  }
+  w = width_of(f, name);
+  text(f, right - w, base, name, account_color(account));
+  return w + 22;
+}
+
+
 static void
 draw_notice(const card_t *c, int index, int top, long long now) {
   static const struct { int icon; uint32_t color; } looks[] = {
@@ -4415,8 +6410,9 @@ draw_notice(const card_t *c, int index, int top, long long now) {
   if(p->time) {
     age(p->time, now, when, sizeof when);
   }
+  end = TEXT_X + TEXT_W - account_tag(small, TEXT_X + TEXT_W, baseline(small, y, FACE), p->account);
   if(when[0]) {
-    text(small, TEXT_X + TEXT_W - width_of(small, when), baseline(small, y, FACE), when, GREY);
+    text(small, end - width_of(small, when), baseline(small, y, FACE), when, GREY);
   }
 
   y = top + c->body_y;
@@ -4448,7 +6444,10 @@ draw_chat(const card_t *c, int index, int top, long long now) {
   text_font_t *name = font(F_NAME), *small = font(F_SMALL), *body = font(F_BODY);
   text_font_t *bold = font(F_SMALL_BOLD);
   int y = top + c->avatar_y, right = TEXT_X + TEXT_W, icon, w;
-  const char *carries = dm_carries(p->icon, &icon), *label;
+  const char *carries = p->sealed && !xchat_open_ready(g_settings.ids[g_settings.account - 1]) ?
+                        L("Mensagem cifrada \xc2\xb7 \xe2\x9c\x95 para abrir", "Encrypted message \xc2\xb7 \xe2\x9c\x95 to open") :
+                        p->sealed ? L("Mensagem cifrada", "Encrypted message") :
+                        dm_label(p, &icon), *label;
   const char *from = !p->mine && p->group && p->quote_name[0] ? p->quote_name : "";
   char line[1400], when[48];
 
@@ -4460,6 +6459,8 @@ draw_chat(const card_t *c, int index, int top, long long now) {
                 p->user[0] ? p->user : p->name, p->name, AVATAR_X, y, AVATAR);
     if(!p->group && p->playing[0]) {
       playing_badge(AVATAR_X, y, AVATAR);
+    } else if(!p->group && p->online) {
+      online_badge(AVATAR_X, y, AVATAR);
     }
     // the picture of who it is with opens their profile
     if(!p->group && p->user_id[0] && zone(Z_AUTHOR, index, 0, AVATAR_X - 6, y - 6, AVATAR + 12, AVATAR + 12)) {
@@ -4468,7 +6469,7 @@ draw_chat(const card_t *c, int index, int top, long long now) {
   }
   if(p->user[0]) {
     draw_name_row_playing(name, small, TEXT_X, y, NAME_H, TEXT_W, p->name, p->badge, p->user, p->time, now,
-                          p->group ? NULL : p->playing);
+                          p->group ? NULL : p->playing, !p->group && p->online);
   } else {
     when[0] = 0;
     if(p->time) {
@@ -4498,6 +6499,13 @@ draw_chat(const card_t *c, int index, int top, long long now) {
     draw_circle(&g_dst, right - 9, y + LINE_H / 2.0f, 9, BLUE);
     right -= 34;
   }
+  if(p->xchat) {
+    label = "X Chat";
+    w = width_of(bold, label) + 26;
+    draw_box(&g_dst, right - w, y + 5, w, LINE_H - 10, (LINE_H - 10) / 2.0f, 0, CHIP_ON);
+    text(bold, right - w + 13, baseline(bold, y + 5, LINE_H - 10), label, FG);
+    right -= w + 16;
+  }
   if(p->request) {
     label = L("Pedido", "Request");
     w = width_of(bold, label) + 26;
@@ -4512,6 +6520,192 @@ draw_chat(const card_t *c, int index, int top, long long now) {
 
 
 /**
+ * when XPS5 last saw someone around, in words: "Seen 3 h ago"
+ **/
+static void
+seen_ago(long long at, long long now, char *buf, size_t size) {
+  const long long d = now - at;
+
+  if(d < 120) {
+    snprintf(buf, size, "%s", L("Visto agora mesmo", "Seen just now"));
+  } else if(d < 3600) {
+    snprintf(buf, size, L("Visto h\xc3\xa1 %lld min", "Seen %lld min ago"), d / 60);
+  } else if(d < 86400) {
+    snprintf(buf, size, L("Visto h\xc3\xa1 %lld h", "Seen %lld h ago"), d / 3600);
+  } else if(d < 2 * 86400) {
+    snprintf(buf, size, "%s", L("Visto ontem", "Seen yesterday"));
+  } else {
+    snprintf(buf, size, L("Visto h\xc3\xa1 %lld dias", "Seen %lld days ago"), d / 86400);
+  }
+}
+
+
+/**
+ * someone of Friends, as a PS5 lists its friends: the picture with the dot
+ * of what they do, their names, and under them the game they play (the
+ * accent's controller when it is the user's too), that they are on XPS5,
+ * when XPS5 last saw them around, or their bio
+ **/
+static void
+draw_friend(const card_t *c, int index, int top, long long now) {
+  const x_post_t *p = c->post;
+  const seen_person_t *s = seen_find(&g_seen, p->user_id);
+  text_font_t *name = font(F_NAME), *small = font(F_SMALL), *body = font(F_BODY);
+  const int same = p->playing[0] && g_game.name[0] && !strcmp(p->playing, g_game.name), is = 28;
+  int y = top + c->avatar_y, x = TEXT_X, right = TEXT_X + TEXT_W;
+  char line[400], when[64];
+  uint32_t ink = GREY;
+
+  draw_avatar(p->avatar, p->user, p->name, AVATAR_X, y, AVATAR);
+  if(p->playing[0]) {
+    playing_badge(AVATAR_X, y, AVATAR);
+  } else if(p->online) {
+    online_badge(AVATAR_X, y, AVATAR);
+  }
+  if(p->user_id[0] && zone(Z_AUTHOR, index, 0, AVATAR_X - 6, y - 6, AVATAR + 12, AVATAR + 12)) {
+    draw_arc(&g_dst, AVATAR_X + AVATAR / 2.0f, y + AVATAR / 2.0f, AVATAR / 2.0f + 5, 3, 0, 6.2832f, ACCENT);
+  }
+  draw_name_row_playing(name, small, TEXT_X, y, NAME_H, TEXT_W, p->name, p->badge, p->user, 0, now, NULL, 0);
+
+  y = top + c->body_y;
+  line[0] = 0;
+  if(p->playing[0]) {
+    draw_icon(&g_dst, ICON_GAME, x, y + (LINE_H - is) / 2, is, same ? ACCENT : GREEN);
+    snprintf(line, sizeof line, same ? L("Tamb\xc3\xa9m em %s, como tu", "In %s too, like you") :
+             L("A jogar %s", "Playing %s"), p->playing);
+    ink = same ? FG : GREEN;
+    x += is + 12;
+  } else if(p->online) {
+    draw_circle(&g_dst, x + is / 2.0f, y + LINE_H / 2.0f, 7.5f, GREEN);
+    snprintf(line, sizeof line, "%s", L("Online no XPS5", "Online on XPS5"));
+    ink = GREEN;
+    x += is + 12;
+  } else if(s && s->at > 0) {
+    draw_icon(&g_dst, ICON_CLOCK, x, y + (LINE_H - is) / 2, is, GREY);
+    seen_ago(s->at, now, when, sizeof when);
+    if(s->game[0]) {
+      snprintf(line, sizeof line, "%s \xc2\xb7 %s", when, s->game);
+    } else {
+      snprintf(line, sizeof line, L("%s no XPS5", "%s on XPS5"), when);
+    }
+    x += is + 12;
+  } else if(p->text[0]) {
+    copy_whole(line, sizeof line, p->text);
+  }
+  for(char *q=line; *q; q++) {
+    *q = *q == '\n' || *q == '\r' || *q == '\t' ? ' ' : *q;
+  }
+  if(line[0] && right > x + 40) {
+    text_fitted(body, x, baseline(body, y, LINE_H), line, right - x, ink);
+  }
+}
+
+
+/**
+ * a voice note of X Chat in its message, w x h at x, y: its button (play,
+ * pause, or a spinner while it comes), how far it played and how long it is.
+ * It plays with ✕ or the pointer (dm_voice), sound only, the player's
+ **/
+static void
+draw_dm_voice(const x_media_t *m, int index, int x, int y, int w, int h, int mine) {
+  text_font_t *small = font(F_SMALL);
+  const uint32_t ink = mine ? WHITE : FG;
+  const float r = h / 2.0f - 6, cx = x + h / 2.0f, cy = y + h / 2.0f;
+  const int on = player_is(m->video_url);
+  player_status_t st;
+  int over, bx, bw, ms, size;
+  float done = 0;
+  char line[32];
+
+  memset(&st, 0, sizeof st);
+  if(on) {
+    player_status(&st);
+    g_player_wanted = 1; // it goes on while it shows
+  }
+  over = zone(Z_MEDIA, index, 0, x, y, w, h);
+  draw_circle(&g_dst, cx, cy, over ? r + 3 : r, mine ? RGBA(255, 255, 255, 64) : RGBA(255, 255, 255, 34));
+  if(on && (st.state == PLAYER_LOADING || st.buffering)) {
+    g_spinning = 1;
+    spinner(cx, cy, r * 0.55f, 4, g_frame_no, ink);
+  } else if(on && st.state == PLAYER_PLAYING) {
+    size = (int)(r * 0.9f);
+    draw_icon(&g_dst, ICON_PAUSE, (int)(cx - size / 2.0f), (int)(cy - size / 2.0f), size, ink);
+  } else {
+    draw_icon(&g_dst, ICON_PLAY, (int)(cx - r * 0.5f), (int)(cy - r * 0.52f), (int)r, ink);
+  }
+  bx = x + h + 10;
+  bw = w - h - 10 - 96;
+  if(on && (st.state == PLAYER_PLAYING || st.state == PLAYER_PAUSED) && st.len_ms > 0) {
+    done = (float)st.pos_ms / st.len_ms;
+    done = done < 0 ? 0 : done > 1 ? 1 : done;
+  }
+  draw_box(&g_dst, bx, cy - 3, bw, 6, 3, 0, mine ? RGBA(255, 255, 255, 90) : RGBA(255, 255, 255, 50));
+  if(done > 0) {
+    draw_box(&g_dst, bx, cy - 3, (int)(bw * done), 6, 3, 0, mine ? WHITE : ACCENT);
+  }
+  draw_circle(&g_dst, bx + bw * done, cy, 8, mine ? WHITE : ACCENT);
+  if(on && st.state == PLAYER_FAILED) {
+    snprintf(line, sizeof line, "%s", L("Falhou", "Failed"));
+  } else {
+    ms = on && done > 0 ? st.pos_ms : st.len_ms > 0 ? st.len_ms : m->duration_ms;
+    clock_text(ms, line, sizeof line);
+  }
+  text_fitted(small, bx + bw + 16, baseline(small, y, h), line, 80, ink);
+}
+
+
+/**
+ * X Chat's picture or video in its message (c->media[0], from the bubble's
+ * x, y): the picture opened once it came (images_get_enc), a video dark with
+ * its play button and how long it is; ✕ or the pointer shows it over the
+ * whole screen. A voice note is its row
+ **/
+static void
+draw_dm_media(const card_t *c, const x_post_t *p, const x_media_t *m, int index, int bx, int by) {
+  text_font_t *small = font(F_SMALL_BOLD);
+  const rect_t *r = &c->media[0];
+  const int x = bx + r->x, y = by + r->y;
+  const uint32_t *pixels = NULL;
+  char line[32];
+  int over, lw;
+
+  if(m->voice) {
+    draw_dm_voice(m, index, x, y, r->w, r->h, p->mine);
+    return;
+  }
+  over = zone(Z_MEDIA, index, 0, x, y, r->w, r->h);
+  if(!m->video) {
+    pixels = m->xchat ? images_get_enc(m->url, m->xchat_key, pxs(r->w), pxs(r->h)) : picture(m->url, r->w, r->h);
+  }
+  if(pixels) {
+    draw_picture_round(&g_dst, x, y, r->w, r->h, DM_MEDIA_R, pixels);
+  } else {
+    draw_box(&g_dst, x, y, r->w, r->h, DM_MEDIA_R, 0, m->video ? RGBA(0, 0, 0, 190) : PLACEHOLDER);
+    if(!m->video) {
+      draw_icon(&g_dst, ICON_PHOTO, x + r->w / 2 - 24, y + r->h / 2 - 24, 48, DIM);
+    }
+  }
+  if(m->video) {
+    draw_play(x + r->w / 2.0f, y + r->h / 2.0f, 40);
+    // how long it is, or that it is a GIF
+    if(m->duration_ms > 0) {
+      clock_text(m->duration_ms, line, sizeof line);
+    } else {
+      snprintf(line, sizeof line, "%s", p->icon == X_DM_GIF ? "GIF" : "");
+    }
+    if(line[0]) {
+      lw = width_of(small, line) + 20;
+      draw_box(&g_dst, x + 12, y + r->h - 46, lw, 34, 17, 0, RGBA(0, 0, 0, 170));
+      text(small, x + 22, baseline(small, y + r->h - 46, 34), line, WHITE);
+    }
+  }
+  if(over) {
+    draw_box(&g_dst, x, y, r->w, r->h, DM_MEDIA_R, 3, RGBA(255, 255, 255, 210));
+  }
+}
+
+
+/**
  * a message of a conversation: its bubble, blue for the user's own, the
  * picture of who sent the others', and when
  **/
@@ -4521,14 +6715,40 @@ draw_dm(const card_t *c, int index, int top, int selected, long long now) {
   text_font_t *body = font(F_BODY), *small = font(F_SMALL), *bold = font(F_SMALL_BOLD);
   uint32_t ink = p->mine ? WHITE : FG;
   int x = c->bubble_x, y = top + c->bubble_y, ty, icon, fy = top + c->avatar_y;
-  const char *carries = dm_carries(p->icon, &icon);
-  char when[48];
+  const char *carries = dm_label(p, &icon);
+  const x_media_t *m;
+  char when[96];
+
+  // the bubble of the one written here: fainter while it goes, red when it did not
+  const int state = c->pending ? g_dm.state : DM_NONE;
+  uint32_t fill = !p->mine ? RGBA(255, 255, 255, 38) : state == DM_FAILED ? RGBA(244, 33, 46, 120) :
+                  state == DM_SENDING ? RGBA(29, 155, 240, 130) : BLUE;
+  uint32_t when_ink = state == DM_FAILED ? RED : GREY;
+
+  // who did what to the group: a line of its own in the middle
+  if(p->icon == X_DM_EVENT) {
+    const char *says = dm_event_text(p, &icon);
+    zone(Z_CARD, index, 0, x, y, c->bubble_w, c->bubble_h);
+    if(selected) {
+      draw_box(&g_dst, x - 5, y - 5, c->bubble_w + 10, c->bubble_h + 10, c->bubble_h / 2.0f + 5, 2.5f, ACCENT);
+    }
+    draw_box(&g_dst, x, y, c->bubble_w, c->bubble_h, c->bubble_h / 2.0f, 0, RGBA(255, 255, 255, 18));
+    draw_icon(&g_dst, icon, x + DM_EVENT_PAD, y + (c->bubble_h - 26) / 2, 26, GREY);
+    text_fitted(small, x + DM_EVENT_PAD + 34, baseline(small, y, c->bubble_h), says,
+                c->bubble_w - 2 * DM_EVENT_PAD - 34, GREY);
+    return;
+  }
+  // one taken back: an empty bubble that says so
+  if(p->icon == X_DM_DELETED) {
+    fill = RGBA(255, 255, 255, 12);
+    ink = GREY;
+  }
 
   zone(Z_CARD, index, 0, x, y, c->bubble_w, c->bubble_h);
-  if(p->group && !p->mine) {
+  if(p->group && !p->mine && !(c->run & RUN_PREV)) {
     text_fitted(bold, x + 8, baseline(bold, y - 38, 36), p->name[0] ? p->name : p->user, BUBBLE_MAX, GREY);
   }
-  if(!p->mine) {
+  if(!p->mine && !(c->run & RUN_NEXT)) {
     draw_avatar(p->avatar, p->user, p->name, MAIN_X + CARD_PAD, fy, FACE);
     if(p->user_id[0] && zone(Z_AUTHOR, index, 0, MAIN_X + CARD_PAD - 4, fy - 4, FACE + 8, FACE + 8)) {
       draw_arc(&g_dst, MAIN_X + CARD_PAD + FACE / 2.0f, fy + FACE / 2.0f, FACE / 2.0f + 4, 3, 0, 6.2832f, ACCENT);
@@ -4538,7 +6758,29 @@ draw_dm(const card_t *c, int index, int top, int selected, long long now) {
     draw_box(&g_dst, x - 5, y - 5, c->bubble_w + 10, c->bubble_h + 10, BUBBLE_R + 5, 2.5f,
              p->mine ? RGBA(255, 255, 255, 150) : ACCENT);
   }
-  draw_box(&g_dst, x, y, c->bubble_w, c->bubble_h, BUBBLE_R, 0, p->mine ? BLUE : RGBA(255, 255, 255, 38));
+  draw_box(&g_dst, x, y, c->bubble_w, c->bubble_h, BUBBLE_R, 0, fill);
+  if(p->icon == X_DM_DELETED) {
+    draw_box(&g_dst, x, y, c->bubble_w, c->bubble_h, BUBBLE_R, 1.5f, EDGE);
+  }
+  // the message it replies to: whose, and the start of what it said
+  if(c->quote_h) {
+    const int in = dm_media(p) ? DM_MEDIA_PAD : 12, rx = x + in, ry = y + in, rw = c->bubble_w - 2 * in;
+    const int rh = DM_REPLY_H - 12;
+    int bi = -1;
+    const char *said = p->quote_text[0] ? p->quote_text : dm_carries(p->quote_badge, &bi);
+    draw_box(&g_dst, rx, ry, rw, rh, 16, 0, p->mine ? RGBA(0, 0, 0, 46) : RGBA(255, 255, 255, 22));
+    draw_box(&g_dst, rx, ry + 8, 5, rh - 16, 2.5f, 0, p->mine ? WHITE : ACCENT);
+    text_fitted(bold, rx + DM_REPLY_PAD, baseline(bold, ry + 4, 32), dm_reply_name(p), rw - 2 * DM_REPLY_PAD,
+                p->mine ? WHITE : ACCENT);
+    if(bi >= 0) {
+      draw_icon(&g_dst, bi, rx + DM_REPLY_PAD, ry + 38 + (30 - 24) / 2, 24, p->mine ? WHITE : GREY);
+    }
+    text_fitted(small, rx + DM_REPLY_PAD + (bi >= 0 ? 32 : 0), baseline(small, ry + 36, 32), said,
+                rw - 2 * DM_REPLY_PAD - (bi >= 0 ? 32 : 0), p->mine ? RGBA(255, 255, 255, 220) : GREY);
+  }
+  if((m=dm_media(p))) {
+    draw_dm_media(c, p, m, index, x, y);
+  }
   ty = top + c->body_y;
   for(int i=0; i < c->lines; i++, ty += LINE_H) {
     text_draw(body, &g_dst, x + BUBBLE_PAD, baseline(body, ty, LINE_H), p->text + c->start[i], c->len[i], ink);
@@ -4548,13 +6790,54 @@ draw_dm(const card_t *c, int index, int top, int selected, long long now) {
     text(body, x + BUBBLE_PAD + 40, baseline(body, ty, LINE_H), carries, ink);
   }
   when[0] = 0;
-  if(p->time) {
+  if(state == DM_SENDING) {
+    snprintf(when, sizeof when, "%s", L("A enviar\xe2\x80\xa6", "Sending\xe2\x80\xa6"));
+  } else if(state == DM_FAILED) {
+    snprintf(when, sizeof when, "%s", L("N\xc3\xa3o enviada \xc2\xb7 \xe2\x9c\x95 para tentar de novo",
+                                        "Not sent \xc2\xb7 \xe2\x9c\x95 to try again"));
+  } else if(state == DM_SENT) {
+    snprintf(when, sizeof when, "%s", L("Enviada", "Sent"));
+  } else if(p->time && !(c->run & RUN_NEXT)) {
     age(p->time, now, when, sizeof when);
+    if(p->edited) {
+      const size_t n = strlen(when);
+      snprintf(when + n, sizeof when - n, " \xc2\xb7 %s", L("Editada", "Edited"));
+    }
+    // X Chat: its signature did not hold with the sender's key as X lists
+    // it (one not checked shows as it always did)
+    if(p->xchat && p->signature == XCHAT_SIG_BAD) {
+      const size_t n = strlen(when);
+      snprintf(when + n, sizeof when - n, " \xc2\xb7 \xe2\x9a\xa0 %s", L("Assinatura inv\xc3\xa1lida", "Bad signature"));
+      when_ink = RED;
+    }
+  }
+  // its reactions: the emoji once each and how many there are, on a pill
+  // over the bubble's lower edge, outlined when the user's is one
+  if(p->reaction_count > 0 && p->reactions[0]) {
+    char line[80];
+    int pw, px;
+    const int py = y + c->bubble_h - 14;
+    if(p->reaction_count > 1) {
+      snprintf(line, sizeof line, "%s %d", p->reactions, p->reaction_count);
+    } else {
+      snprintf(line, sizeof line, "%s", p->reactions);
+    }
+    pw = width_of(small, line) + 28;
+    px = p->mine ? x + c->bubble_w - pw - 14 : x + 14;
+    draw_box(&g_dst, px - 3, py - 3, pw + 6, DM_REACT_H + 6, DM_REACT_H / 2.0f + 3, 0, PANE);
+    draw_box(&g_dst, px, py, pw, DM_REACT_H, DM_REACT_H / 2.0f, 0, CHIP);
+    if(p->reacted) {
+      draw_box(&g_dst, px, py, pw, DM_REACT_H, DM_REACT_H / 2.0f, 2, ACCENT);
+    }
+    text(small, px + 14, baseline(small, py, DM_REACT_H), line, FG);
   }
   if(when[0]) {
+    const int ww = width_of(small, when);
     ty = top + c->actions_y;
-    text(small, p->mine ? x + c->bubble_w - width_of(small, when) - 8 : x + 8, baseline(small, ty, DM_TIME_H),
-         when, GREY);
+    // the user's on the right, under the bubble's end, and inside the list
+    x = p->mine ? x + c->bubble_w - ww - 8 : x + 8;
+    x = x < MAIN_X + CARD_PAD ? MAIN_X + CARD_PAD : x;
+    text(small, x, baseline(small, ty, DM_TIME_H), when, when_ink);
   }
 }
 
@@ -4738,12 +7021,20 @@ draw_card(const card_t *c, int index, int top, int selected, long long now) {
     draw_box(&g_dst, MAIN_X, top, MAIN_W, c->height - CARD_GAP, CARD_R, over ? 2 : 1.5f,
              over ? HOVER_CARD : EDGE);
   }
+  if(p->account) {
+    // whose notification it is, in the notifications of every account
+    draw_box(&g_dst, MAIN_X + 7, top + 18, 6, c->height - CARD_GAP - 36, 3, 0, account_color(p->account));
+  }
   if(p->kind == X_KIND_NOTICE) {
     draw_notice(c, index, top, now);
     return;
   }
   if(p->kind == X_KIND_CHAT) {
     draw_chat(c, index, top, now);
+    return;
+  }
+  if(p->kind == X_KIND_USER) {
+    draw_friend(c, index, top, now);
     return;
   }
   if(p->kind == X_KIND_TREND) {
@@ -4780,6 +7071,8 @@ draw_card(const card_t *c, int index, int top, int selected, long long now) {
   draw_avatar(p->avatar, p->user, p->name, AVATAR_X, y, AVATAR);
   if(p->playing[0]) {
     playing_badge(AVATAR_X, y, AVATAR);
+  } else if(p->online) {
+    online_badge(AVATAR_X, y, AVATAR);
   }
   w = width_of(font(F_NAME), p->name[0] ? p->name : p->user) + 12;
   w = w > TEXT_W / 2 ? TEXT_W / 2 : w;
@@ -4792,11 +7085,12 @@ draw_card(const card_t *c, int index, int top, int selected, long long now) {
     draw_rect(&g_dst, TEXT_X, baseline(font(F_NAME), y, NAME_H) + 5, w - 12, 2, FG);
   }
   w = TEXT_W - (p->id[0] ? 56 : 0);
+  w -= account_tag(font(F_SMALL), TEXT_X + w, baseline(font(F_NAME), y, NAME_H), p->account);
   if(c->rising) {
     w -= draw_rising(TEXT_X + w, y) + 16;
   }
   draw_name_row_playing(font(F_NAME), font(F_SMALL), TEXT_X, y, NAME_H, w, p->name, p->badge, p->user, p->time,
-                        now, p->playing);
+                        now, p->playing, p->online);
   // its menu, at the right of the name, as on x.com
   if(p->id[0]) {
     int dx = TEXT_X + TEXT_W - 26, dy = y + NAME_H / 2;
@@ -4835,6 +7129,9 @@ draw_card(const card_t *c, int index, int top, int selected, long long now) {
   }
   if(c->quote_h) {
     draw_quote(c, top, now);
+  }
+  if(c->note_h) {
+    draw_note(c, top);
   }
   draw_actions(c, index, top, selected);
 }
@@ -5052,6 +7349,8 @@ draw_profile(const tab_t *t, int top) {
   draw_avatar(u->avatar, u->user, u->name, MAIN_X + 36, y, BIG_AVATAR);
   if(play_game_of(u->location, game, sizeof game)) {
     playing_badge(MAIN_X + 36, y, BIG_AVATAR);
+  } else if(play_online_of(u->location)) {
+    online_badge(MAIN_X + 36, y, BIG_AVATAR);
   }
 
   // someone else's: Follow (Following, Blocked), and its menu
@@ -5268,6 +7567,12 @@ error_text(const tab_t *t, char *title, size_t tsize, char *hint, size_t hsize) 
                                     "abrem nas apps do X. Carrega em \xe2\x96\xa1 para ver outra vez.",
                                     "Your direct messages show up here. Encrypted X Chat conversations only open "
                                     "in X's apps. Press \xe2\x96\xa1 to look again."));
+    } else if(t->feed == UI_FRIENDS) {
+      snprintf(title, tsize, "%s", L("Ainda n\xc3\xa3o segues ningu\xc3\xa9m", "You do not follow anyone yet"));
+      snprintf(hint, hsize, "%s", L("Os teus amigos no XPS5 s\xc3\xa3o quem segues no X: quem joga e quem est\xc3\xa1 no "
+                                    "XPS5 aparece primeiro. Carrega em \xe2\x96\xa1 para ver outra vez.",
+                                    "Your friends on XPS5 are who you follow on X: who plays and who is on XPS5 "
+                                    "comes first. Press \xe2\x96\xa1 to look again."));
     } else if(t->feed == UI_DM) {
       snprintf(title, tsize, "%s", L("Ainda n\xc3\xa3o h\xc3\xa1 mensagens", "No messages yet"));
       snprintf(hint, hsize, "%s", L("Carrega em L2 para escrever a primeira. Uma conversa cifrada do X Chat s\xc3\xb3 "
@@ -5348,6 +7653,8 @@ draw_footer(const tab_t *t, int top, unsigned frame) {
                                   "You reached the %d posts XPS5 keeps"), MAX_POSTS);
   } else if(t->feed == UI_LISTS) {
     snprintf(line, sizeof line, "%s", L("N\xc3\xa3o h\xc3\xa1 mais listas", "There are no more Lists"));
+  } else if(t->feed == UI_FRIENDS) {
+    snprintf(line, sizeof line, "%s", L("N\xc3\xa3o h\xc3\xa1 mais pessoas que segues", "There is nobody else you follow"));
   } else if(t->feed == UI_SEARCH && !t->query[0]) {
     snprintf(line, sizeof line, "%s", L("Por agora \xc3\xa9 tudo", "That is all for now"));
   } else {
@@ -5423,6 +7730,74 @@ draw_list(const tab_t *t, long long now, unsigned frame) {
 
 
 /**
+ * Calls' test of the controller's microphone, from y: the button, the
+ * meter, and what it hears or why not
+ **/
+static void
+draw_mic(int y) {
+  text_font_t *pill = font(F_PILL), *small = font(F_SMALL);
+  const int cx = MAIN_X + MAIN_W / 2, h = 64, mx = MAIN_X + 160, mw = MAIN_W - 320, mh = 18;
+  const int failed = g_mic.want && g_mic.state == UI_MIC_FAILED, on = g_mic.want && !failed;
+  const int hearing = on && g_mic.state == UI_MIC_ON;
+  const char *label, *says;
+  char line[160];
+  uint32_t color = GREY;
+  int kw, bw, bx, over, fill;
+
+  // ✕ starts it, stops it, and tries again after it failed
+  label = failed ? L("Tentar de novo", "Try again") : on ? L("Parar o teste", "Stop the test") :
+    L("Testar o microfone", "Test the microphone");
+  kw = width_of(font(F_KEY), "\xe2\x9c\x95") + 22;
+  bw = 22 + kw + 14 + width_of(pill, label) + 30;
+  bx = cx - bw / 2;
+  over = zone(Z_MIC, 0, 0, bx, y, bw, h);
+  draw_box(&g_dst, bx, y, bw, h, h / 2.0f, 0, CHIP_ON);
+  if(over) {
+    lit_box(bx, y, bw, h, h / 2.0f, 1);
+  }
+  draw_key("\xe2\x9c\x95", bx + 22, y + (h - 38) / 2);
+  text(pill, bx + 22 + kw + 14, baseline(pill, y, h), label, FG);
+  y += h + 34;
+
+  // the meter: how loud it hears, and a mark at the loudest of late
+  draw_box(&g_dst, mx, y, mw, mh, mh / 2.0f, 0, CHIP);
+  fill = hearing ? (int)(g_mic.level * mw + 0.5f) : 0;
+  if(fill > 0) {
+    draw_box(&g_dst, mx, y, fill < mh ? mh : fill, mh, mh / 2.0f, 0, ACCENT);
+  }
+  if(hearing && g_mic.peak > 0.02f) {
+    draw_box(&g_dst, mx + (int)(g_mic.peak * (mw - 6)), y - 5, 6, mh + 10, 3, 0, FG);
+  }
+  y += mh + 28;
+
+  if(failed) {
+    snprintf(line, sizeof line, L("O microfone n\xc3\xa3o abriu (0x%08X).", "The microphone did not open (0x%08X)."),
+             (unsigned)g_mic.code);
+    says = line;
+    color = RED;
+  } else if(!on) {
+    says = L("Fala para o comando e v\xc3\xaa se o XPS5 te ouve. Nada \xc3\xa9 gravado nem enviado.",
+             "Speak into the controller and see whether XPS5 hears you. Nothing is recorded or sent.");
+  } else if(!hearing) {
+    says = L("A abrir o microfone do comando\xe2\x80\xa6", "Opening the controller's microphone\xe2\x80\xa6");
+  } else if(g_mic.silent & UI_MIC_PRIORITY_LOW) {
+    says = L("Outra app, como o chat de grupo, est\xc3\xa1 a usar o microfone.",
+             "Another app, such as party chat, is using the microphone.");
+    color = RED;
+  } else if(g_mic.silent & UI_MIC_NO_DEVICE) {
+    says = L("A PS5 n\xc3\xa3o encontra nenhum microfone.", "The PS5 finds no microphone.");
+    color = RED;
+  } else {
+    says = L("A ouvir, sem gravar nem enviar. Se a barra n\xc3\xa3o mexer, v\xc3\xaa se o bot\xc3\xa3o de silenciar do "
+             "comando est\xc3\xa1 aceso.",
+             "Listening, without recording or sending. If the bar does not move, check whether the "
+             "controller's mute button is lit.");
+  }
+  text_wrapped(small, MAIN_X + 110, y, 38, says, MAIN_W - 220, color);
+}
+
+
+/**
  * a page of a section X keeps to its own apps: what it is, and where
  **/
 static void
@@ -5451,16 +7826,24 @@ draw_page(const tab_t *t) {
         "X Premium (the blue check, longer posts, fewer ads) is subscribed to in the X app and on x.com.");
     break;
   default:
-    icon = ICON_HISTORY;
-    says = L("Os posts que abrires aparecem aqui, o mais recente primeiro, at\xc3\xa9 fechares a app.",
-             "The posts you open show up here, newest first, until you close the app.");
+    icon = t->latest ? ICON_CLOCK : ICON_HISTORY;
+    says = t->latest ?
+      L("Guarda aqui posts para ler depois de jogar: no \xe2\x80\xa2\xe2\x80\xa2\xe2\x80\xa2 de um post, \xc2\xabLer depois\xc2\xbb. "
+        "Ficam na consola at\xc3\xa9 os tirares.",
+        "Keep posts here to read after you play: in a post's \xe2\x80\xa2\xe2\x80\xa2\xe2\x80\xa2, \xe2\x80\x9cRead later\xe2\x80\x9d. "
+        "They stay on the console until you take them out.") :
+      L("Os posts que abrires aparecem aqui, o mais recente primeiro, at\xc3\xa9 fechares a app.",
+        "The posts you open show up here, newest first, until you close the app.");
     break;
   }
   draw_circle(&g_dst, cx, 150, 76, CHIP);
   draw_icon(&g_dst, icon, cx - 42, 108, 84, FG);
   centred(font(F_TITLE), 250, 70, title, FG);
   y = 340;
-  text_wrapped(font(F_BODY), MAIN_X + 110, y, LINE_H, says, MAIN_W - 220, GREY);
+  y = text_wrapped(font(F_BODY), MAIN_X + 110, y, LINE_H, says, MAIN_W - 220, GREY);
+  if(t->feed == UI_CALLS) {
+    draw_mic(y + 44);
+  }
 }
 
 
@@ -5654,13 +8037,173 @@ draw_timeline(const tab_t *t, long long now, unsigned frame) {
 /**
  * under the app's name: when the tab was read, or why it was not
  **/
+/**
+ * how many of Friends play and are on XPS5, in words; 0 when nobody is around
+ **/
+static int
+friends_status(const tab_t *t, char *line, size_t size) {
+  int playing = 0, online = 0;
+
+  for(int i=0; i < t->count; i++) {
+    playing += t->posts[i].kind == X_KIND_USER && t->posts[i].playing[0];
+    online += t->posts[i].kind == X_KIND_USER && !t->posts[i].playing[0] && t->posts[i].online;
+  }
+  if(playing && online) {
+    snprintf(line, size, L("%d a jogar \xc2\xb7 %d no XPS5", "%d playing \xc2\xb7 %d on XPS5"), playing, online);
+  } else if(playing) {
+    snprintf(line, size, L("%d a jogar agora", "%d playing now"), playing);
+  } else if(online) {
+    snprintf(line, size, L("%d no XPS5 agora", "%d on XPS5 now"), online);
+  }
+  return playing || online;
+}
+
+
+/**
+ * whether the list shows that it is read again from the top: not when it
+ * does so by itself (an open conversation's new messages)
+ **/
+static int
+refreshing(const tab_t *t) {
+  return t->loading == LOAD_TOP && !t->quiet;
+}
+
+
+/*
+ * A Space heard in the background (space.h): which one (g_space), how it
+ * stands on the top line of every page, and a toast when it ends.
+ */
+void
+ui_space(const x_space_t *space) {
+  snprintf(g_space.id, sizeof g_space.id, "%s", space->id[0] ? space->id : g_act.id);
+  snprintf(g_space.host, sizeof g_space.host, "%s", space->host[0] ? space->host : g_act.user);
+  snprintf(g_space.title, sizeof g_space.title, "%s", space->title);
+  g_space.live = space->state == X_SPACE_LIVE;
+  g_space.state = SPACE_TUNING;
+}
+
+
+static int
+space_playing(const char *id) {
+  space_status_t s;
+
+  space_status(&s);
+  return g_space.id[0] && (s.state == SPACE_TUNING || s.state == SPACE_ON) && (!id || !strcmp(id, g_space.id));
+}
+
+
+static void
+space_off(void) {
+  space_stop();
+  memset(&g_space, 0, sizeof g_space);
+}
+
+
+/**
+ * the Space's line on top: tuning, playing (for how long) or quiet; 0 when
+ * none plays
+ **/
+static int
+space_line(char *line, size_t size) {
+  space_status_t s;
+  long long sec;
+
+  space_status(&s);
+  if(!g_space.id[0] || (s.state != SPACE_TUNING && s.state != SPACE_ON)) {
+    return 0;
+  }
+  // short: the line has the room the page's tabs leave it
+  sec = s.heard_ms / 1000;
+  if(s.state == SPACE_TUNING || (s.waiting && !s.heard_ms)) {
+    snprintf(line, size, "%s", L("A sintonizar o Space\xe2\x80\xa6", "Tuning in to the Space\xe2\x80\xa6"));
+  } else if(s.hushed) {
+    snprintf(line, size, "%s", L("Space em sil\xc3\xaancio (v\xc3\xad" "deo)", "Space quiet (video)"));
+  } else {
+    snprintf(line, size, g_space.live ? L("Space no ar \xc2\xb7 %lld:%02lld", "Space live \xc2\xb7 %lld:%02lld") :
+             L("Space gravado \xc2\xb7 %lld:%02lld", "Recorded Space \xc2\xb7 %lld:%02lld"), sec / 60, sec % 60);
+  }
+  return 1;
+}
+
+
+/**
+ * once a frame: a toast when the Space playing ends or stops being heard;
+ * 1 when the screen should be drawn again (its line on top changed)
+ **/
+static int space_toast_why(const space_status_t *s, char *why, size_t size);
+
+static int
+space_watch(void) {
+  space_status_t s;
+  long long shown;
+  char why[64];
+
+  if(!g_space.id[0]) {
+    return 0;
+  }
+  space_status(&s);
+  if(s.state == g_space.state) {
+    shown = s.heard_ms / 1000 * 4 + s.waiting * 2 + s.hushed;
+    if(shown == g_space.shown) {
+      return 0;
+    }
+    g_space.shown = shown;
+    return 1;
+  }
+  g_space.state = s.state;
+  if(s.state == SPACE_OVER && !s.error) {
+    toast(0, L("O Space de @%s acabou.", "@%s's Space ended."), g_space.host);
+    memset(&g_space, 0, sizeof g_space);
+  } else if(s.state == SPACE_OVER || s.state == SPACE_FAILED) {
+    space_toast_why(&s, why, sizeof why);
+    toast(1, L("O Space de @%s deixou de se ouvir (%s)", "@%s's Space can no longer be heard (%s)"),
+          g_space.host, why);
+    memset(&g_space, 0, sizeof g_space);
+  } else if(s.state == SPACE_IDLE) {
+    memset(&g_space, 0, sizeof g_space);
+  }
+  return 1;
+}
+
+
+static int
+space_toast_why(const space_status_t *s, char *why, size_t size) {
+  switch(s->error) {
+  case SPACE_ERR_NETWORK:
+    snprintf(why, size, "%s", L("sem liga\xc3\xa7\xc3\xa3o", "no connection"));
+    break;
+  case SPACE_ERR_HTTP:
+    snprintf(why, size, "HTTP %d", s->code);
+    break;
+  case SPACE_ERR_FORMAT:
+    snprintf(why, size, "%s", L("o som n\xc3\xa3o veio como devia", "the sound did not come as it should"));
+    break;
+  case SPACE_ERR_AUDIO:
+    snprintf(why, size, L("sa\xc3\xad" "da de som 0x%08X", "audio output 0x%08X"), (unsigned)s->code);
+    break;
+  case SPACE_ERR_MEMORY:
+    snprintf(why, size, "%s", L("sem mem\xc3\xb3ria", "out of memory"));
+    break;
+  case SPACE_ERR_GONE:
+    snprintf(why, size, "%s", L("o servi\xc3\xa7o de fundo parou", "the background service stopped"));
+    break;
+  default:
+    snprintf(why, size, L("erro %d", "error %d"), s->code);
+    break;
+  }
+  return 1;
+}
+
+
 static void
 status_line(const tab_t *t, long long now, char *line, size_t size, uint32_t *color) {
   long long diff;
   char n[32];
 
   *color = GREY;
-  if(t->error && t->count && t->loading != LOAD_TOP) {
+  if(!(t->error && t->count && !refreshing(t)) && space_line(line, size)) {
+    *color = GREEN;
+  } else if(t->error && t->count && !refreshing(t)) {
     *color = RED;
     if(t->error == ERR_HTTP) {
       snprintf(line, size, L("N\xc3\xa3o atualizou (HTTP %d)", "Not refreshed (HTTP %d)"), t->code);
@@ -5670,7 +8213,7 @@ status_line(const tab_t *t, long long now, char *line, size_t size, uint32_t *co
     } else {
       snprintf(line, size, "%s", L("N\xc3\xa3o atualizou", "Not refreshed"));
     }
-  } else if(t->has_user && t->user.posts >= 0 && t->loading != LOAD_TOP) {
+  } else if(t->has_user && t->user.posts >= 0 && !refreshing(t)) {
     count_text(t->user.posts, n, sizeof n);
     snprintf(line, size, "@%s \xc2\xb7 %s posts", t->user.user, n);
   } else if(t->has_user && t->user.user[0] && !t->fetched_at) {
@@ -5681,14 +8224,18 @@ status_line(const tab_t *t, long long now, char *line, size_t size, uint32_t *co
     snprintf(line, size, "%s", L("Dicas sem spoilers", "Hints without spoilers"));
   } else if(t->feed >= UI_CALLS && t->feed <= UI_PREMIUM) {
     snprintf(line, size, "%s", L("Nas apps do X", "In X's apps"));
-  } else if(t->feed == UI_DM && t->user.user[0] && t->loading != LOAD_TOP) {
+  } else if(t->feed == UI_DM && t->user.user[0] && !refreshing(t)) {
     snprintf(line, size, "@%s", t->user.user);
-  } else if(t->feed == UI_DM && t->loading != LOAD_TOP) {
+  } else if(t->feed == UI_DM && !refreshing(t)) {
     snprintf(line, size, "%s", L("Conversa de grupo", "Group chat"));
+  } else if(t->feed == UI_HISTORY && t->latest) {
+    snprintf(line, size, "%s", L("Para ler depois de jogar", "To read after you play"));
   } else if(t->feed == UI_HISTORY) {
     snprintf(line, size, "%s", L("Os posts que abriste", "The posts you opened"));
-  } else if(t->feed == UI_LIST && t->user.user[0] && t->loading != LOAD_TOP) {
+  } else if(t->feed == UI_LIST && t->user.user[0] && !refreshing(t)) {
     snprintf(line, size, L("Lista de @%s", "A List by @%s"), t->user.user);
+  } else if(t->feed == UI_FRIENDS && t->fetched_at && !refreshing(t) && friends_status(t, line, size)) {
+    *color = GREEN;
   } else if(t->fetched_at) {
     diff = now - t->fetched_at;
     if(diff < 60) {
@@ -5714,6 +8261,8 @@ list_title(const tab_t *t) {
     return L("Explorar", "Explore");
   case UI_CHAT:
     return g_pick ? L("Enviar a\xe2\x80\xa6", "Send to\xe2\x80\xa6") : L("Chat", "Chat");
+  case UI_FRIENDS:
+    return L("Amigos", "Friends");
   case UI_CALLS:
     return L("Chamadas", "Calls");
   case UI_GROK:
@@ -5757,6 +8306,7 @@ section_icon(int feed) {
   case UI_NOTIFICATIONS:
     return ICON_BELL;
   case UI_CHAT:
+  case UI_FRIENDS:
     return ICON_CHAT;
   case UI_CALLS:
     return ICON_CALL;
@@ -5781,6 +8331,34 @@ section_icon(int feed) {
 
 
 /**
+ * whether Notifications shows its tabs: more than one account is linked
+ **/
+static int
+inbox_tabs(void) {
+  return g_section == UI_NOTIFICATIONS && (g_accounts & (g_accounts - 1));
+}
+
+/**
+ * under "Notifications" with every account's: a dot of each linked
+ * account's colour, and how many there are (each post says whose it is)
+ **/
+static void
+inbox_legend(text_font_t *f, int x, int y, int w) {
+  char line[48];
+  int n = 0;
+
+  for(int a=1; a <= SETTINGS_ACCOUNTS; a++) {
+    if(g_accounts >> (a - 1) & 1) {
+      draw_circle(&g_dst, x + 6 + n * 16, y - 8, 6, account_color(a));
+      n++;
+    }
+  }
+  snprintf(line, sizeof line, L("%d contas", "%d accounts"), n);
+  text_fitted(f, x + n * 16 + 8, y, line, w - n * 16 - 8, GREY);
+}
+
+
+/**
  * over the list: the section's icon or the way back, what the list is, the
  * tabs of the timeline, refreshing, and where a reply goes
  **/
@@ -5789,6 +8367,10 @@ draw_top(const tab_t *t, long long now, unsigned frame) {
   const char *const names[3] = {L("Para ti", "For you"), L("A seguir", "Following"), g_game.tab};
   const char *const products[2] = {L("Principais", "Top"), L("Recentes", "Latest")};
   const char *const explore[2] = {L("Tend\xc3\xaa" "ncias", "Trending"), L("Not\xc3\xad" "cias", "News")};
+  const char *const chats[2] = {L("Conversas", "Messages"), L("Amigos", "Friends")};
+  const char *const kept[2] = {L("Abertos", "Opened"), L("Ler depois", "Read later")};
+  const char *const inboxes[2] = {L("Esta conta", "This account"), L("Todas as contas", "Every account")};
+  int ids[3] = {UI_FOR_YOU, UI_FOLLOWING, UI_GAME};
   text_font_t *brand = font(F_BRAND), *small = font(F_SMALL), *on = font(F_PILL);
   text_font_t *off = font(F_PILL_OFF), *legend = font(F_LEGEND);
   const int pill_h = 60, py = TOP_Y + (TOP_H - pill_h) / 2;
@@ -5828,7 +8410,7 @@ draw_top(const tab_t *t, long long now, unsigned frame) {
   }
 
   // □ refreshes
-  label = t->loading == LOAD_TOP ? L("A atualizar\xe2\x80\xa6", "Refreshing\xe2\x80\xa6") :
+  label = refreshing(t) ? L("A atualizar\xe2\x80\xa6", "Refreshing\xe2\x80\xa6") :
                                    L("Atualizar", "Refresh");
   w = 24 + 30 + 12 + width_of(on, label) + 26;
   x = MAIN_X + MAIN_W - w;
@@ -5837,7 +8419,7 @@ draw_top(const tab_t *t, long long now, unsigned frame) {
   if(over) {
     lit_box(x, py, w, pill_h, pill_h / 2.0f, 1);
   }
-  if(t->loading == LOAD_TOP) {
+  if(refreshing(t)) {
     spinner(x + 24 + 15, py + pill_h / 2.0f, 12, 4, frame, FG);
   } else {
     draw_icon(&g_dst, ICON_SQUARE, x + 24, py + (pill_h - 30) / 2, 30, FG);
@@ -5853,14 +8435,22 @@ draw_top(const tab_t *t, long long now, unsigned frame) {
       game_w = width_of(on, g_game.tab);
       game_w = game_w > GAME_TAB_W ? GAME_TAB_W : game_w;
     }
-  } else if(!g_depth && g_section == UI_SEARCH) {
-    tabs = t->query[0] ? products : explore;
+  } else if(!g_depth && (g_section == UI_SEARCH || g_section == UI_HISTORY || inbox_tabs())) {
+    // the search's, History's (what was opened, and what waits to be read),
+    // or Notifications' when more accounts are linked: this one's, or all
+    tabs = g_section == UI_HISTORY ? kept : g_section == UI_NOTIFICATIONS ? inboxes : t->query[0] ? products : explore;
     lit = t->latest;
     kind = Z_PRODUCT;
+  } else if(!g_depth && (g_section == UI_CHAT || g_section == UI_FRIENDS) && !g_pick) {
+    tabs = chats;
+    lit = g_section == UI_FRIENDS;
+    ids[0] = UI_CHAT;
+    ids[1] = UI_FRIENDS;
   }
   if(tabs) {
     for(int i=0; i < n_tabs; i++) {
       seg[i] = (i == 2 ? GAME_TAB_ICON + 8 + game_w : width_of(on, tabs[i])) + (n_tabs == 3 ? 40 : 52);
+      seg[i] += tabs == chats && i == 1 && g_playing.count ? 24 : 0; // the dot
       tabs_w += seg[i];
     }
     x -= 16 + tabs_w;
@@ -5871,7 +8461,7 @@ draw_top(const tab_t *t, long long now, unsigned frame) {
       text_font_t *f = shown ? on : off;
       const char *s = tabs[i];
       uint32_t ink;
-      over = zone(kind, kind == Z_TAB && i == 2 ? UI_GAME : i, 0, x, py + 5, seg[i], pill_h - 10);
+      over = zone(kind, kind == Z_TAB ? ids[i] : i, 0, x, py + 5, seg[i], pill_h - 10);
       if(shown) {
         draw_box(&g_dst, x, py + 5, seg[i], pill_h - 10, (pill_h - 10) / 2.0f, 0, CHIP_ON);
       }
@@ -5883,6 +8473,11 @@ draw_top(const tab_t *t, long long now, unsigned frame) {
         // a controller, and the game's name as far as it fits
         draw_icon(&g_dst, ICON_GAME, x + 20, py + (pill_h - GAME_TAB_ICON) / 2, GAME_TAB_ICON, shown ? ACCENT : ink);
         text_fitted(f, x + 20 + GAME_TAB_ICON + 8, baseline(f, py, pill_h), s, game_w + 4, ink);
+      } else if(tabs == chats && i == 1 && g_playing.count) {
+        // someone the user follows plays or is on XPS5
+        const int tw = width_of(f, s), tx = x + (seg[i] - tw - 24) / 2;
+        text(f, tx, baseline(f, py, pill_h), s, ink);
+        draw_circle(&g_dst, tx + tw + 16, py + pill_h / 2.0f, 6.5f, GREEN);
       } else {
         text(f, x + (seg[i] - width_of(f, s)) / 2, baseline(f, py, pill_h), s, ink);
       }
@@ -5894,7 +8489,11 @@ draw_top(const tab_t *t, long long now, unsigned frame) {
   title_w = x - 16 - (MAIN_X + 82);
   title_w = title_w > 400 ? 400 : title_w;
   text_fitted(brand, MAIN_X + 82, TOP_Y + 31, list_title(t), title_w, FG);
-  text_fitted(small, MAIN_X + 82, TOP_Y + 63, line, title_w, color);
+  if(inbox_tabs() && t->latest && !g_depth && color == GREY) {
+    inbox_legend(small, MAIN_X + 82, TOP_Y + 63, title_w); // whose colour is whose
+  } else {
+    text_fitted(small, MAIN_X + 82, TOP_Y + 63, line, title_w, color);
+  }
 
   // where L2's reply goes (in a search, the words searched for, which △
   // changes), which also says for a few seconds how a reply or a like
@@ -5907,6 +8506,18 @@ draw_top(const tab_t *t, long long now, unsigned frame) {
   key = t->feed == UI_SEARCH ? "\xe2\x96\xb3" : "L2";
   key_x = MAIN_X + MAIN_W - 14 - (width_of(font(F_KEY), key) + 22);
   draw_key(key, key_x, INPUT_Y + (INPUT_H - 38) / 2);
+  if(t->feed == UI_DM) {
+    // a bead of the glass with the microphone: R2's voice note to the conversation
+    const int d = INPUT_H - 14, mx = key_x - 14 - d, my = INPUT_Y + 7;
+    const int on = zone(Z_DM_VOICE, 0, 0, mx - 4, my - 4, d + 8, d + 8);
+    draw_circle(&g_dst, mx + d / 2.0f, my + d / 2.0f, d / 2.0f, on ? HOVER : CHIP_ON);
+    draw_arc(&g_dst, mx + d / 2.0f, my + d / 2.0f, d / 2.0f - 1, 1.5f, 0, 6.2832f, RGBA(255, 255, 255, 60));
+    if(on) {
+      lit_circle(mx + d / 2, my + d / 2, d / 2, 1);
+    }
+    draw_icon(&g_dst, ICON_MIC, mx + (d - 26) / 2, my + (d - 26) / 2, 26, on ? ACCENT : FG);
+    key_x = mx;
+  }
   if(g_toast.frames > 0) {
     if(g_toast.error) {
       draw_box(&g_dst, MAIN_X, INPUT_Y, MAIN_W, INPUT_H, 20, 0, RGBA(244, 33, 46, 44));
@@ -5922,6 +8533,19 @@ draw_top(const tab_t *t, long long now, unsigned frame) {
     text_fitted(legend, MAIN_X + 64, baseline(legend, INPUT_Y, INPUT_H),
                 t->query[0] ? t->query : L("Pesquisar no X\xe2\x80\xa6", "Search X\xe2\x80\xa6"),
                 key_x - MAIN_X - 84, t->query[0] || over ? FG : DIM);
+    return;
+  }
+  // in Friends, the conversation L2 opens with the one picked
+  if(t->feed == UI_FRIENDS) {
+    draw_icon(&g_dst, ICON_CHAT, MAIN_X + 22, INPUT_Y + (INPUT_H - 28) / 2, 28, over ? FG : DIM);
+    if(p && p->kind == X_KIND_USER && p->user[0]) {
+      snprintf(line, sizeof line, L("Escrever a @%s\xe2\x80\xa6", "Message @%s\xe2\x80\xa6"), p->user);
+    } else {
+      snprintf(line, sizeof line, "%s", L("Quem segues no X, como os amigos de uma PS5",
+                                          "Who you follow on X, as a PS5's friends"));
+    }
+    text_fitted(legend, MAIN_X + 64, baseline(legend, INPUT_Y, INPUT_H), line, key_x - MAIN_X - 84,
+                over ? FG : DIM);
     return;
   }
   // in Chat, the conversation ✕ opens; in one, the message L2 writes
@@ -5992,7 +8616,7 @@ draw_nav(void) {
   const char *post = L("Publicar", "Post");
   const tab_t *me = &g_tabs[UI_ME];
   const int text_x = NAV_X + 26 + NAV_ICON + 24;
-  int lit = nav_item(), over, y, w;
+  int lit = nav_item(), over, y, w, count;
 
   // the logo, lined up with the icons; made once (it is the size it shows)
   if(!logo_tried) {
@@ -6019,6 +8643,12 @@ draw_nav(void) {
       draw_icon(&g_dst, icons[i], NAV_X + 27, y + (NAV_ITEM - NAV_ICON) / 2, NAV_ICON, FG);
     }
     text_fitted(tf, text_x, baseline(tf, y, NAV_ITEM), labels[i], NAV_X + NAV_W - text_x - 10, FG);
+    // what came since the user last looked, but not on the list shown
+    count = g_nav_sections[i] == UI_NOTIFICATIONS && g_section != UI_NOTIFICATIONS ? g_counts.notices :
+            g_nav_sections[i] == UI_CHAT && g_section != UI_CHAT ? g_counts.chats : 0;
+    if(count > 0) {
+      nav_badge(NAV_X + 26 + NAV_ICON / 2, text_x - 6, y + (NAV_ITEM - NAV_ICON) / 2 - 8, count);
+    }
   }
 
   // Post, the big round button
@@ -6122,20 +8752,27 @@ draw_key_cell(int x, int y, int w, int icon, const char *key, const char *label)
  **/
 static void
 draw_side_keys(const tab_t *t) {
-  const int chat = t->feed == UI_CHAT || t->feed == UI_DM;
-  const int trends = t->feed == UI_SEARCH && !t->query[0];
+  const int chat = t->feed == UI_CHAT || t->feed == UI_DM, friends = t->feed == UI_FRIENDS;
+  const int trends = t->feed == UI_SEARCH && !t->query[0], lfg = is_lfg(t);
   struct cell { int icon; const char *key, *label; };
   const struct cell cells[SIDE_ROWS * 2] = {
+    friends ? (struct cell){-1, "R2", L("Entrar", "Join")} :
     chat || trends ? (struct cell){ICON_UP_DOWN, NULL, L("Mover", "Move")} :
                      (struct cell){-1, "R2", L("Gosto", "Like")},
+    friends ? (struct cell){-1, "L2", L("Mensagem", "Message")} :
     chat ? (struct cell){-1, "L2", L("Escrever", "Write")} :
     trends ? (struct cell){ICON_LEFT_RIGHT, NULL, L("Sec\xc3\xa7\xc3\xb5" "es", "Sections")} :
              (struct cell){-1, "L2", L("Responder", "Reply")},
-    {ICON_CROSS, NULL, g_pick && t->feed == UI_CHAT ? L("Enviar", "Send") :
-                       t->count && t->cards && t->cards[t->sel].spoiler ? L("Mostrar", "Show") : L("Abrir", "Open")},
+    {ICON_CROSS, NULL, g_pick && t->feed == UI_CHAT ? L("Enviar", "Send") : friends ? L("Perfil", "Profile") :
+                       t->feed == UI_CALLS ? L("Microfone", "Microphone") :
+                       t->count && t->cards && t->cards[t->sel].spoiler ? L("Mostrar", "Show") :
+                       t->feed == UI_DM && t->count && dm_media(&t->posts[t->sel]) &&
+                       dm_media(&t->posts[t->sel])->voice ? L("Ouvir", "Listen") : L("Abrir", "Open")},
     {ICON_CIRCLE, NULL, L("Voltar", "Back")},
-    {ICON_TRIANGLE, NULL, trends ? L("Pesquisar", "Search") : L("Topo", "Top")},
-    {-1, "\xe2\x98\xb0", L("Novo post", "New post")},
+    t->feed == UI_DM ? (struct cell){-1, "R2", L("Voz", "Voice")} :
+                       (struct cell){ICON_TRIANGLE, NULL, trends ? L("Pesquisar", "Search") : L("Topo", "Top")},
+    t->feed == UI_DM || friends || lfg ? (struct cell){-1, "R1", L("Convidar", "Invite")} :
+                                  (struct cell){-1, "\xe2\x98\xb0", L("Novo post", "New post")},
   };
   const int cell_w = SIDE_W / 2;
 
@@ -6254,8 +8891,9 @@ draw_side_people(int top, unsigned frame) {
 
 /**
  * "Playing now": the people the user follows whose profile says a game,
- * each with the game in green and an Invite button, in a box from top; the
- * pointer on a name opens the profile
+ * each with the game in green and an Invite button, then those on XPS5
+ * with a green dot ("Friends online" then), in a box from top; the pointer
+ * on a name opens the profile
  **/
 static void
 draw_side_playing(int top) {
@@ -6263,13 +8901,16 @@ draw_side_playing(int top) {
   const char *label = L("Convidar", "Invite");
   int y = top + 14, n = g_playing.count < SIDE_PEOPLE ? g_playing.count : SIDE_PEOPLE;
   int bottom = y + SIDE_HEAD_H + n * SIDE_USER_H + 10, bw = width_of(pill, label) + 36;
-  int bx = SIDE_X + SIDE_W - bw, x, end, size = text_line_height(bold) - 6, is = 24, over;
+  int bx = SIDE_X + SIDE_W - bw, x, end, size = text_line_height(bold) - 6, is = 24, over, online = 0;
 
   if(!n || bottom > SIDE_KEYS_Y - 24) {
     return;
   }
+  for(int i=0; i < n; i++) {
+    online += !g_playing.items[i].playing[0];
+  }
   side_card(top, bottom);
-  side_title(y, L("A jogar agora", "Playing now"));
+  side_title(y, online ? L("Amigos online", "Friends online") : L("A jogar agora", "Playing now"));
   y += SIDE_HEAD_H;
   for(int i=0; i < n; i++, y += SIDE_USER_H) {
     const x_post_t *p = &g_playing.items[i];
@@ -6277,15 +8918,24 @@ draw_side_playing(int top) {
       lit_box(SIDE_X - 14, y, bx - SIDE_X + 4, SIDE_USER_H - 6, 18, 1);
     }
     draw_avatar(p->avatar, p->user, p->name, SIDE_X, y + 7, 52);
-    playing_badge(SIDE_X, y + 7, 52);
+    if(p->playing[0]) {
+      playing_badge(SIDE_X, y + 7, 52);
+    } else {
+      online_badge(SIDE_X, y + 7, 52);
+    }
     x = SIDE_X + 66;
     end = text_fitted(bold, x, y + 32, p->name[0] ? p->name : p->user, bx - x - 12 - (p->badge ? size + 6 : 0), FG);
     if(p->badge) {
       draw_badge(p->badge, end + 5, y + 32 - text_ascent(bold) + 2, size);
     }
     // the game under the name and the button, the whole width: its name is what matters
-    draw_icon(&g_dst, ICON_GAME, x, y + 43, is, GREEN);
-    text_fitted(small, x + is + 8, y + 63, p->playing, SIDE_X + SIDE_W - x - is - 8, GREEN);
+    if(p->playing[0]) {
+      draw_icon(&g_dst, ICON_GAME, x, y + 43, is, GREEN);
+      text_fitted(small, x + is + 8, y + 63, p->playing, SIDE_X + SIDE_W - x - is - 8, GREEN);
+    } else {
+      draw_circle(&g_dst, x + is / 2.0f, y + 55, 6.5f, GREEN);
+      text_fitted(small, x + is + 8, y + 63, L("No XPS5", "On XPS5"), SIDE_X + SIDE_W - x - is - 8, GREEN);
+    }
     over = zone(Z_SIDE_INVITE, i, 0, bx, y + 6, bw, 36);
     draw_box(&g_dst, bx, y + 6, bw, 36, 18, 0, over ? RGBA(224, 219, 214, 255) : WHITE);
     if(over) {
@@ -6293,6 +8943,421 @@ draw_side_playing(int top) {
     }
     text(pill, bx + (bw - width_of(pill, label)) / 2, baseline(pill, y + 6, 36), label, INK);
   }
+}
+
+
+#define SIDE_GAME_ICON 64
+#define SIDE_GAME_BTN  50 // a button, the box's width
+#define SIDE_GAME_GAP  10
+
+/**
+ * "Your game", on Home's tab of the game that runs, in place of the
+ * trends: its icon and name, how many of its trophies the user has, and
+ * buttons for their sheet, the week's card, a post looking for a group and
+ * the posts that look for one, in a box from top; returns where it ends
+ **/
+static int
+draw_side_game(int top) {
+  text_font_t *bold = font(F_SIDE_BOLD), *small = font(F_SMALL), *pill = font(F_SMALL_BOLD);
+  static const int icons[GAME_BUTTONS] = {ICON_TROPHY, ICON_CLOCK, ICON_PLUS, ICON_SEARCH};
+  const char *labels[GAME_BUTTONS] = {
+    L("Trof\xc3\xa9us e dicas do Grok", "Trophies and Grok's tips"),
+    L("O cart\xc3\xa3o da minha semana", "My week's card"),
+    L("Procurar grupo (LFG)", "Look for a group (LFG)"),
+    L("Grupos \xc3\xa0 procura de jogadores", "Groups looking for players"),
+  };
+  const int y0 = top + 14, mine = !strcmp(g_tr.id, g_game.id);
+  const int bottom = y0 + SIDE_HEAD_H + SIDE_GAME_ICON + 22 + GAME_BUTTONS * (SIDE_GAME_BTN + SIDE_GAME_GAP) + 4;
+  char url[IMAGES_URL_MAX], line[96];
+  const uint32_t *icon;
+  int y = y0, x, w, over;
+
+  side_card(top, bottom);
+  side_title(y, L("O teu jogo", "Your game"));
+  y += SIDE_HEAD_H;
+  snprintf(url, sizeof url, "file:///user/appmeta/%s/icon0.png", g_game.id);
+  if((icon=picture(url, SIDE_GAME_ICON, SIDE_GAME_ICON))) {
+    draw_picture_round(&g_dst, SIDE_X, y, SIDE_GAME_ICON, SIDE_GAME_ICON, 14, icon);
+  } else {
+    draw_box(&g_dst, SIDE_X, y, SIDE_GAME_ICON, SIDE_GAME_ICON, 14, 0, CHIP);
+    draw_icon(&g_dst, ICON_GAME, SIDE_X + 14, y + 14, 36, GREY);
+  }
+  x = SIDE_X + SIDE_GAME_ICON + 16;
+  w = SIDE_X + SIDE_W - x;
+  text_fitted(bold, x, y + 26, g_game.name[0] ? g_game.name : g_game.id, w, FG);
+  if(mine && g_tr.count > 0) {
+    const int done = g_tr.earned * w / g_tr.count;
+    snprintf(line, sizeof line, L("%d de %d trof\xc3\xa9us \xc2\xb7 %d%%", "%d of %d trophies \xc2\xb7 %d%%"), g_tr.earned,
+             g_tr.count, g_tr.earned * 100 / g_tr.count);
+    draw_icon(&g_dst, ICON_TROPHY, x, y + 33, 22, g_grade_colours[2]);
+    text_fitted(small, x + 28, y + 52, line, w - 28, GREY);
+    draw_box(&g_dst, x, y + 60, w, 6, 3, 0, CHIP);
+    if(done > 0) {
+      draw_box(&g_dst, x, y + 60, done < 6 ? 6 : done, 6, 3, 0, g_grade_colours[2]);
+    }
+  } else {
+    text_fitted(small, x, y + 54, mine && g_tr.count < 0 ? L("Sem trof\xc3\xa9us nesta PS5", "No trophies on this PS5") :
+                L("A ler os trof\xc3\xa9us\xe2\x80\xa6", "Reading the trophies\xe2\x80\xa6"), w, GREY);
+  }
+  y += SIDE_GAME_ICON + 22;
+  for(int i=0; i < GAME_BUTTONS; i++, y += SIDE_GAME_BTN + SIDE_GAME_GAP) {
+    over = zone(Z_SIDE_GAME, i, 0, SIDE_X - 10, y, SIDE_W + 20, SIDE_GAME_BTN);
+    draw_box(&g_dst, SIDE_X - 10, y, SIDE_W + 20, SIDE_GAME_BTN, SIDE_GAME_BTN / 2.0f, 0, over ? HOVER : CHIP);
+    if(over) {
+      lit_box(SIDE_X - 10, y, SIDE_W + 20, SIDE_GAME_BTN, SIDE_GAME_BTN / 2.0f, 1);
+    }
+    draw_icon(&g_dst, icons[i], SIDE_X + 8, y + (SIDE_GAME_BTN - 26) / 2, 26,
+              i == GAME_TROPHIES ? g_grade_colours[2] : FG);
+    text_fitted(pill, SIDE_X + 48, baseline(pill, y, SIDE_GAME_BTN), labels[i], SIDE_W - 48 - 8, FG);
+  }
+  return bottom;
+}
+
+
+/**
+ * a group's conversation: its people, those playing first (the game in
+ * green, a green dot for those on XPS5), and the button that invites them
+ * all to the game that runs here, R1's, as a party does; returns where the
+ * box ends
+ **/
+static int
+draw_side_party(int top) {
+  text_font_t *bold = font(F_SIDE_BOLD), *small = font(F_SMALL), *pill = font(F_SMALL_BOLD);
+  const int n = g_party.count < PARTY_ROWS ? g_party.count : PARTY_ROWS, more = g_party.count - n;
+  const int y0 = top + 14, kw = width_of(font(F_KEY), "R1") + 22, ready = g_game.name[0] != 0;
+  const int bottom = y0 + SIDE_HEAD_H + n * SIDE_USER_H + (more > 0 ? 36 : 0) + 10 + SIDE_GAME_BTN + 46;
+  char line[160];
+  int y = y0, x, end, size = text_line_height(bold) - 6, is = 24, over, around = 0;
+
+  for(int i=0; i < g_party.count; i++) {
+    around += g_party.items[i].playing[0] || g_party.items[i].online;
+  }
+  side_card(top, bottom);
+  side_title(y, L("Grupo", "Group"));
+  // how many are around, or how many there are, on the title's right
+  if(around) {
+    snprintf(line, sizeof line, L("%d online", "%d online"), around);
+  } else {
+    snprintf(line, sizeof line, L("%d pessoas", "%d people"), g_party.count);
+  }
+  text(small, SIDE_X + SIDE_W - width_of(small, line), baseline(font(F_HEADING), y, 50), line, around ? GREEN : GREY);
+  y += SIDE_HEAD_H;
+  for(int i=0; i < n; i++, y += SIDE_USER_H) {
+    const x_post_t *p = &g_party.items[i];
+    if(zone(Z_PARTY_ROW, i, 0, SIDE_X - 14, y, SIDE_W + 28, SIDE_USER_H - 6)) {
+      lit_box(SIDE_X - 14, y, SIDE_W + 28, SIDE_USER_H - 6, 18, 1);
+    }
+    draw_avatar(p->avatar, p->user, p->name, SIDE_X, y + 7, 52);
+    if(p->playing[0]) {
+      playing_badge(SIDE_X, y + 7, 52);
+    } else if(p->online) {
+      online_badge(SIDE_X, y + 7, 52);
+    }
+    x = SIDE_X + 66;
+    end = text_fitted(bold, x, y + 32, p->name[0] ? p->name : p->user,
+                      SIDE_X + SIDE_W - x - (p->badge ? size + 6 : 0), FG);
+    if(p->badge) {
+      draw_badge(p->badge, end + 5, y + 32 - text_ascent(bold) + 2, size);
+    }
+    if(p->playing[0]) {
+      draw_icon(&g_dst, ICON_GAME, x, y + 43, is, GREEN);
+      text_fitted(small, x + is + 8, y + 63, p->playing, SIDE_X + SIDE_W - x - is - 8, GREEN);
+    } else if(p->online) {
+      draw_circle(&g_dst, x + is / 2.0f, y + 55, 6.5f, GREEN);
+      text_fitted(small, x + is + 8, y + 63, L("No XPS5", "On XPS5"), SIDE_X + SIDE_W - x - is - 8, GREEN);
+    } else {
+      snprintf(line, sizeof line, "@%s", p->user);
+      text_fitted(small, x, y + 63, line, SIDE_X + SIDE_W - x, GREY);
+    }
+  }
+  if(more > 0) {
+    snprintf(line, sizeof line, L("e mais %d", "and %d more"), more);
+    text_fitted(small, SIDE_X, y + 24, line, SIDE_W, GREY);
+    y += 36;
+  }
+  y += 10;
+  // the invite, a light pill of the glass; the game's icon in the accent once there is one
+  over = zone(Z_PARTY_INVITE, 0, 0, SIDE_X - 10, y, SIDE_W + 20, SIDE_GAME_BTN);
+  draw_box(&g_dst, SIDE_X - 10, y, SIDE_W + 20, SIDE_GAME_BTN, SIDE_GAME_BTN / 2.0f, 0, over ? HOVER : CHIP);
+  if(over) {
+    lit_box(SIDE_X - 10, y, SIDE_W + 20, SIDE_GAME_BTN, SIDE_GAME_BTN / 2.0f, 1);
+  }
+  draw_icon(&g_dst, ICON_GAME, SIDE_X + 8, y + (SIDE_GAME_BTN - 26) / 2, 26, ready ? ACCENT : DIM);
+  text_fitted(pill, SIDE_X + 48, baseline(pill, y, SIDE_GAME_BTN), L("Convidar o grupo", "Invite the group"),
+              SIDE_W - 48 - kw - 12, ready ? FG : GREY);
+  draw_key("R1", SIDE_X + SIDE_W + 2 - kw, y + (SIDE_GAME_BTN - 38) / 2);
+  y += SIDE_GAME_BTN;
+  if(ready) {
+    snprintf(line, sizeof line, L("Convite para %s", "An invite to %s"), g_game.name);
+  } else {
+    snprintf(line, sizeof line, "%s", L("Abre um jogo para convidar o grupo", "Open a game to invite the group"));
+  }
+  text_fitted(small, SIDE_X, y + 32, line, SIDE_W, GREY);
+  return bottom;
+}
+
+
+#define ACTIVITY_MAX 8 // changes the side column shows at most
+
+/**
+ * Friends' activity, as a PS5's "What's new" has it: who of the people the
+ * user follows started a game or opened XPS5, the newest first, in a box
+ * from top; returns where it ends
+ **/
+static int
+draw_side_activity(int top) {
+  text_font_t *bold = font(F_SIDE_BOLD), *small = font(F_SMALL), *f = font(F_SIDE);
+  const char *none = L("Quando algu\xc3\xa9m que segues come\xc3\xa7" "a um jogo ou abre o XPS5, aparece aqui.",
+                       "When someone you follow starts a game or opens XPS5, it shows up here.");
+  const int y0 = top + 14, room = (SIDE_KEYS_Y - 24 - y0 - SIDE_HEAD_H - 10) / SIDE_USER_H, is = 24;
+  int n = g_seen.events < room ? g_seen.events : room, bottom, y = y0, x, w;
+  char line[200], when[48];
+
+  n = n > ACTIVITY_MAX ? ACTIVITY_MAX : n < 0 ? 0 : n;
+  bottom = y0 + SIDE_HEAD_H + (n ? n * SIDE_USER_H : wrapped_lines(f, none, SIDE_W) * SIDE_LINE_H + 8) + 10;
+  side_card(top, bottom);
+  side_title(y, L("Atividade", "Activity"));
+  y += SIDE_HEAD_H;
+  if(!n) {
+    text_wrapped(f, SIDE_X, y + 4, SIDE_LINE_H, none, SIDE_W, GREY);
+    return bottom;
+  }
+  for(int i=0; i < n; i++, y += SIDE_USER_H) {
+    const seen_event_t *e = &g_seen.event[i];
+    const seen_person_t *s = seen_find(&g_seen, e->id);
+    if(zone(Z_ACTIVITY, i, 0, SIDE_X - 14, y, SIDE_W + 28, SIDE_USER_H - 6)) {
+      lit_box(SIDE_X - 14, y, SIDE_W + 28, SIDE_USER_H - 6, 18, 1);
+    }
+    draw_avatar(e->avatar, e->user, e->name, SIDE_X, y + 7, 52);
+    // the dot of what they do now
+    if(s && s->state == SEEN_PLAYING) {
+      playing_badge(SIDE_X, y + 7, 52);
+    } else if(s && s->state == SEEN_ONLINE) {
+      online_badge(SIDE_X, y + 7, 52);
+    }
+    x = SIDE_X + 66;
+    age(e->at, g_now, when, sizeof when);
+    w = width_of(small, when);
+    text(small, SIDE_X + SIDE_W - w, y + 32, when, GREY);
+    text_fitted(bold, x, y + 32, e->name[0] ? e->name : e->user, SIDE_X + SIDE_W - w - 12 - x, FG);
+    if(e->game[0]) {
+      draw_icon(&g_dst, ICON_GAME, x, y + 43, is, GREEN);
+      snprintf(line, sizeof line, L("Come\xc3\xa7ou %s", "Started %s"), e->game);
+    } else {
+      draw_circle(&g_dst, x + is / 2.0f, y + 55, 6.5f, GREEN);
+      snprintf(line, sizeof line, "%s", L("Abriu o XPS5", "Opened XPS5"));
+    }
+    text_fitted(small, x + is + 8, y + 63, line, SIDE_X + SIDE_W - x - is - 8, GREY);
+  }
+  return bottom;
+}
+
+
+/**
+ * a light pill of the glass, the side column's width, at y: an icon (in
+ * the accent when lit) and its words; returns whether the pointer is on it
+ **/
+static int
+side_pill(int kind, int arg, int y, int icon, int lit, const char *label) {
+  text_font_t *pill = font(F_SMALL_BOLD);
+  const int over = zone(kind, arg, 0, SIDE_X - 10, y, SIDE_W + 20, SIDE_GAME_BTN);
+
+  draw_box(&g_dst, SIDE_X - 10, y, SIDE_W + 20, SIDE_GAME_BTN, SIDE_GAME_BTN / 2.0f, 0, over ? HOVER : CHIP);
+  if(over) {
+    lit_box(SIDE_X - 10, y, SIDE_W + 20, SIDE_GAME_BTN, SIDE_GAME_BTN / 2.0f, 1);
+  }
+  draw_icon(&g_dst, icon, SIDE_X + 8, y + (SIDE_GAME_BTN - 26) / 2, 26, lit ? ACCENT : FG);
+  text_fitted(pill, SIDE_X + 48, baseline(pill, y, SIDE_GAME_BTN), label, SIDE_W - 48 - 8, FG);
+  return over;
+}
+
+
+#define WEEK_ROW 58 // a game of the week on the user's card
+
+/**
+ * the card of the user's own profile: their week of play (the payload's
+ * sessions, asked for while it shows), its most played games, what their
+ * friends see of them, and the week's card to post; returns where it ends
+ **/
+static int
+draw_side_week(int top, unsigned frame) {
+  text_font_t *bold = font(F_SIDE_BOLD), *small = font(F_SMALL), *f = font(F_SIDE), *big = font(F_HEADING);
+  const week_t *w = &g_week_info.week;
+  const int waiting = !g_week_info.ok && g_now - g_week_info.asked < WEEK_INFO_WAIT;
+  const int n = g_week_info.ok > 0 && w->sessions ? (w->count < 3 ? w->count : 3) : 0, is = 24;
+  const char *words = NULL, *seen_by;
+  char line[200], took[32], url[IMAGES_URL_MAX];
+  const uint32_t *icon;
+  int y = top + 14, bottom, middle, x, tw, all, seen_h;
+
+  // asked for now and then while it shows
+  if(!g_week_info.asked || g_now - g_week_info.asked >= WEEK_INFO_EVERY) {
+    g_week_info.want = 1;
+    g_week_info.asked = g_now;
+  }
+  if(g_week_info.ok > 0 && !w->sessions) {
+    words = L("Ainda n\xc3\xa3o h\xc3\xa1 sess\xc3\xb5" "es esta semana: o XPS5 conta as de 10 minutos ou mais, com "
+              "\xe2\x80\x9cPartilhar capturas e trof\xc3\xa9us\xe2\x80\x9d ligado.",
+              "No sessions this week yet: XPS5 counts the ones of 10 minutes or more, with "
+              "\xe2\x80\x9cShare captures and trophies\xe2\x80\x9d on.");
+  } else if(g_week_info.ok <= 0 && !waiting) {
+    words = L("A tua semana n\xc3\xa3o veio agora. Volto a pedi-la daqui a pouco.",
+              "Your week did not come now. It is asked for again in a while.");
+  }
+  // what the people the user follows see of them, as the settings have it
+  if(g_settings.playing && g_game.name[0]) {
+    snprintf(line, sizeof line, L("Amigos veem: %s", "Friends see: %s"), g_game.name);
+  } else if(g_settings.online && !g_game.name[0]) {
+    snprintf(line, sizeof line, "%s", L("Amigos veem-te no XPS5", "Friends see you on XPS5"));
+  } else {
+    snprintf(line, sizeof line, "%s", L("Estado oculto (Defini\xc3\xa7\xc3\xb5" "es)", "Status hidden (Settings)"));
+  }
+  seen_by = line;
+  seen_h = wrapped_lines(small, seen_by, SIDE_W - is - 10) * 30 + 14;
+  middle = n ? 92 + n * WEEK_ROW : words ? wrapped_lines(f, words, SIDE_W) * SIDE_LINE_H + 8 : 50;
+  bottom = y + SIDE_HEAD_H + middle + seen_h + SIDE_GAME_BTN + 10;
+  side_card(top, bottom);
+  side_title(y, L("A tua semana", "Your week"));
+  y += SIDE_HEAD_H;
+  if(waiting && !n) {
+    spinner(SIDE_X + 15, y + 22, 13, 4, frame, ACCENT);
+    g_spinning = 1;
+    text(f, SIDE_X + 44, baseline(f, y, 44), L("A ler a tua semana\xe2\x80\xa6", "Reading your week\xe2\x80\xa6"), GREY);
+  } else if(words) {
+    text_wrapped(f, SIDE_X, y + 4, SIDE_LINE_H, words, SIDE_W, GREY);
+  } else if(n) {
+    // the time played, big, and the sessions and trophies under it
+    session_duration(w->seconds, took, sizeof took);
+    tw = text_fitted(big, SIDE_X, baseline(big, y, 50), took, SIDE_W, FG);
+    text_fitted(small, tw + 12, baseline(big, y, 50), L("jogadas", "played"), SIDE_X + SIDE_W - tw - 12, GREY);
+    all = w->trophies[0] + w->trophies[1] + w->trophies[2] + w->trophies[3];
+    snprintf(url, sizeof url, L("Sess\xc3\xb5" "es: %d \xc2\xb7 Trof\xc3\xa9us: %d", "Sessions: %d \xc2\xb7 Trophies: %d"),
+             w->sessions, all);
+    text_fitted(small, SIDE_X, y + 78, url, SIDE_W, GREY);
+    y += 92;
+    for(int i=0; i < n; i++, y += WEEK_ROW) {
+      const week_game_t *g = &w->games[i];
+      snprintf(url, sizeof url, "file:///user/appmeta/%s/icon0.png", g->id);
+      if((icon=picture(url, 46, 46))) {
+        draw_picture_round(&g_dst, SIDE_X, y + 4, 46, 46, 10, icon);
+      } else {
+        draw_box(&g_dst, SIDE_X, y + 4, 46, 46, 10, 0, CHIP);
+        draw_icon(&g_dst, ICON_GAME, SIDE_X + 11, y + 15, 24, GREY);
+      }
+      session_duration(g->seconds, took, sizeof took);
+      x = SIDE_X + SIDE_W - width_of(small, took);
+      text(small, x, baseline(bold, y, WEEK_ROW - 4), took, GREY);
+      text_fitted(bold, SIDE_X + 60, baseline(bold, y, WEEK_ROW - 4), g->name[0] ? g->name : g->id,
+                  x - 12 - SIDE_X - 60, FG);
+    }
+  }
+  y = top + 14 + SIDE_HEAD_H + middle;
+  // what the friends see, then the week's card
+  if(g_settings.playing && g_game.name[0]) {
+    draw_icon(&g_dst, ICON_GAME, SIDE_X, y + 8, is, GREEN);
+  } else if(g_settings.online && !g_game.name[0]) {
+    draw_circle(&g_dst, SIDE_X + is / 2.0f, y + 20, 6.5f, GREEN);
+  } else {
+    draw_icon(&g_dst, ICON_EYE_OFF, SIDE_X, y + 8, is, GREY);
+  }
+  text_wrapped(small, SIDE_X + is + 10, y + 7, 30, seen_by, SIDE_W - is - 10, GREY);
+  y += seen_h;
+  side_pill(Z_GAMER, GAMER_WEEK, y, ICON_CLOCK, 0, L("O cart\xc3\xa3o da minha semana", "My week's card"));
+  return bottom;
+}
+
+
+/**
+ * the player card, in the side column of a profile, as a PS5's profile has
+ * it: for someone else, the game they play or that they are on XPS5 (else
+ * when XPS5 last saw them around), the games they were seen playing, and
+ * buttons that invite them, ask to join their game and write to them; for
+ * the user, their week (draw_side_week). Returns where the box ends
+ **/
+static int
+draw_side_gamer(const tab_t *t, int top, unsigned frame) {
+  text_font_t *bold = font(F_SIDE_BOLD), *small = font(F_SMALL), *f = font(F_SIDE);
+  const char *me = g_settings.ids[g_settings.account - 1];
+  const seen_person_t *s = seen_find(&g_seen, t->user.id);
+  char game[PLAY_GAME], line[200], sub[200];
+  int games = 0, y = top + 14, bottom, is = 30, online;
+  uint32_t ink;
+
+  if(t->feed == UI_ME || (me[0] && !strcmp(t->user.id, me))) {
+    return draw_side_week(top, frame);
+  }
+  game[0] = 0;
+  online = !play_game_of(t->user.location, game, sizeof game) && play_online_of(t->user.location);
+  for(int i=0; s && i < SEEN_GAMES; i++) {
+    games += s->games[i][0] != 0;
+  }
+  bottom = y + SIDE_HEAD_H + 76 + (games ? 34 + games * 42 + 6 : 0) + (game[0] ? 3 : 2) * (SIDE_GAME_BTN + SIDE_GAME_GAP) +
+           4;
+  side_card(top, bottom);
+  side_title(y, L("Cart\xc3\xa3o de jogador", "Player card"));
+  y += SIDE_HEAD_H;
+  // what they do, or when XPS5 last saw them around
+  if(game[0]) {
+    draw_icon(&g_dst, ICON_GAME, SIDE_X, y + 8, is, GREEN);
+    snprintf(line, sizeof line, "%s", game);
+    snprintf(sub, sizeof sub, "%s", L("A jogar agora, na PS5", "Playing now, on PS5"));
+    ink = GREEN;
+  } else if(online) {
+    draw_circle(&g_dst, SIDE_X + is / 2.0f, y + 23, 8, GREEN);
+    snprintf(line, sizeof line, "%s", L("Online no XPS5", "Online on XPS5"));
+    snprintf(sub, sizeof sub, "%s", L("Na PS5, sem jogo aberto", "On PS5, with no game open"));
+    ink = GREEN;
+  } else if(s && s->at > 0) {
+    draw_icon(&g_dst, ICON_CLOCK, SIDE_X, y + 8, is, GREY);
+    seen_ago(s->at, g_now, line, sizeof line);
+    if(s->game[0]) {
+      snprintf(sub, sizeof sub, L("A jogar %s", "Playing %s"), s->game);
+    } else {
+      snprintf(sub, sizeof sub, "%s", L("No XPS5", "On XPS5"));
+    }
+    ink = FG;
+  } else {
+    draw_icon(&g_dst, ICON_PERSON, SIDE_X, y + 8, is, GREY);
+    snprintf(line, sizeof line, "%s", L("Ainda n\xc3\xa3o visto no XPS5", "Not seen on XPS5 yet"));
+    snprintf(sub, sizeof sub, "%s", L("Quem segues aparece ao jogar", "Who you follow shows up as they play"));
+    ink = GREY;
+  }
+  text_fitted(bold, SIDE_X + is + 14, y + 30, line, SIDE_W - is - 14, ink);
+  text_fitted(small, SIDE_X + is + 14, y + 60, sub, SIDE_W - is - 14, GREY);
+  y += 76;
+  // the games XPS5 saw them play, the newest first
+  if(games) {
+    text_fitted(small, SIDE_X, y + 24, L("Jogos recentes", "Recent games"), SIDE_W, GREY);
+    y += 34;
+    for(int i=0; i < SEEN_GAMES; i++) {
+      if(s->games[i][0]) {
+        draw_box(&g_dst, SIDE_X, y + 4, 34, 34, 9, 0, CHIP);
+        draw_icon(&g_dst, ICON_GAME, SIDE_X + 6, y + 10, 22, !strcmp(s->games[i], game) ? GREEN : GREY);
+        text_fitted(f, SIDE_X + 48, baseline(f, y, 42), s->games[i], SIDE_W - 48, FG);
+        y += 42;
+      }
+    }
+    y += 6;
+  }
+  // what the user can do: invite them, ask to join, write
+  if(g_game.name[0]) {
+    snprintf(line, sizeof line, L("Convidar para %s", "Invite to %s"), g_game.name);
+  } else if(game[0]) {
+    snprintf(line, sizeof line, L("Convidar para %s", "Invite to %s"), game);
+  } else {
+    line[0] = 0;
+  }
+  if(!line[0] || width_of(font(F_SMALL_BOLD), line) > SIDE_W - 56) {
+    snprintf(line, sizeof line, "%s", L("Convidar para jogar", "Invite to play"));
+  }
+  side_pill(Z_GAMER, GAMER_INVITE, y, ICON_GAME, g_game.name[0] != 0, line);
+  y += SIDE_GAME_BTN + SIDE_GAME_GAP;
+  if(game[0]) {
+    side_pill(Z_GAMER, GAMER_JOIN, y, ICON_SEND, 0, L("Pedir para entrar", "Ask to join"));
+    y += SIDE_GAME_BTN + SIDE_GAME_GAP;
+  }
+  side_pill(Z_GAMER, GAMER_CHAT, y, ICON_CHAT, 0, L("Enviar mensagem", "Send a message"));
+  return bottom;
 }
 
 
@@ -6309,17 +9374,25 @@ draw_side(const tab_t *t, unsigned frame) {
 
   draw_side_keys(t);
 
-  if(t->feed == UI_CHAT || t->feed == UI_DM || (t->feed == UI_SEARCH && !t->query[0]) || t->feed == UI_LISTS) {
+  if(is_party(t)) {
+    y = draw_side_party(y);
+  } else if(t->feed == UI_FRIENDS) {
+    draw_side_activity(y);
+    return; // the list itself is who plays and who is around
+  } else if((t->feed == UI_USER || t->feed == UI_ME) && t->has_user) {
+    y = draw_side_gamer(t, y, frame);
+  } else if(t->feed == UI_CHAT || t->feed == UI_DM || (t->feed == UI_SEARCH && !t->query[0]) ||
+            t->feed == UI_LISTS) {
     const char *title = g_pick && t->feed == UI_CHAT ? L("Enviar a\xe2\x80\xa6", "Send to\xe2\x80\xa6") :
                         t->feed == UI_CHAT || t->feed == UI_DM ? "Chat" : list_title(t);
     const char *words = g_pick && t->feed == UI_CHAT ?
       L("Escolhe a conversa para onde vai a tua captura. \xe2\x9c\x95 envia-a e \xe2\x97\x8b volta ao post.",
         "Pick the conversation your capture goes to. \xe2\x9c\x95 sends it and \xe2\x97\x8b goes back to the post.") :
       t->feed == UI_DM ?
-      L("\xe2\x9c\x95 ou L2 escreve uma mensagem, \xe2\x86\x91 e \xe2\x86\x93 percorrem a conversa e "
-        "\xe2\x96\xa1 v\xc3\xaa se chegaram novas.",
-        "\xe2\x9c\x95 or L2 writes a message, \xe2\x86\x91 and \xe2\x86\x93 go through the "
-        "conversation and \xe2\x96\xa1 checks for new ones.") :
+      L("\xe2\x9c\x95 ou L2 escreve uma mensagem e \xe2\x86\x91 e \xe2\x86\x93 percorrem a conversa. "
+        "As novas chegam sozinhas.",
+        "\xe2\x9c\x95 or L2 writes a message, and \xe2\x86\x91 and \xe2\x86\x93 go through the "
+        "conversation. New ones come in by themselves.") :
       t->feed == UI_CHAT ?
       L("As tuas mensagens diretas do X. \xe2\x9c\x95 abre uma conversa e \xe2\x96\xa1 atualiza. "
         "As conversas cifradas do X Chat s\xc3\xb3 abrem nas apps do X.",
@@ -6340,6 +9413,8 @@ draw_side(const tab_t *t, unsigned frame) {
     text(heading, SIDE_X, baseline(heading, y + 14, 52), title, FG);
     text_wrapped(f, SIDE_X, y + 14 + SIDE_HEAD_H + 8, SIDE_LINE_H, words, SIDE_W, GREY);
     y = bottom;
+  } else if(t->feed == UI_GAME && game_id_ok(g_game.id)) {
+    y = draw_side_game(y);
   } else {
     y = draw_side_trends(y, frame);
   }
@@ -6367,7 +9442,8 @@ draw_viewer(unsigned frame) {
 
   g_viewer.waiting = 0;
   if(video) {
-    draw_viewer_video(m, media_url(m->url, "large", buf, sizeof buf), frame);
+    // X Chat's video has no still: its url is the encrypted MP4
+    draw_viewer_video(m, m->xchat ? NULL : media_url(m->url, "large", buf, sizeof buf), frame);
     return;
   }
   draw_rect(&g_dst, 0, 0, UI_WIDTH, UI_HEIGHT, RGBA(10, 8, 7, 228));
@@ -6383,7 +9459,9 @@ draw_viewer(unsigned frame) {
   h = (h < 64 ? 64 : h) & ~1;
   x = (UI_WIDTH - w) / 2;
   y = 50 + (max_h - h) / 2;
-  if((pixels=picture(media_url(m->url, "large", buf, sizeof buf), w, h))) {
+  pixels = m->xchat ? images_get_enc(m->url, m->xchat_key, pxs(w), pxs(h)) :
+           picture(media_url(m->url, "large", buf, sizeof buf), w, h);
+  if(pixels) {
     draw_picture_round(&g_dst, x, y, w, h, 16, pixels);
   } else {
     g_viewer.waiting = 1;
@@ -6738,6 +9816,10 @@ player_error(const player_status_t *st, char *buf, size_t size) {
   case PLAYER_ERR_DECODER:
     snprintf(buf, size, L("O descodificador falhou (%d)", "The decoder failed (%d)"), st->code);
     break;
+  case PLAYER_ERR_CUT:
+    snprintf(buf, size, L("A liga\xc3\xa7\xc3\xa3o caiu a meio do v\xc3\xad" "deo (0x%08X)",
+                          "The connection dropped partway through the video (0x%08X)"), (unsigned)st->code);
+    break;
   default:
     snprintf(buf, size, "%s", L("Falta mem\xc3\xb3ria para o v\xc3\xad" "deo", "Out of memory for the video"));
   }
@@ -6782,7 +9864,7 @@ draw_viewer_video(const x_media_t *m, const char *still, unsigned frame) {
   if(st.state == PLAYER_PLAYING || st.state == PLAYER_PAUSED) {
     shown = draw_player(x, y, w, h, 0);
   }
-  if(!shown && (pixels=picture(still, w, h))) {
+  if(!shown && still && (pixels=picture(still, w, h))) {
     draw_picture_round(&g_dst, x, y, w, h, 0, pixels);
   }
   over = zone(Z_V_PLAY, 0, 0, x, y, w, h);
@@ -6943,7 +10025,10 @@ viewer_keys(unsigned keys) {
 enum { C_FOCUS_TEXT, C_FOCUS_MEDIA, C_FOCUS_ADD = C_FOCUS_MEDIA + UI_MEDIA_MAX, C_FOCUS_SEND,
        C_FOCUS_POLL, // the bar's poll button
        C_FOCUS_CHOICE, C_FOCUS_CHOICE_ADD = C_FOCUS_CHOICE + X_POLL_MAX, C_FOCUS_LENGTH, // and the poll's rows
-       C_FOCUS_DM }; // the bar's button that sends the capture in a message
+       C_FOCUS_DM,     // the bar's button that sends the capture in a message
+       C_FOCUS_VOICE,  // and the one that tapes a voice note
+       C_FOCUS_PHONE,  // and the one that writes the text on the phone
+       C_FOCUS_DICTATE }; // and the one that writes what is said
 
 // the captures
 #define G_X       220
@@ -6970,13 +10055,13 @@ enum { GALLERY_NONE, GALLERY_LOADING, GALLERY_READY, GALLERY_FAILED };
 #define S_ROW_H   78
 
 enum {
-  S_LANG, S_THEME, S_SCREEN, S_NOTIFY, S_EVERY, S_SOUND, S_HOVER, S_AUTOPLAY, S_SAVER, S_SPOILER, S_LIGHT,
-  S_BREAK, S_RISING, S_SHARE, S_PLAYING, S_SESSION, S_UPDATE, S_ROWS
+  S_LANG, S_THEME, S_SCREEN, S_NOTIFY, S_EVERY, S_SOUND, S_HOVER, S_AUTOPLAY, S_SAVER, S_SPOILER, S_CATCHUP, S_LIGHT,
+  S_RUMBLE, S_SPEAKER, S_BREAK, S_RISING, S_FRIENDS, S_QUIET, S_SHARE, S_PLAYING, S_ONLINE, S_SESSION, S_UPDATE, S_ROWS
 };
 #define S_SHOWN   10 // the rows that fit; ↑ ↓ and the right stick go through the rest
 #define S_CHOICES S_ROWS // the rows that change something; S_SESSION the account
 
-static const int g_everies[] = {30, 60, 120, 300, 600};
+static const int g_everies[] = {15, 20, 30, 60, 120, 300, 600};
 static const int g_screens[] = {0, 1080, 1440, 2160}; // the rows drawn; 0 for the TV's
 
 static struct {
@@ -7407,13 +10492,102 @@ remove_media(int i) {
 }
 
 
+/*
+ * The part of the composer's MP4 that goes (capture_t's clip, clip.h): all
+ * of it, its last 30 or 15 s, or its first 30 s, cut by main.c without
+ * encoding it again. ✕ on it goes to the next part its length has room for;
+ * one longer than X takes without Premium goes as its last 30 s, said once.
+ */
+#define CLIP_AUTO_MS 140000 // X's 2:20 without Premium
+
+static char g_clip_path[CAPTURE_PATH]; // the composer's video whose length its player told
+static int  g_clip_len_ms;
+
+
+static const char *
+clip_name(int which) {
+  return which == CLIP_LAST_30 ? L("\xc3\x9altimos 30 s", "Last 30 s") :
+         which == CLIP_LAST_15 ? L("\xc3\x9altimos 15 s", "Last 15 s") :
+         which == CLIP_FIRST_30 ? L("Primeiros 30 s", "First 30 s") : L("Inteiro", "Whole");
+}
+
+
+/**
+ * whether a video len_ms long (0 when not known) has room for the part which
+ **/
+static int
+clip_fits(int which, int len_ms) {
+  return which == CLIP_WHOLE || !len_ms ||
+         len_ms > (which == CLIP_LAST_15 ? 15000 : 30000) + CLIP_SHORTEST;
+}
+
+
+/**
+ * the composer's video c is len_ms long, as its player says
+ **/
+static void
+clip_known(capture_t *c, int len_ms) {
+  char clock[16];
+
+  if(c->kind != CAPTURE_MP4 || len_ms <= 0) {
+    return;
+  }
+  if(!strcmp(g_clip_path, c->path)) {
+    g_clip_len_ms = len_ms;
+    return;
+  }
+  snprintf(g_clip_path, sizeof g_clip_path, "%s", c->path);
+  g_clip_len_ms = len_ms;
+  if(c->clip == CLIP_WHOLE && len_ms > CLIP_AUTO_MS && !premium()) {
+    c->clip = CLIP_LAST_30;
+    clock_text(len_ms, clock, sizeof clock);
+    toast(0, L("O v\xc3\xad" "deo tem %s, mais do que o X aceita: v\xc3\xa3o os \xc3\xbaltimos 30 s \xc2\xb7 \xe2\x9c\x95 muda",
+               "The video is %s long, more than X takes: its last 30 s go \xc2\xb7 \xe2\x9c\x95 changes it"), clock);
+  }
+}
+
+
+/**
+ * the composer's media i: the next part of its video, or out when it is no
+ * MP4
+ **/
+static int
+clip_next(int i) {
+  capture_t *c;
+  int len, k;
+
+  if(i < 0 || i >= g_compose.count || g_compose.sending) {
+    return 0;
+  }
+  c = &g_compose.media[i];
+  if(c->kind != CAPTURE_MP4) {
+    remove_media(i);
+    return 1;
+  }
+  len = !strcmp(g_clip_path, c->path) ? g_clip_len_ms : 0;
+  k = c->clip;
+  for(int n=0; n < CLIP_KINDS; n++) {
+    k = (k + 1) % CLIP_KINDS;
+    if(clip_fits(k, len)) {
+      break;
+    }
+  }
+  if(k == c->clip) {
+    toast(0, "%s", L("O v\xc3\xad" "deo \xc3\xa9 curto: vai inteiro.", "The video is short: it goes whole."));
+    return 1;
+  }
+  c->clip = k;
+  return 1;
+}
+
+
 /**
  * the composer's next place for the buttons, d of -1 or 1: the text, its
  * media, adding, posting
  **/
 static void
 compose_move(int d) {
-  int order[8 + UI_MEDIA_MAX + X_POLL_MAX], n = 0, at = 0;
+  int order[10 + UI_MEDIA_MAX + X_POLL_MAX], n = 0, at = 0;
 
   order[n++] = C_FOCUS_TEXT;
   for(int i=0; i < g_compose.count; i++) {
@@ -7432,6 +10606,11 @@ compose_move(int d) {
   if(!g_compose.quote && !g_compose.edit) {
     order[n++] = C_FOCUS_POLL;
   }
+  if(!g_compose.edit) {
+    order[n++] = C_FOCUS_VOICE;
+  }
+  order[n++] = C_FOCUS_DICTATE;
+  order[n++] = C_FOCUS_PHONE;
   if(share_dm_ok()) {
     order[n++] = C_FOCUS_DM;
   }
@@ -7605,6 +10784,11 @@ read_account(int at) {
     free_list(&g_tabs[i]);
     g_tabs[i].feed = i;
     g_tabs[i].serial = ++g_serial;
+  }
+  // the game's tab of Home stays, read again for this account
+  g_tabs[UI_GAME].latest = 1;
+  if(g_game.tab[0] && game_query(g_game.tab, g_tabs[UI_GAME].query, sizeof g_tabs[UI_GAME].query)) {
+    g_game.tab[0] = 0;
   }
   memset(&g_compose, 0, sizeof g_compose);
   memset(&g_dm, 0, sizeof g_dm);
@@ -8050,8 +11234,18 @@ setting_change(int row, int d) {
     s->spoilers = !s->spoilers;
     relayout(NULL);
     break;
+  case S_CATCHUP:
+    s->catchup = !s->catchup;
+    break;
   case S_LIGHT:
     s->light = !s->light;
+    break;
+  case S_RUMBLE:
+    s->rumble = !s->rumble;
+    g_rumble = s->rumble ? UI_RUMBLE_TICK : UI_RUMBLE_NONE; // how it feels
+    break;
+  case S_SPEAKER:
+    s->speaker = !s->speaker;
     break;
   case S_BREAK: {
     static const int pauses[] = SETTINGS_PAUSES;
@@ -8067,11 +11261,20 @@ setting_change(int row, int d) {
   case S_RISING:
     s->rising = !s->rising;
     break;
+  case S_FRIENDS:
+    s->friends = !s->friends;
+    break;
+  case S_QUIET:
+    s->quiet = !s->quiet;
+    break;
   case S_SHARE:
     s->share = !s->share;
     break;
   case S_PLAYING:
     s->playing = !s->playing;
+    break;
+  case S_ONLINE:
+    s->online = !s->online;
     break;
   case S_SESSION:
     return switch_account(d);
@@ -8106,11 +11309,13 @@ open_settings(void) {
 enum {
   M_BOOKMARKS, M_SETTINGS, M_DELETE, M_OPEN, M_PROFILE, M_BOOKMARK, M_QUOTE, M_EDIT, M_PIN, M_UNPIN,
   M_FOLLOW, M_UNFOLLOW, M_MUTE, M_UNMUTE, M_BLOCK, M_UNBLOCK, M_LISTS, M_SCHEDULED, M_UNSCHEDULE, M_THREAD,
-  M_INVITE,
+  M_INVITE, M_TRANSLATE, M_CATCHUP, // Grok: a post translated, what came in Following
+  M_SPACE, M_SPACE_STOP, // the Space a post shares, heard in the background
+  M_LATER, M_LATER_DONE, // a post kept in Read later, or taken out
   M_ACCOUNT, M_ADD_ACCOUNT, M_LOGOUT, // the bar's account menu
 };
 
-#define MENU_ROWS    11
+#define MENU_ROWS    12
 #define MENU_W       470
 #define MENU_ROW     76
 #define MENU_ACC_ROW 100 // a row of the account menu, with its avatar
@@ -8436,6 +11641,7 @@ open_more(void) {
     return 0;
   }
   memset(&g_menu, 0, sizeof g_menu);
+  g_menu.what[g_menu.count++] = M_CATCHUP; // on top: the rows under it stay where they were
   g_menu.what[g_menu.count++] = M_BOOKMARKS;
   g_menu.what[g_menu.count++] = M_LISTS;
   g_menu.what[g_menu.count++] = M_SCHEDULED;
@@ -8583,6 +11789,10 @@ open_post_menu(const x_post_t *p, int right, int top, int bottom) {
   }
   memset(&g_menu, 0, sizeof g_menu);
   g_menu.post = *p;
+  // the Space it shares first: heard while the rest goes on, or stopped
+  if(p->space[0]) {
+    g_menu.what[g_menu.count++] = space_playing(p->space) ? M_SPACE_STOP : M_SPACE;
+  }
   for(int i=0; i < t->count; i++) {
     if(!strcmp(t->posts[i].id, p->id)) {
       if((g_menu.thread=thread_of(t, i, &g_menu.thread_from)) >= 2) {
@@ -8603,11 +11813,20 @@ open_post_menu(const x_post_t *p, int right, int top, int bottom) {
     g_menu.what[g_menu.count++] = M_OPEN;
   }
   g_menu.what[g_menu.count++] = M_QUOTE;
+  if(p->text[0]) {
+    g_menu.what[g_menu.count++] = M_TRANSLATE;
+  }
+  if(p->kind == X_KIND_POST) {
+    g_menu.what[g_menu.count++] = is_later(p->id) ? M_LATER_DONE : M_LATER;
+  }
   if(p->user_id[0] && !is_mine(p)) {
     g_menu.what[g_menu.count++] = p->following ? M_UNFOLLOW : M_FOLLOW;
     g_menu.what[g_menu.count++] = M_PROFILE;
     g_menu.what[g_menu.count++] = M_MUTE;
     g_menu.what[g_menu.count++] = M_BLOCK;
+    if(g_game.name[0]) {
+      g_menu.what[g_menu.count++] = M_INVITE; // to the game that runs: a post looking for a group
+    }
   }
   g_menu.what[g_menu.count++] = M_BOOKMARK;
   g_menu.x = right - MENU_W;
@@ -8730,6 +11949,31 @@ menu_row(int what, char *label, size_t size, int *icon, uint32_t *color) {
     *icon = ICON_GAME;
     snprintf(label, size, "%s", L("Convidar para jogar", "Invite to play"));
     break;
+  case M_TRANSLATE:
+    *icon = ICON_GLOBE;
+    snprintf(label, size, "%s", L("Traduzir com o Grok", "Translate with Grok"));
+    break;
+  case M_CATCHUP:
+    *icon = ICON_SPARK;
+    snprintf(label, size, "%s", L("O que perdeste", "What you missed"));
+    break;
+  case M_SPACE:
+    *icon = ICON_SOUND;
+    *color = ACCENT;
+    snprintf(label, size, "%s", L("Ouvir o Space", "Listen to the Space"));
+    break;
+  case M_SPACE_STOP:
+    *icon = ICON_MUTE;
+    snprintf(label, size, "%s", L("Parar o Space", "Stop the Space"));
+    break;
+  case M_LATER:
+    *icon = ICON_CLOCK;
+    snprintf(label, size, "%s", L("Ler depois", "Read later"));
+    break;
+  case M_LATER_DONE:
+    *icon = ICON_CLOCK;
+    snprintf(label, size, "%s", L("Tirar de Ler depois", "Remove from Read later"));
+    break;
   case M_ADD_ACCOUNT: // words only, as x.com's account menu
     *icon = -1;
     snprintf(label, size, "%s", L("Adicionar uma conta existente", "Add an existing account"));
@@ -8810,6 +12054,35 @@ menu_choose(int row) {
   case M_INVITE:
     g_sheet = SHEET_NONE;
     return invite(g_menu.post.user_id, g_menu.post.user, g_menu.post.playing);
+  case M_TRANSLATE:
+    return translate_post(&g_menu.post);
+  case M_CATCHUP:
+    return catchup_open();
+  case M_SPACE:
+    if(!act_on(UI_ACT_SPACE, g_menu.post.space, g_menu.post.user) || g_act.kind != UI_ACT_SPACE) {
+      return 1; // something else is being sent: its toast said so
+    }
+    toast(0, L("A sintonizar o Space de @%s\xe2\x80\xa6", "Tuning in to @%s's Space\xe2\x80\xa6"), g_menu.post.user);
+    return 1;
+  case M_SPACE_STOP:
+    toast(0, L("Paraste o Space de @%s.", "You stopped @%s's Space."), g_space.host);
+    space_off();
+    return 1;
+  case M_LATER:
+    if(later_add(&g_menu.post) < 0) {
+      toast(1, L("Ler depois est\xc3\xa1 cheio (%d posts): tira os que j\xc3\xa1 leste.",
+                 "Read later is full (%d posts): take out the ones you read."), LATER_MAX);
+    } else {
+      toast(0, "%s", L("Guardado em Ler depois, no Hist\xc3\xb3rico.", "Kept in Read later, in History."));
+    }
+    return 1;
+  case M_LATER_DONE:
+    later_remove(g_menu.post.id);
+    if(g_section == UI_HISTORY && g_tabs[UI_HISTORY].latest && !g_depth) {
+      fill_history(); // gone from the list shown
+    }
+    toast(0, "%s", L("Tirado de Ler depois.", "Removed from Read later."));
+    return 1;
   case M_ACCOUNT:
     return use_account(g_menu.arg[row]);
   case M_ADD_ACCOUNT:
@@ -9089,6 +12362,15 @@ sheet_keys(unsigned keys) {
       if(g_compose.focus == C_FOCUS_DM) {
         return pick_chat();
       }
+      if(g_compose.focus == C_FOCUS_VOICE) {
+        return voice_open();
+      }
+      if(g_compose.focus == C_FOCUS_DICTATE) {
+        return dictate_open();
+      }
+      if(g_compose.focus == C_FOCUS_PHONE) {
+        return phone_open_compose();
+      }
       if(g_compose.focus >= C_FOCUS_CHOICE && g_compose.focus < C_FOCUS_CHOICE_ADD) {
         return ask_choice(g_compose.focus - C_FOCUS_CHOICE);
       }
@@ -9107,8 +12389,7 @@ sheet_keys(unsigned keys) {
       if(g_compose.focus == C_FOCUS_SEND) {
         return publish();
       }
-      remove_media(g_compose.focus - C_FOCUS_MEDIA);
-      return 1;
+      return clip_next(g_compose.focus - C_FOCUS_MEDIA); // a video's next part; out, for a picture
     }
     if((keys & (UI_LEFT | UI_RIGHT)) && g_compose.focus == C_FOCUS_LENGTH) {
       return poll_length(keys & UI_RIGHT ? 1 : -1);
@@ -9205,6 +12486,17 @@ sheet_keys(unsigned keys) {
     }
     return 0;
 
+  case SHEET_TROPHIES:
+    return trophies_keys(keys);
+
+  case SHEET_VOICE:
+    return voice_keys(keys);
+
+  case SHEET_PHONE:
+    return phone_keys(keys);
+  case SHEET_GROK:
+    return gcard_keys(keys);
+
   case SHEET_LINK:
     if((keys & UI_CIRCLE) || ((keys & UI_CROSS) && g_linking.st.state == UI_LINK_DONE)) {
       return close_link();
@@ -9276,6 +12568,9 @@ sheet_click(const zone_t *z) {
     if(g_sheet == SHEET_LOGIN) {
       return 0; // beside the window: it stays, with what was typed in it
     }
+    if(g_sheet == SHEET_VOICE) {
+      return 0; // a voice note stays: ○ or its cross let it go
+    }
     g_sheet = SHEET_NONE;
     return 1;
   case Z_R_CLOSE:
@@ -9302,6 +12597,11 @@ sheet_click(const zone_t *z) {
     g_compose.focus = C_FOCUS_TEXT;
     return ask_text();
   case Z_C_MEDIA:
+    // on a video it had already: its next part, as ✕ goes
+    if(g_compose.focus == C_FOCUS_MEDIA + z->sub && z->sub < g_compose.count &&
+       g_compose.media[z->sub].kind == CAPTURE_MP4) {
+      return clip_next(z->sub);
+    }
     g_compose.focus = C_FOCUS_MEDIA + z->sub;
     return 1;
   case Z_C_REMOVE:
@@ -9323,6 +12623,27 @@ sheet_click(const zone_t *z) {
   case Z_C_DM:
     g_compose.focus = C_FOCUS_DM;
     return pick_chat();
+  case Z_C_VOICE:
+    g_compose.focus = C_FOCUS_VOICE;
+    return voice_open();
+  case Z_C_DICTATE:
+    g_compose.focus = C_FOCUS_DICTATE;
+    return dictate_open();
+  case Z_C_PHONE:
+    g_compose.focus = C_FOCUS_PHONE;
+    return phone_open_compose();
+  case Z_PHONE_USE:
+    return phone_use();
+  case Z_PHONE_CLOSE:
+    return phone_close();
+  case Z_GCARD_CLOSE:
+    return gcard_close();
+  case Z_GCARD_RETRY:
+    return gcard_retry();
+  case Z_VOICE_STOP:
+    return voice_stop();
+  case Z_VOICE_CLOSE:
+    return voice_cancel();
   case Z_C_CHOICE:
     return ask_choice(z->arg);
   case Z_C_CHOICE_ADD:
@@ -9358,8 +12679,12 @@ sheet_click(const zone_t *z) {
     g_sched.sel = z->arg;
     return ask_unschedule(z->arg);
   case Z_SCHED_CLOSE:
+  case Z_TR_CLOSE:
     g_sheet = SHEET_NONE;
     return 1;
+  case Z_TR_ROW:
+    g_tr.sel = z->arg;
+    return trophy_tip(z->arg);
   case Z_V_PLAY:
     return url ? video_keys(url, UI_CROSS) : 0;
   case Z_V_SOUND:
@@ -9467,6 +12792,12 @@ ui_dm_text(const char *text) {
   }
   g_act.kind = UI_ACT_DM; // to the same conversation, next
   g_act.taken = 0;
+  // its bubble at once, at the end of the conversation, while it goes
+  g_dm.state = DM_SENDING;
+  g_dm.at = g_now;
+  snprintf(g_dm.sent_conv, sizeof g_dm.sent_conv, "%s", g_act.id);
+  snprintf(g_dm.sent, sizeof g_dm.sent, "%s", g_dm.text);
+  dm_pending_show();
 }
 
 
@@ -9502,13 +12833,25 @@ ui_grok_text(const char *text) {
   g_grok.error = 0;
   g_grok.asking = 1;
   g_under_stale = 1;
+  g_grok_what = UI_GROK_HINT;
   g_act.kind = UI_ACT_GROK; // sent next
   g_act.taken = 0;
 }
 
 
 int
-ui_grok_get(char *question, size_t qsize, char *game, size_t gsize, int *fresh) {
+ui_grok_get(char *question, size_t qsize, char *game, size_t gsize, int *fresh, int *what,
+            char *author, size_t asize) {
+  *what = g_grok_what;
+  if(g_grok_what != UI_GROK_HINT) {
+    // the card's: the post's words or the posts' lines, in a conversation of its own
+    snprintf(question, qsize, "%s", g_gcard.input);
+    snprintf(author, asize, "%s", g_grok_what == UI_GROK_TRANSLATE ? g_gcard.user : "");
+    game[0] = 0;
+    *fresh = 1;
+    return (int)strlen(question);
+  }
+  author[0] = 0;
   snprintf(question, qsize, "%s", g_grok.question);
   snprintf(game, gsize, "%s", g_grok.game);
   *fresh = g_grok.fresh;
@@ -9519,7 +12862,34 @@ ui_grok_get(char *question, size_t qsize, char *game, size_t gsize, int *fresh) 
 
 void
 ui_grok_answer(const char *answer) {
-  snprintf(g_grok.answer, sizeof g_grok.answer, "%s", answer);
+  if(g_grok_what != UI_GROK_HINT) {
+    snprintf(g_gcard.answer, sizeof g_gcard.answer, "%s", answer);
+  } else {
+    snprintf(g_grok.answer, sizeof g_grok.answer, "%s", answer);
+  }
+  g_under_stale = 1;
+}
+
+
+int
+ui_mic_wanted(int *retry) {
+  // away from Calls the test ends, and does not start again by itself
+  if(view()->feed != UI_CALLS || g_voice.state != VOICE_OFF) {
+    g_mic.want = g_mic.retry = 0;
+  }
+  *retry = g_mic.retry;
+  g_mic.retry = 0;
+  return g_mic.want;
+}
+
+
+void
+ui_mic(int state, int code, int silent, float level, float peak) {
+  g_mic.state = state;
+  g_mic.code = code;
+  g_mic.silent = silent;
+  g_mic.level = level;
+  g_mic.peak = peak;
   g_under_stale = 1;
 }
 
@@ -9620,6 +12990,77 @@ ui_compose_text(const char *text) {
 }
 
 
+/**
+ * whether Chat's list of conversations shows (not a conversation of it)
+ **/
+static int
+chat_list_shows(void) {
+  return g_section == UI_CHAT && view()->feed == UI_CHAT;
+}
+
+
+void
+ui_badges(int notices, int chats, int news) {
+  static int had_notices, had_chats;
+  tab_t *t = view();
+  const int more = chats > had_chats;
+
+  // more than the last time: two knocks on the controller
+  if(notices > had_notices || more) {
+    g_rumble = UI_RUMBLE_NEWS;
+  }
+  had_notices = notices;
+  had_chats = chats;
+  // new ones while their list shows: it is read again, as with □
+  if(g_section == UI_NOTIFICATIONS && notices > 0 && !g_depth && !t->loading) {
+    t->wanted = 1;
+  }
+  // the payload stops counting the list's once it is looked at, so chats
+  // comes once for each new message
+  if(chat_list_shows() && chats > 0 && !t->loading) {
+    t->wanted = 1;
+  }
+  // a conversation open: its own new messages come in as they do by
+  // themselves, and others' (the count goes up) only change the list
+  // under it, for when the user goes back to it
+  if(t->feed == UI_DM && news && !t->loading) {
+    t->wanted = 1;
+    t->quiet = 1;
+  }
+  if(g_section == UI_CHAT && t->feed == UI_DM && (news || more) && !g_tabs[UI_CHAT].loading) {
+    g_tabs[UI_CHAT].wanted = 1;
+  }
+  g_counts.notices = g_section == UI_NOTIFICATIONS ? 0 : notices;
+  g_counts.chats = chat_list_shows() ? 0 : chats;
+}
+
+
+int
+ui_badges_seen(void) {
+  return (g_section == UI_NOTIFICATIONS ? 1 : 0) | (chat_list_shows() ? 2 : 0);
+}
+
+
+void
+ui_badges_open(char *a, char *b, size_t size) {
+  const tab_t *t = view();
+  const int open = t->feed == UI_DM;
+
+  snprintf(a, size, "%s", open ? t->arg : "");
+  snprintf(b, size, "%s", open ? t->xchat_id : "");
+}
+
+
+void
+ui_open_told(int what) {
+  if(g_sheet != SHEET_NONE || g_viewer.open) {
+    return; // what the user was doing stays
+  }
+  show_section(what == 1 ? UI_NOTIFICATIONS : UI_CHAT);
+  view()->wanted = 1; // with what the toast told of
+}
+
+
 void
 ui_game(const char *id, const char *name) {
   tab_t *t = &g_tabs[UI_GAME];
@@ -9696,11 +13137,11 @@ compose_tag_game(void) {
  * is there or does not fit
  **/
 static void
-compose_tag_quietly(void) {
+compose_tag_of(const char *name) {
   char tag[GAME_NAME + 2];
   size_t len = strlen(g_compose.text);
 
-  if(g_game.name[0] && !game_hashtag(g_game.name, tag, sizeof tag) && !strstr(g_compose.text, tag) &&
+  if(name && name[0] && !game_hashtag(name, tag, sizeof tag) && !strstr(g_compose.text, tag) &&
      len + 1 + strlen(tag) < sizeof g_compose.text) {
     snprintf(g_compose.text + len, sizeof g_compose.text - len, "%s%s",
              len && g_compose.text[len - 1] != ' ' && g_compose.text[len - 1] != '\n' ? " " : "", tag);
@@ -9708,16 +13149,1273 @@ compose_tag_quietly(void) {
 }
 
 
+static void
+compose_tag_quietly(void) {
+  compose_tag_of(g_game.name);
+}
+
+
+/**
+ * line at the top of the composer's text, on a line of its own, unless it
+ * is there already or does not fit
+ **/
+static void
+compose_lead(const char *line) {
+  size_t len = strlen(g_compose.text), n = strlen(line);
+
+  if(!n || strstr(g_compose.text, line) || len + 1 + n >= sizeof g_compose.text) {
+    return;
+  }
+  memmove(g_compose.text + n + (len ? 1 : 0), g_compose.text, len + 1);
+  memcpy(g_compose.text, line, n);
+  if(len) {
+    g_compose.text[n] = '\n';
+  }
+}
+
+
+/**
+ * what the composer has (its text and media), as a number: the draft XPS5
+ * wrote itself (a card's post, a group's) is known by it while the user
+ * did not change it
+ **/
+static uint32_t g_auto_draft;
+
+static uint32_t
+draft_sum(void) {
+  uint32_t h = 2166136261u;
+
+  for(const char *s=g_compose.text; *s; s++) {
+    h = (h ^ (unsigned char)*s) * 16777619u;
+  }
+  for(int i=0; i < g_compose.count; i++) {
+    for(const char *s=g_compose.media[i].path; *s; s++) {
+      h = (h ^ (unsigned char)*s) * 16777619u;
+    }
+    h = (h ^ 0xffu) * 16777619u;
+  }
+  return h ? h : 1;
+}
+
+
+/**
+ * before XPS5 writes a post of its own: the one it wrote before goes when
+ * the user left it as it was, and one of theirs stays, with this over it
+ **/
+static void
+draft_fresh(void) {
+  if(g_compose.reply || g_compose.quote || g_compose.edit || (g_auto_draft && draft_sum() == g_auto_draft)) {
+    memset(&g_compose, 0, sizeof g_compose);
+  }
+}
+
+
+/*
+ * The cards for a post (cards.h), drawn on the frame after their pictures
+ * came (or CARD_WAIT_US without them), and the game's corner: its
+ * trophies, Grok's tip for one, and the posts looking for a group.
+ */
+
+static void
+card_icon_url(const char *id, char *url, size_t size) {
+  url[0] = 0;
+  if(game_id_ok(id)) {
+    snprintf(url, size, "file:///user/appmeta/%s/icon0.png", id);
+  }
+}
+
+
+/**
+ * a card of kind to be made, unless one is being made; returns 1 when it is
+ **/
+static int
+card_start(int kind) {
+  if(g_card.kind) {
+    toast(1, "%s", L("J\xc3\xa1 est\xc3\xa1 a ser feito um cart\xc3\xa3o. Tenta daqui a pouco.",
+                     "A card is being made already. Try again in a moment."));
+    return 0;
+  }
+  memset(&g_card, 0, sizeof g_card);
+  g_card.kind = kind;
+  g_card.since_us = g_ui_us;
+  return 1;
+}
+
+
+/**
+ * the card c, first in the composer of a post of the user's own, with text
+ * on top and the game's hashtag; returns 0 while a post or an action goes
+ **/
+static int
+card_offer(const capture_t *c, const char *text, const char *game) {
+  int at = -1, has_video = 0;
+
+  if(g_compose.sending || g_act.kind) {
+    return 0;
+  }
+  draft_fresh();
+  for(int i=0; i < g_compose.count; i++) {
+    has_video |= g_compose.media[i].kind == CAPTURE_MP4 || g_compose.media[i].kind == CAPTURE_WEBM;
+    at = !strcmp(g_compose.media[i].path, c->path) ? i : at;
+  }
+  if(at < 0) {
+    // X takes four pictures, or one video; the card first, shown biggest
+    if(has_video || g_compose.count >= UI_MEDIA_MAX) {
+      g_compose.count = 0;
+    }
+    memmove(&g_compose.media[1], &g_compose.media[0], (size_t)g_compose.count * sizeof g_compose.media[0]);
+    g_compose.media[0] = *c;
+    g_compose.count++;
+  }
+  compose_lead(text);
+  compose_tag_of(game);
+  g_auto_draft = draft_sum();
+  if(g_sheet != SHEET_NONE && g_sheet != SHEET_COMPOSE) {
+    toast(0, "%s", L("O teu cart\xc3\xa3o est\xc3\xa1 no post \xc2\xb7 \xe2\x98\xb0 abre-o",
+                     "Your card is in your post \xc2\xb7 \xe2\x98\xb0 opens it"));
+    return 1;
+  }
+  if(compose_open(NULL, CM_POST)) {
+    g_compose.focus = C_FOCUS_TEXT;
+    toast(0, "%s", L("Pronto a publicar \xc2\xb7 R2 publica \xc2\xb7 \xe2\x9c\x95 escreve",
+                     "Ready to post \xc2\xb7 R2 posts it \xc2\xb7 \xe2\x9c\x95 to write"));
+  }
+  return 1;
+}
+
+
+/**
+ * after the frame: a card offered once a post went, and the card being
+ * made drawn once its pictures came
+ **/
+static void
+card_step(void) {
+  text_surface_t dst = card_surface(NULL);
+  card_look_t look;
+  int ready = 1, size, px;
+
+  if(g_card_wait.ready && card_offer(&g_card_wait.c, g_card_wait.text, g_card_wait.game)) {
+    memset(&g_card_wait, 0, sizeof g_card_wait);
+  }
+  if(!g_card.kind || g_card.pixels || g_card.taken) {
+    return;
+  }
+  memset(&look, 0, sizeof look);
+  memcpy(look.fonts, g_card_fonts, sizeof look.fonts);
+  look.lang = g_lang;
+  for(int i=0; i < CARD_GAMES; i++) {
+    // a voice note's: who speaks, then the game's icon
+    size = g_card.kind == CARD_SESSION ? CARD_ICON : g_card.kind == CARD_WEEK ? CARD_ROW_ICON :
+           g_card.kind == CARD_VOICE ? (i ? CARD_VOICE_GAME : CARD_VOICE_AVATAR) : CARD_BIG_ICON;
+    px = text_size(&dst, (float)size);
+    if(g_card.icons[i][0] && !(look.icons[i]=images_get(g_card.icons[i], px, px))) {
+      ready = 0;
+    }
+  }
+  if(g_card.photo[0] && !(look.photo=images_get(g_card.photo, card_pixels_w(), card_pixels_h()))) {
+    ready = 0;
+  }
+  if(!ready && g_ui_us - g_card.since_us < CARD_WAIT_US) {
+    return;
+  }
+  if(!(dst.pixels=mem_alloc((size_t)card_pixels_w() * (size_t)card_pixels_h() * sizeof *dst.pixels))) {
+    memset(&g_card, 0, sizeof g_card);
+    toast(1, "%s", L("O cart\xc3\xa3o n\xc3\xa3o se fez: falta mem\xc3\xb3ria.", "The card was not made: no memory."));
+    return;
+  }
+  if(g_card.kind == CARD_SESSION) {
+    card_session(&dst, &look, &g_card.session);
+  } else if(g_card.kind == CARD_WEEK) {
+    card_week(&dst, &look, &g_card.week);
+  } else if(g_card.kind == CARD_VOICE) {
+    card_voice(&dst, &look, g_card.name, g_card.handle, g_card.game, g_card.seconds, g_card.bars, g_card.bar_count);
+  } else {
+    card_trophy(&dst, &look, g_card.grade, g_card.game, g_card.trophy, g_card.earned, g_card.all);
+  }
+  g_card.pixels = dst.pixels;
+}
+
+
+int
+ui_card_take(uint32_t **pixels, int *w, int *h) {
+  if(!g_card.pixels) {
+    return 0;
+  }
+  *pixels = g_card.pixels;
+  *w = card_pixels_w();
+  *h = card_pixels_h();
+  g_card.pixels = NULL;
+  g_card.taken = 1;
+  return g_card.kind == CARD_VOICE ? UI_CARD_VOICE : UI_CARD_PICTURE;
+}
+
+
+void
+ui_card_done(const capture_t *c) {
+  char text[sizeof g_card.text], game[GAME_NAME];
+  int trophy;
+
+  if(g_card.kind == CARD_VOICE) {
+    memset(&g_card, 0, sizeof g_card);
+    voice_attach(c);
+    return;
+  }
+  snprintf(text, sizeof text, "%s", g_card.text);
+  snprintf(game, sizeof game, "%s", g_card.game);
+  trophy = g_card.kind == CARD_TROPHY;
+  memset(&g_card, 0, sizeof g_card);
+  if(!c || !c->path[0]) {
+    toast(1, "%s", L("O cart\xc3\xa3o n\xc3\xa3o se fez.", "The card could not be made."));
+    return;
+  }
+  for(int i=0; trophy && i < g_compose.count; i++) {
+    if(is_video(&g_compose.media[i])) {
+      return; // the PS5's clip of the trophy came while it was drawn: it stays
+    }
+  }
+  if(!card_offer(c, text, game)) {
+    // offered once what goes went
+    g_card_wait.ready = 1;
+    g_card_wait.c = *c;
+    snprintf(g_card_wait.text, sizeof g_card_wait.text, "%s", text);
+    snprintf(g_card_wait.game, sizeof g_card_wait.game, "%s", game);
+  }
+}
+
+
+/*
+ * A voice note: its sheet tapes the controller's microphone (main.c, mic.h)
+ * for VOICE_MAX_SECONDS at most; once ✕ stops it, a card of who speaks and
+ * how loud is the picture of an MP4 with the sound (src/voice.h), the post's
+ * one video.
+ */
+
+/**
+ * the composer's microphone button: the voice note's sheet, taping at once
+ **/
+static int
+voice_open(void) {
+  if(g_compose.sending || g_act.kind || g_compose.edit) {
+    return 0;
+  }
+  if(g_compose.poll) {
+    toast(1, "%s", L("Uma sondagem n\xc3\xa3o leva notas de voz: tira-a primeiro.",
+                     "A poll takes no voice note: remove it first."));
+    return 1;
+  }
+  if(g_card.kind) {
+    toast(1, "%s", L("J\xc3\xa1 est\xc3\xa1 a ser feito um cart\xc3\xa3o. Tenta daqui a pouco.",
+                     "A card is being made already. Try again in a moment."));
+    return 1;
+  }
+  memset(&g_voice, 0, sizeof g_voice);
+  g_voice.state = VOICE_TAPING;
+  g_voice.mic = UI_MIC_OPENING;
+  g_voice.trail_us = g_ui_us;
+  g_sheet = SHEET_VOICE;
+  return 1;
+}
+
+
+/**
+ * the composer's dictation button: the microphone's sheet, taping at once;
+ * once ✕ stops it, main.c has the words made on the console (ui_dictated)
+ * and they go into the post's text
+ **/
+static int
+dictate_open(void) {
+  if(g_compose.sending || g_act.kind) {
+    return 0;
+  }
+  memset(&g_voice, 0, sizeof g_voice);
+  g_voice.state = VOICE_TAPING;
+  g_voice.mic = UI_MIC_OPENING;
+  g_voice.trail_us = g_ui_us;
+  g_voice.dictate = 1;
+  g_sheet = SHEET_VOICE;
+  return 1;
+}
+
+
+/**
+ * ✕: the note made for the post (or the words of a dictation), once a
+ * second of it was taped; or the microphone asked again after it failed
+ **/
+static int
+voice_stop(void) {
+  if(g_voice.state != VOICE_TAPING) {
+    return 0;
+  }
+  if(g_voice.mic == UI_MIC_FAILED) {
+    g_voice.retry = 1;
+    g_voice.mic = UI_MIC_OPENING;
+    return 1;
+  }
+  if(g_voice.samples < (size_t)VOICE_RATE * VOICE_MIN_SECONDS) {
+    toast(1, "%s", L("Fala pelo menos um segundo.", "Speak for a second at least."));
+    return 1;
+  }
+  g_voice.state = VOICE_MAKING;
+  g_voice.take = 1;
+  return 1;
+}
+
+
+/**
+ * R2 (or the microphone of the bar) in a conversation: the voice note's
+ * sheet, taping at once, for a message to it
+ **/
+static int
+voice_open_dm(const tab_t *t) {
+  if(t->feed != UI_DM || !t->arg[0]) {
+    return 0;
+  }
+  if(g_act.kind || g_compose.sending) {
+    toast(1, "%s", L("Espera que acabe o que est\xc3\xa1 a ser enviado", "Wait for what is being sent"));
+    return 1;
+  }
+  if(g_card.kind) {
+    toast(1, "%s", L("J\xc3\xa1 est\xc3\xa1 a ser feito um cart\xc3\xa3o. Tenta daqui a pouco.",
+                     "A card is being made already. Try again in a moment."));
+    return 1;
+  }
+  memset(&g_voice, 0, sizeof g_voice);
+  g_voice.state = VOICE_TAPING;
+  g_voice.mic = UI_MIC_OPENING;
+  g_voice.trail_us = g_ui_us;
+  snprintf(g_voice.dm, sizeof g_voice.dm, "%s", t->arg);
+  if(t->user.user[0]) {
+    snprintf(g_voice.dm_name, sizeof g_voice.dm_name, "@%s", t->user.user);
+  } else {
+    snprintf(g_voice.dm_name, sizeof g_voice.dm_name, "%s", t->user.name[0] ? t->user.name : L("Grupo", "Group"));
+  }
+  g_sheet = SHEET_VOICE;
+  return 1;
+}
+
+
+/**
+ * ○: the tape let go of, and a note being made not put in the post (nor
+ * sent to the conversation)
+ **/
+static int
+voice_cancel(void) {
+  const int dm = g_voice.dm[0] != 0;
+
+  memset(&g_voice, 0, sizeof g_voice);
+  g_sheet = dm ? SHEET_NONE : SHEET_COMPOSE;
+  return 1;
+}
+
+
+static int
+voice_keys(unsigned keys) {
+  if(keys & UI_CIRCLE) {
+    return voice_cancel();
+  }
+  if(keys & UI_CROSS) {
+    return voice_stop();
+  }
+  return 0;
+}
+
+
+/**
+ * the note made (c, or NULL when it could not be): the post's one video,
+ * in place of its photos and videos
+ **/
+static void
+voice_attach(const capture_t *c) {
+  const int was = g_voice.state;
+  char dm[sizeof g_voice.dm], name[sizeof g_voice.dm_name];
+
+  snprintf(dm, sizeof dm, "%s", g_voice.dm);
+  snprintf(name, sizeof name, "%s", g_voice.dm_name);
+  memset(&g_voice, 0, sizeof g_voice);
+  if(was != VOICE_MAKING) {
+    return; // let go of meanwhile
+  }
+  if(g_sheet == SHEET_VOICE) {
+    g_sheet = dm[0] ? SHEET_NONE : SHEET_COMPOSE;
+  }
+  if(!c || !c->path[0]) {
+    toast(1, "%s", L("A nota de voz n\xc3\xa3o se fez.", "The voice note could not be made."));
+    return;
+  }
+  if(dm[0]) {
+    // a message of its own to the conversation, the note alone
+    if(g_act.kind) {
+      toast(1, "%s", L("A nota de voz n\xc3\xa3o foi enviada: estava outra coisa a ser enviada.",
+                       "The voice note was not sent: something else was being sent."));
+      return;
+    }
+    g_voice_dm = *c;
+    memset(&g_act, 0, sizeof g_act);
+    g_act.kind = UI_ACT_VOICE_DM;
+    snprintf(g_act.id, sizeof g_act.id, "%s", dm);
+    copy_whole(g_act.user, sizeof g_act.user, name);
+    toast(0, L("A enviar a nota de voz para %s\xe2\x80\xa6", "Sending the voice note to %s\xe2\x80\xa6"), g_act.user);
+    return;
+  }
+  g_compose.media[0] = *c;
+  g_compose.count = 1;
+  g_compose.focus = C_FOCUS_SEND;
+  toast(0, "%s", L("A nota de voz est\xc3\xa1 no post \xc2\xb7 R2 publica",
+                   "The voice note is in your post \xc2\xb7 R2 posts it"));
+}
+
+
+int
+ui_voice_wanted(int *retry) {
+  *retry = g_voice.retry;
+  g_voice.retry = 0;
+  return g_voice.state == VOICE_TAPING;
+}
+
+
+void
+ui_voice_heard(int state, int code, int silent, float level, size_t samples) {
+  if(g_voice.state != VOICE_TAPING || (g_voice.retry && state == UI_MIC_FAILED)) {
+    return;
+  }
+  g_voice.mic = state;
+  g_voice.code = code;
+  g_voice.silent = silent;
+  g_voice.level = level < 0 ? 0 : level > 1 ? 1 : level;
+  g_voice.samples = samples;
+  if(g_ui_us - g_voice.trail_us >= VOICE_TRAIL_US) {
+    g_voice.trail[g_voice.trail_at++ % VOICE_TRAIL] = state == UI_MIC_ON && !silent ? g_voice.level : 0;
+    g_voice.trail_us = g_ui_us;
+  }
+  // the tape is full: made as it is
+  if(g_voice.dictate) {
+    if(samples >= (size_t)VOICE_RATE * DICT_MAX_S && voice_stop()) {
+      toast(0, L("O ditado parou aos %d s, o m\xc3\xa1ximo dele.", "Dictation stopped at %d s, its longest."), DICT_MAX_S);
+    }
+  } else if(samples >= (size_t)VOICE_RATE * VOICE_MAX_SECONDS && voice_stop()) {
+    toast(0, "%s", L("A nota parou aos 2:20, o m\xc3\xa1ximo dela.", "The note stopped at 2:20, its longest."));
+  }
+}
+
+
+int
+ui_voice_dictating(void) {
+  return g_voice.dictate && g_voice.state != VOICE_OFF;
+}
+
+
+/**
+ * words added to the end of the post's text, after a space; cut at a
+ * character's edge when they do not all fit. 1 when they were cut
+ **/
+static int
+compose_append(const char *words) {
+  const size_t room = sizeof g_compose.text - 1;
+  size_t n = strlen(g_compose.text), len = strlen(words);
+  int cut = 0;
+
+  if(n && n < room && g_compose.text[n - 1] != ' ' && g_compose.text[n - 1] != '\n') {
+    g_compose.text[n++] = ' ';
+  }
+  if(len > room - n) {
+    len = room - n;
+    while(len && ((unsigned char)words[len] & 0xc0) == 0x80) {
+      len--;
+    }
+    cut = 1;
+  }
+  memcpy(g_compose.text + n, words, len);
+  g_compose.text[n + len] = 0;
+  return cut;
+}
+
+
+void
+ui_dictated(int status, const char *text) {
+  if(g_voice.state != VOICE_MAKING || !g_voice.dictate) {
+    return; // let go of meanwhile
+  }
+  memset(&g_voice, 0, sizeof g_voice);
+  if(g_sheet == SHEET_VOICE) {
+    g_sheet = SHEET_COMPOSE;
+  }
+  if(status == DICT_OK && text && text[0]) {
+    if(compose_append(text)) {
+      toast(1, "%s", L("O post ficou cheio: o fim do que disseste n\xc3\xa3o coube.",
+                       "The post is full: the end of what you said did not fit."));
+    }
+  } else if(status == DICT_OK || status == DICT_NOTHING) {
+    toast(1, "%s", L("N\xc3\xa3o se ouviu nada. Fala mais perto do comando e tenta outra vez.",
+                     "Nothing was heard. Speak closer to the controller and try again."));
+  } else if(status == DICT_NO_MODEL) {
+    toast(1, "%s", L("Falta o modelo do ditado: instala o XPS5 outra vez.",
+                     "The dictation model is missing: install XPS5 again."));
+  } else {
+    toast(1, "%s", L("O ditado n\xc3\xa3o funcionou. Tenta outra vez.", "Dictation did not work. Try again."));
+  }
+}
+
+
+int
+ui_voice_dm_get(capture_t *c) {
+  if(!g_voice_dm.path[0]) {
+    return 0;
+  }
+  *c = g_voice_dm;
+  return 1;
+}
+
+
+void
+ui_party(const char *conversation, const x_post_t *people, int count) {
+  const char *me = g_settings.ids[g_settings.account - 1];
+  int n = 0;
+
+  memset(&g_party, 0, sizeof g_party);
+  if(!conversation || !people) {
+    return;
+  }
+  snprintf(g_party.conv, sizeof g_party.conv, "%s", conversation);
+  // those playing, then those on XPS5, then the rest, each in X's order
+  for(int pass=0; pass < 3; pass++) {
+    for(int i=0; i < count && i < UI_PARTY_MAX; i++) {
+      const x_post_t *p = &people[i];
+      if((p->playing[0] ? 0 : p->online ? 1 : 2) != pass || !p->user_id[0] || (me[0] && !strcmp(p->user_id, me))) {
+        continue;
+      }
+      g_party.items[n++] = *p;
+    }
+  }
+  g_party.count = n;
+}
+
+
+int
+ui_voice_take(void) {
+  const int take = g_voice.take;
+
+  g_voice.take = 0;
+  return take;
+}
+
+
+int
+ui_voice_card(const float *bars, int count, int seconds) {
+  const x_user_t *me = g_tabs[UI_ME].has_user ? &g_tabs[UI_ME].user : NULL;
+  char buf[IMAGES_URL_MAX];
+
+  if(g_voice.state != VOICE_MAKING) {
+    return 0;
+  }
+  if(!bars || count <= 0) {
+    voice_attach(NULL);
+    return 0;
+  }
+  if(!card_start(CARD_VOICE)) {
+    const int dm = g_voice.dm[0] != 0;
+    memset(&g_voice, 0, sizeof g_voice);
+    g_sheet = g_sheet == SHEET_VOICE ? (dm ? SHEET_NONE : SHEET_COMPOSE) : g_sheet;
+    return 0;
+  }
+  g_card.bar_count = count < CARD_VOICE_BARS ? count : CARD_VOICE_BARS;
+  memcpy(g_card.bars, bars, (size_t)g_card.bar_count * sizeof *bars);
+  g_card.seconds = seconds;
+  if(me) {
+    snprintf(g_card.name, sizeof g_card.name, "%s", me->name);
+    snprintf(g_card.handle, sizeof g_card.handle, "%s", me->user);
+    if(me->avatar[0]) {
+      snprintf(g_card.icons[0], sizeof g_card.icons[0], "%s", avatar_url(me->avatar, buf, sizeof buf));
+    }
+  }
+  snprintf(g_card.game, sizeof g_card.game, "%s", g_game.name);
+  card_icon_url(g_game.id, g_card.icons[1], sizeof g_card.icons[1]);
+  return 1;
+}
+
+
+void
+ui_session(const session_t *s) {
+  const char *name;
+  char took[32];
+  int all, kind;
+
+  if(!s || !s->id[0] || !card_start(CARD_SESSION)) {
+    return;
+  }
+  g_card.session = *s;
+  name = s->name[0] ? s->name : s->id;
+  snprintf(g_card.game, sizeof g_card.game, "%s", s->name);
+  card_icon_url(s->id, g_card.icons[0], sizeof g_card.icons[0]);
+  for(int i=s->pic_count - 1; i >= 0 && !g_card.photo[0]; i--) {
+    // the newest screenshot, under the words
+    const char *nul = memchr(s->pics[i], 0, sizeof s->pics[i]);
+    const size_t n = nul ? (size_t)(nul - s->pics[i]) : sizeof g_card.photo; // none: too long
+    kind = captures_kind(s->pics[i]);
+    if((kind == CAPTURE_JPEG || kind == CAPTURE_PNG || kind == CAPTURE_JXR) && 7 + n < sizeof g_card.photo) {
+      memcpy(g_card.photo, "file://", 7);
+      memcpy(g_card.photo + 7, s->pics[i], n);
+      g_card.photo[7 + n] = 0;
+    }
+  }
+  all = s->trophies[0] + s->trophies[1] + s->trophies[2] + s->trophies[3];
+  session_duration(s->end - s->start, took, sizeof took);
+  if(all == 1) {
+    snprintf(g_card.text, sizeof g_card.text, L("%s de %s \xc2\xb7 1 trof\xc3\xa9u \xf0\x9f\x8f\x86",
+             "%s of %s \xc2\xb7 1 trophy \xf0\x9f\x8f\x86"), took, name);
+  } else if(all > 1) {
+    snprintf(g_card.text, sizeof g_card.text, L("%s de %s \xc2\xb7 %d trof\xc3\xa9us \xf0\x9f\x8f\x86",
+             "%s of %s \xc2\xb7 %d trophies \xf0\x9f\x8f\x86"), took, name, all);
+  } else {
+    snprintf(g_card.text, sizeof g_card.text, L("%s de %s \xf0\x9f\x8e\xae", "%s of %s \xf0\x9f\x8e\xae"), took, name);
+  }
+  toast(0, "%s", L("A fazer o cart\xc3\xa3o da tua sess\xc3\xa3o\xe2\x80\xa6", "Making your session's card\xe2\x80\xa6"));
+}
+
+
+void
+ui_seen_set(const seen_t *s) {
+  if(s) {
+    g_seen = *s;
+  } else {
+    memset(&g_seen, 0, sizeof g_seen);
+  }
+  g_seen_dirty = 0;
+}
+
+
+int
+ui_seen_get(const seen_t **s) {
+  const int dirty = g_seen_dirty;
+
+  g_seen_dirty = 0;
+  *s = &g_seen;
+  return dirty;
+}
+
+
+int
+ui_week_info_wanted(void) {
+  const int wanted = g_week_info.want;
+
+  g_week_info.want = 0;
+  return wanted;
+}
+
+
+void
+ui_week_info(const week_t *w) {
+  if(w) {
+    g_week_info.week = *w;
+    week_sort(&g_week_info.week);
+    g_week_info.ok = 1;
+  } else if(g_week_info.ok <= 0) {
+    g_week_info.ok = -1; // what came before stays
+  }
+}
+
+
+int
+ui_week_wanted(void) {
+  const int wanted = g_week_wanted;
+
+  g_week_wanted = 0;
+  return wanted;
+}
+
+
+void
+ui_week(const week_t *w) {
+  char took[32];
+  size_t len;
+  int all;
+
+  if(!w) {
+    toast(1, "%s", L("A tua semana n\xc3\xa3o veio. Tenta outra vez daqui a pouco.",
+                     "Your week did not come. Try again in a moment."));
+    return;
+  }
+  if(!w->sessions) {
+    toast(0, "%s", L("Ainda n\xc3\xa3o h\xc3\xa1 sess\xc3\xb5" "es esta semana: o XPS5 conta as de 10 minutos ou mais, com "
+                     "\xe2\x80\x9cPartilhar capturas e trof\xc3\xa9us\xe2\x80\x9d ligado.",
+                     "No sessions this week yet: XPS5 counts the ones of 10 minutes or more, with "
+                     "\xe2\x80\x9cShare captures and trophies\xe2\x80\x9d on."));
+    return;
+  }
+  if(!card_start(CARD_WEEK)) {
+    return;
+  }
+  g_card.week = *w;
+  week_sort(&g_card.week);
+  for(int i=0; i < CARD_GAMES && i < g_card.week.count; i++) {
+    card_icon_url(g_card.week.games[i].id, g_card.icons[i], sizeof g_card.icons[i]);
+  }
+  all = w->trophies[0] + w->trophies[1] + w->trophies[2] + w->trophies[3];
+  session_duration(w->seconds, took, sizeof took);
+  if(g_card.week.count == 1) {
+    const week_game_t *g = &g_card.week.games[0];
+    snprintf(g_card.text, sizeof g_card.text, L("A minha semana na PS5: %s de %s", "My week on PS5: %s of %s"), took,
+             g->name[0] ? g->name : g->id);
+    snprintf(g_card.game, sizeof g_card.game, "%s", g->name);
+  } else {
+    snprintf(g_card.text, sizeof g_card.text, L("A minha semana na PS5: %s em %d jogos", "My week on PS5: %s across %d games"),
+             took, g_card.week.count);
+  }
+  len = strlen(g_card.text);
+  if(all) {
+    snprintf(g_card.text + len, sizeof g_card.text - len, all == 1 ? L(" \xc2\xb7 1 trof\xc3\xa9u \xf0\x9f\x8f\x86",
+             " \xc2\xb7 1 trophy \xf0\x9f\x8f\x86") : L(" \xc2\xb7 %d trof\xc3\xa9us \xf0\x9f\x8f\x86",
+             " \xc2\xb7 %d trophies \xf0\x9f\x8f\x86"), all);
+  }
+  toast(0, "%s", L("A fazer o cart\xc3\xa3o da tua semana\xe2\x80\xa6", "Making your week's card\xe2\x80\xa6"));
+}
+
+
+void
+ui_trophies(const char *id, const ui_trophy_row_t *rows, int count) {
+  int n = 0;
+
+  mem_free(g_tr.rows);
+  g_tr.rows = NULL;
+  g_tr.earned = 0;
+  snprintf(g_tr.id, sizeof g_tr.id, "%s", id ? id : "");
+  g_tr.count = count < 0 ? -1 : 0;
+  if(count > 0 && (g_tr.rows=mem_alloc((size_t)count * sizeof *rows))) {
+    // the ones still to get first, in the set's order; then the ones the user has
+    for(int pass=0; pass<2; pass++) {
+      for(int i=0; i < count; i++) {
+        if(!rows[i].earned == !pass) {
+          g_tr.rows[n++] = rows[i];
+        }
+      }
+    }
+    for(int i=0; i < count; i++) {
+      g_tr.earned += !!rows[i].earned;
+    }
+    g_tr.count = count;
+  }
+  g_tr.sel = g_tr.sel < g_tr.count ? g_tr.sel : 0;
+  g_under_stale = 1;
+}
+
+
+int
+ui_trophies_wanted(void) {
+  const int wanted = g_tr.wanted;
+
+  g_tr.wanted = 0;
+  return wanted;
+}
+
+
+/**
+ * the sheet of the game's trophies, read again
+ **/
+static int
+open_trophies(void) {
+  if(!game_id_ok(g_game.id)) {
+    toast(1, "%s", L("Abre um jogo primeiro: os trof\xc3\xa9us s\xc3\xa3o os do jogo que est\xc3\xa1 a correr.",
+                     "Open a game first: the trophies are the ones of the game that runs."));
+    return 1;
+  }
+  g_tr.wanted = 1;
+  g_tr.sel = 0;
+  g_sheet = SHEET_TROPHIES;
+  return 1;
+}
+
+
+/**
+ * a question to Grok on its page, in a new conversation, sent at once
+ **/
+static int
+grok_about(const char *question) {
+  if(g_act.kind || g_grok.asking) {
+    toast(1, "%s", L("Espera que acabe o que est\xc3\xa1 a ser enviado", "Wait for what is being sent"));
+    return 1;
+  }
+  session_text(question, g_grok.question, sizeof g_grok.question);
+  snprintf(g_grok.game, sizeof g_grok.game, "%s", g_game.name);
+  g_grok.answer[0] = 0;
+  g_grok.error = 0;
+  g_grok.asking = 1;
+  g_grok.fresh = 1;
+  g_under_stale = 1;
+  memset(&g_act, 0, sizeof g_act);
+  g_grok_what = UI_GROK_HINT;
+  g_act.kind = UI_ACT_GROK; // sent next
+  g_sheet = SHEET_NONE;
+  show_section(UI_GROK);
+  return 1;
+}
+
+
+/**
+ * the card's question goes once nothing else is being sent (each frame
+ * looks): the posts summed up when XPS5 opens may wait for a post going
+ **/
+static void
+gcard_go(void) {
+  if(!g_gcard.pending || g_act.kind || g_grok.asking) {
+    return;
+  }
+  g_gcard.pending = 0;
+  g_gcard.asking = 1;
+  g_gcard.error = 0;
+  g_gcard.answer[0] = 0;
+  g_gcard.scroll = 0;
+  memset(&g_act, 0, sizeof g_act);
+  g_grok_what = g_gcard.what;
+  g_act.kind = UI_ACT_GROK; // sent next
+  g_under_stale = 1;
+}
+
+
+/**
+ * Grok's translation of p into the app's language, on its card; the one
+ * already there when it is p's
+ **/
+static int
+translate_post(const x_post_t *p) {
+  size_t n;
+
+  if(!p->text[0]) {
+    toast(1, "%s", L("Este post n\xc3\xa3o tem palavras para traduzir.", "This post has no words to translate."));
+    return 1;
+  }
+  if(g_gcard.what == UI_GROK_TRANSLATE && !strcmp(g_gcard.id, p->id) &&
+     (g_gcard.pending || g_gcard.asking || (g_gcard.answer[0] && !g_gcard.error))) {
+    g_gcard.scroll = 0;
+    g_sheet = SHEET_GROK;
+    return 1;
+  }
+  if(g_act.kind || g_grok.asking || g_gcard.pending || g_gcard.asking) {
+    toast(1, "%s", L("Espera que acabe o que est\xc3\xa1 a ser enviado", "Wait for what is being sent"));
+    return 1;
+  }
+  memset(&g_gcard, 0, sizeof g_gcard);
+  g_gcard.what = UI_GROK_TRANSLATE;
+  snprintf(g_gcard.id, sizeof g_gcard.id, "%s", p->id);
+  snprintf(g_gcard.user, sizeof g_gcard.user, "%s", p->user);
+  snprintf(g_gcard.name, sizeof g_gcard.name, "%s", p->name);
+  // its words, cut at a whole character to fit
+  n = strlen(p->text);
+  if(n >= sizeof g_gcard.input) {
+    for(n=sizeof g_gcard.input - 1; n && ((unsigned char)p->text[n] & 0xC0) == 0x80; n--) {
+    }
+  }
+  memcpy(g_gcard.input, p->text, n);
+  g_gcard.input[n] = 0;
+  g_gcard.pending = 1;
+  gcard_go();
+  g_sheet = SHEET_GROK;
+  return 1;
+}
+
+
+/**
+ * the posts the user has not seen, count of them, each on a line of lines
+ * as "@author: words" for Grok's catch-up: at most X_CATCHUP_MOST, each cut
+ * at a whole character to X_CATCHUP_POST bytes, their own line breaks made
+ * spaces, reposts and posts without words left out; how many went in
+ **/
+static int
+catchup_lines(const x_post_t *posts, int count, char *lines, size_t size) {
+  size_t n = 0, start, room, k;
+  int w, kept = 0;
+
+  if(!size) {
+    return 0;
+  }
+  lines[0] = 0;
+  for(int i=0; i < count && kept < X_CATCHUP_MOST; i++) {
+    const x_post_t *p = &posts[i];
+    const unsigned char *s = (const unsigned char *)p->text;
+
+    if(p->kind != X_KIND_POST || p->reposter[0] || !p->user[0] || !*s) {
+      continue;
+    }
+    start = n;
+    room = size - n;
+    w = room < 32 ? -1 : snprintf(lines + n, room, "@%s: ", p->user);
+    if(w < 0 || (size_t)w + 2 >= room) { // with a word, its line break and the NUL
+      lines[start] = 0;
+      break;
+    }
+    n += (size_t)w;
+    // whole characters, while they fit the line and leave room for its end
+    for(; *s; s += k) {
+      k = *s < 0x80 ? 1 : *s >= 0xF0 ? 4 : *s >= 0xE0 ? 3 : *s >= 0xC0 ? 2 : 1;
+      for(size_t j=1; j < k; j++) {
+        k = (s[j] & 0xC0) == 0x80 ? k : j; // a character cut short: what there is of it
+      }
+      if(n + k + 2 > size || n - start + k > X_CATCHUP_POST) {
+        break;
+      }
+      if(k == 1) {
+        lines[n++] = *s == '\n' || *s == '\r' || *s == '\t' ? ' ' : (char)*s;
+      } else {
+        memcpy(lines + n, s, k);
+        n += k;
+      }
+    }
+    lines[n++] = '\n';
+    lines[n] = 0;
+    kept++;
+  }
+  if(n && lines[n - 1] == '\n') {
+    lines[--n] = 0;
+  }
+  return kept;
+}
+
+
+/**
+ * what came in Following, the count posts on top of t: Grok sums them up on
+ * its card, at once, or (by_itself, as XPS5 opens) shown when it comes
+ **/
+static int
+catchup_ask(const tab_t *t, int count, int by_itself, int since) {
+  static char lines[X_GROK_INPUT];
+  int kept;
+
+  if(g_gcard.what == UI_GROK_CATCHUP && (g_gcard.pending || g_gcard.asking)) {
+    if(!by_itself) {
+      g_gcard.by_itself = 0;
+      g_sheet = SHEET_GROK;
+    }
+    return 1;
+  }
+  if(g_gcard.pending || g_gcard.asking || (!by_itself && (g_act.kind || g_grok.asking))) {
+    if(!by_itself) {
+      toast(1, "%s", L("Espera que acabe o que est\xc3\xa1 a ser enviado", "Wait for what is being sent"));
+    }
+    return 1;
+  }
+  kept = catchup_lines(t->posts, count < t->count ? count : t->count, lines, sizeof lines);
+  if(kept < CATCHUP_LEAST) {
+    if(!by_itself) {
+      toast(0, "%s", L("H\xc3\xa1 pouco de novo para resumir: est\xc3\xa1s em dia.",
+                       "There is little new to sum up: you are all caught up."));
+    }
+    return 1;
+  }
+  memset(&g_gcard, 0, sizeof g_gcard);
+  g_gcard.what = UI_GROK_CATCHUP;
+  g_gcard.count = kept;
+  g_gcard.by_itself = by_itself;
+  g_gcard.since = since;
+  memcpy(g_gcard.input, lines, sizeof g_gcard.input);
+  g_gcard.pending = 1;
+  gcard_go();
+  if(!by_itself) {
+    g_sheet = SHEET_GROK;
+  }
+  return 1;
+}
+
+
+/**
+ * More's "What you missed": the card of the last catch-up when there is
+ * one, or a new one of what is on top of Following now
+ **/
+static int
+catchup_open(void) {
+  const tab_t *t = &g_tabs[UI_FOLLOWING];
+  int since;
+
+  if(g_gcard.what == UI_GROK_CATCHUP &&
+     (g_gcard.pending || g_gcard.asking || (g_gcard.answer[0] && !g_gcard.error))) {
+    g_gcard.by_itself = 0;
+    g_gcard.scroll = 0;
+    g_sheet = SHEET_GROK;
+    return 1;
+  }
+  if(!t->count) {
+    toast(1, "%s", L("Abre o A seguir primeiro: o resumo \xc3\xa9 dos posts dele.",
+                     "Open Following first: the summary is of its posts."));
+    return 1;
+  }
+  g_catchup_asked = 1; // asked for: none of its own later
+  // since last time when a few came, else the newest
+  since = t->seen_at >= CATCHUP_LEAST;
+  return catchup_ask(t, since ? t->seen_at : X_CATCHUP_MOST, 0, since);
+}
+
+
+/**
+ * Grok's answer for the card came, or did not: shown, when it is the
+ * catch-up of its own and nothing else is up, or said in a toast
+ **/
+static void
+gcard_done(int error, int code, int x_code) {
+  g_gcard.asking = 0;
+  g_gcard.error = error;
+  g_gcard.code = code;
+  g_gcard.x_code = x_code;
+  g_grok_what = UI_GROK_HINT;
+  if(g_gcard.by_itself) {
+    g_gcard.by_itself = 0;
+    if(error) {
+      return; // asked of its own: no word of it
+    }
+    if(g_sheet == SHEET_NONE && !g_viewer.open) {
+      g_gcard.scroll = 0;
+      g_sheet = SHEET_GROK;
+    } else {
+      toast(0, "%s", L("O Grok resumiu o que perdeste \xc2\xb7 est\xc3\xa1 em Mais",
+                       "Grok summed up what you missed \xc2\xb7 it is in More"));
+    }
+  }
+  g_under_stale = 1;
+}
+
+
+static int
+gcard_close(void) {
+  g_sheet = SHEET_NONE;
+  return 1;
+}
+
+
+/**
+ * ✕ after it failed: the same question again
+ **/
+static int
+gcard_retry(void) {
+  if(!g_gcard.what || !g_gcard.error || g_gcard.pending || g_gcard.asking) {
+    return 0;
+  }
+  if(g_act.kind || g_grok.asking) {
+    toast(1, "%s", L("Espera que acabe o que est\xc3\xa1 a ser enviado", "Wait for what is being sent"));
+    return 1;
+  }
+  g_gcard.pending = 1;
+  gcard_go();
+  return 1;
+}
+
+
+static int
+gcard_keys(unsigned keys) {
+  if(keys & UI_CIRCLE) {
+    return gcard_close();
+  }
+  if(keys & UI_CROSS) {
+    return gcard_retry() || gcard_close();
+  }
+  if(keys & (UI_UP | UI_DOWN)) {
+    g_gcard.scroll += keys & UI_UP ? -1 : 1;
+    g_gcard.scroll = g_gcard.scroll < 0 ? 0 : g_gcard.scroll; // the drawing keeps it short of the end
+    return 1;
+  }
+  return 0;
+}
+
+
+/**
+ * Grok's tip for the trophy i of the sheet, one the user does not have yet
+ **/
+static int
+trophy_tip(int i) {
+  const ui_trophy_row_t *r;
+  char q[X_GROK_QUESTION];
+
+  if(!g_tr.rows || i < 0 || i >= g_tr.count) {
+    return 0;
+  }
+  r = &g_tr.rows[i];
+  if(r->earned) {
+    toast(0, "%s", L("J\xc3\xa1 tens este trof\xc3\xa9u.", "You have this trophy already."));
+    return 1;
+  }
+  if(!r->name[0]) {
+    snprintf(q, sizeof q, L("Que trof\xc3\xa9u escondido me pode faltar em %s, e como o consigo? Sem spoilers da hist\xc3\xb3ria.",
+             "Which hidden trophy might I be missing in %s, and how do I get it? No story spoilers."), g_game.name);
+  } else if(r->detail[0]) {
+    snprintf(q, sizeof q, L("Como consigo o trof\xc3\xa9u \xe2\x80\x9c%s\xe2\x80\x9d em %s? Diz: \xe2\x80\x9c%s\xe2\x80\x9d",
+             "How do I get the trophy \xe2\x80\x9c%s\xe2\x80\x9d in %s? It says: \xe2\x80\x9c%s\xe2\x80\x9d"), r->name, g_game.name,
+             r->detail);
+  } else {
+    snprintf(q, sizeof q, L("Como consigo o trof\xc3\xa9u \xe2\x80\x9c%s\xe2\x80\x9d em %s?",
+             "How do I get the trophy \xe2\x80\x9c%s\xe2\x80\x9d in %s?"), r->name, g_game.name);
+  }
+  return grok_about(q);
+}
+
+
+/**
+ * the best posts of X about the trophy i of the sheet, in Explore's Top:
+ * its name as written, and the game's
+ **/
+static int
+trophy_posts(int i) {
+  const ui_trophy_row_t *r;
+  char query[X_QUERY_MAX + 1];
+
+  if(!g_tr.rows || i < 0 || i >= g_tr.count) {
+    return 0;
+  }
+  r = &g_tr.rows[i];
+  if(!r->name[0]) {
+    toast(1, "%s", L("Este trof\xc3\xa9u est\xc3\xa1 escondido: ganha-o para veres o nome.",
+                     "This trophy is hidden: earn it to see its name."));
+    return 1;
+  }
+  snprintf(query, sizeof query, "\"%s\" %s", r->name, g_game.name);
+  g_tabs[UI_SEARCH].latest = 0;
+  g_sheet = SHEET_NONE;
+  ui_search(query);
+  return 1;
+}
+
+
+/**
+ * a post looking for a group to play the game that runs with, in the
+ * composer; the replies get an invite from a post's menu
+ **/
+static int
+lfg_post(void) {
+  char line[400];
+
+  if(!g_game.name[0]) {
+    toast(1, "%s", L("Abre um jogo primeiro: o post \xc3\xa9 sobre o jogo que est\xc3\xa1 a correr.",
+                     "Open a game first: the post is about the game that runs."));
+    return 1;
+  }
+  if(g_compose.sending || g_act.kind) {
+    return 0;
+  }
+  draft_fresh();
+  snprintf(line, sizeof line, L("\xc3\x80 procura de grupo para %s \xf0\x9f\x8e\xae Quem alinha? Responde e mando-te um "
+           "convite pelo XPS5. #LFG #XPS5", "Looking for a group in %s \xf0\x9f\x8e\xae Who's in? Reply and I'll send "
+           "you an invite from XPS5. #LFG #XPS5"), g_game.name);
+  compose_lead(line);
+  compose_tag_of(g_game.name);
+  g_auto_draft = draft_sum();
+  if(compose_open(NULL, CM_POST)) {
+    g_compose.focus = C_FOCUS_TEXT;
+    toast(0, "%s", L("Pronto a publicar \xc2\xb7 R2 publica \xc2\xb7 \xe2\x9c\x95 escreve",
+                     "Ready to post \xc2\xb7 R2 posts it \xc2\xb7 \xe2\x9c\x95 to write"));
+  }
+  return 1;
+}
+
+
+/**
+ * the latest posts looking for a group for the game that runs, in Explore
+ **/
+static int
+lfg_find(void) {
+  char query[X_QUERY_MAX + 1], tag[GAME_NAME + 2];
+
+  if(!g_game.name[0]) {
+    toast(1, "%s", L("Abre um jogo primeiro: os grupos s\xc3\xa3o os do jogo que est\xc3\xa1 a correr.",
+                     "Open a game first: the groups are the ones of the game that runs."));
+    return 1;
+  }
+  // by the game's name or its hashtag (the one XPS5's posts carry), in the
+  // words of x.com's and of XPS5's posts in the languages it writes
+  if(game_hashtag(g_game.name, tag, sizeof tag)) {
+    tag[0] = 0;
+  }
+  snprintf(query, sizeof query, "(\"%s\"%s%s) (#LFG OR \"looking for group\" OR \"looking for players\" OR "
+           "\"procura de grupo\" OR \"busco grupo\")", g_game.name, tag[0] ? " OR " : "", tag);
+  g_tabs[UI_SEARCH].latest = 1;
+  ui_search(query);
+  snprintf(g_lfg_query, sizeof g_lfg_query, "%s", g_tabs[UI_SEARCH].query);
+  toast(0, "%s", L("R1 convida quem escreveu o post para o teu jogo.",
+                   "R1 invites whoever wrote the post to your game."));
+  return 1;
+}
+
+
+/**
+ * in the search of groups t, the author of the post picked invited to the
+ * game that runs, in their one-to-one conversation
+ **/
+static int
+lfg_invite(const tab_t *t) {
+  const x_post_t *p;
+
+  if(!t->count || t->sel < 0 || t->sel >= t->count) {
+    return 0;
+  }
+  p = &t->posts[t->sel];
+  if(!p->user_id[0] || is_mine(p)) {
+    toast(1, "%s", L("Este post \xc3\xa9 teu: convida quem lhe respondeu, no \xe2\x80\xa2\xe2\x80\xa2\xe2\x80\xa2 das respostas.",
+                     "This post is yours: invite those who replied, from the replies' \xe2\x80\xa2\xe2\x80\xa2\xe2\x80\xa2."));
+    return 1;
+  }
+  return invite(p->user_id, p->user, p->playing);
+}
+
+
+/**
+ * a button of the game's box in the side column
+ **/
+static int
+game_button(int which) {
+  switch(which) {
+  case GAME_TROPHIES:
+    return open_trophies();
+  case GAME_WEEK:
+    if(g_card.kind) {
+      toast(1, "%s", L("J\xc3\xa1 est\xc3\xa1 a ser feito um cart\xc3\xa3o. Tenta daqui a pouco.",
+                       "A card is being made already. Try again in a moment."));
+      return 1;
+    }
+    g_week_wanted = 1;
+    toast(0, "%s", L("A juntar a tua semana\xe2\x80\xa6", "Putting your week together\xe2\x80\xa6"));
+    return 1;
+  case GAME_LFG:
+    return lfg_post();
+  case GAME_GROUPS:
+    return lfg_find();
+  }
+  return 0;
+}
+
+
+#define TR_ROW_H 92
+#define TR_PAGE  5
+
+static int
+trophies_keys(unsigned keys) {
+  if(keys & UI_CIRCLE) {
+    g_sheet = SHEET_NONE;
+    return 1;
+  }
+  if(keys & UI_SQUARE) {
+    g_tr.wanted = 1;
+    return 1;
+  }
+  if(keys & UI_CROSS) {
+    return trophy_tip(g_tr.sel);
+  }
+  if(keys & UI_TRIANGLE) {
+    return trophy_posts(g_tr.sel);
+  }
+  if((keys & (UI_UP | UI_DOWN | UI_L1 | UI_R1)) && g_tr.count > 0) {
+    g_tr.sel += keys & UI_UP ? -1 : keys & UI_DOWN ? 1 : keys & UI_L1 ? -TR_PAGE : TR_PAGE;
+    g_tr.sel = g_tr.sel < 0 ? 0 : g_tr.sel >= g_tr.count ? g_tr.count - 1 : g_tr.sel;
+    return 1;
+  }
+  return 0;
+}
+
+
 void
 ui_trophy(int grade, const char *name) {
   const char *said;
   char line[300];
-  size_t len;
+  int has_video = 0;
 
   if(g_act.kind || g_compose.sending || grade < 0 || grade > 3) {
     return;
   }
-  if(g_compose.reply || g_compose.quote || g_compose.edit) {
+  if(grade == 3) {
+    draft_fresh(); // a platinum, with its card, is a post of its own
+  } else if(g_compose.reply || g_compose.quote || g_compose.edit) {
     memset(&g_compose, 0, sizeof g_compose); // a post of the user's own
   }
   said = grade == 3 ? L("Trof\xc3\xa9u de platina desbloqueado", "Platinum trophy unlocked") :
@@ -9729,25 +14427,88 @@ ui_trophy(int grade, const char *name) {
   } else {
     snprintf(line, sizeof line, "%s", said);
   }
-  len = strlen(g_compose.text);
-  if(!strstr(g_compose.text, line) && len + 1 + strlen(line) < sizeof g_compose.text) {
-    // before what is written, on a line of its own
-    memmove(g_compose.text + strlen(line) + (len ? 1 : 0), g_compose.text, len + 1);
-    memcpy(g_compose.text, line, strlen(line));
-    if(len) {
-      g_compose.text[strlen(line)] = '\n';
+  compose_lead(line); // before what is written, on a line of its own
+  compose_tag_quietly();
+  for(int i=0; i < g_compose.count; i++) {
+    has_video |= is_video(&g_compose.media[i]);
+  }
+  // its card follows, with how many of the game's trophies the user has;
+  // not over a video in the post (X takes pictures or one video), which the
+  // PS5's own clip of the trophy is when it came first. A clip that comes
+  // after takes the card's place
+  if(!has_video && game_id_ok(g_game.id) && !g_card.kind && card_start(CARD_TROPHY)) {
+    g_card.grade = grade;
+    snprintf(g_card.game, sizeof g_card.game, "%s", g_game.name);
+    snprintf(g_card.trophy, sizeof g_card.trophy, "%s", name ? name : "");
+    card_icon_url(g_game.id, g_card.icons[0], sizeof g_card.icons[0]);
+    if(!strcmp(g_tr.id, g_game.id) && g_tr.count > 0) {
+      g_card.earned = g_tr.earned;
+      g_card.all = g_tr.count;
+      for(int i=0; i < g_tr.count; i++) {
+        // this one, not read since: the platinum, or the one of its name
+        g_card.earned += !g_tr.rows[i].earned && (grade == 3 ? g_tr.rows[i].grade == 3 :
+                         name && name[0] && !strcmp(g_tr.rows[i].name, name));
+      }
     }
   }
-  compose_tag_quietly();
   if(g_sheet != SHEET_NONE && g_sheet != SHEET_COMPOSE) {
     toast(0, "%s", L("O teu trof\xc3\xa9u est\xc3\xa1 no post \xc2\xb7 \xe2\x98\xb0 abre-o",
                      "Your trophy is in your post \xc2\xb7 \xe2\x98\xb0 opens it"));
     return;
   }
   if(compose_open(NULL, CM_POST)) {
+    // on the text, so ✕ writes about it: with the game's hashtag in it the
+    // focus went to Post, and ✕ posted it at once
+    g_compose.focus = C_FOCUS_TEXT;
     toast(0, "%s", L("Pronto a publicar \xc2\xb7 R2 publica \xc2\xb7 \xe2\x9c\x95 escreve",
                      "Ready to post \xc2\xb7 R2 posts it \xc2\xb7 \xe2\x9c\x95 to write"));
   }
+}
+
+
+// the .jxr captures the loader found HDR: hashes of their paths, the newest
+// HDR_SEEN of them
+#define HDR_SEEN 32
+static uint64_t g_hdr_seen[HDR_SEEN];
+static unsigned g_hdr_next;
+
+
+static uint64_t
+path_hash(const char *s) {
+  uint64_t h = 1469598103934665603ull; // FNV-1a
+
+  for(; *s; s++) {
+    h = (h ^ (unsigned char)*s) * 1099511628211ull;
+  }
+  return h | 1; // never 0, which is an empty slot
+}
+
+
+void
+ui_capture_hdr(const char *path) {
+  unsigned i = __atomic_fetch_add(&g_hdr_next, 1, __ATOMIC_RELAXED) % HDR_SEEN;
+
+  __atomic_store_n(&g_hdr_seen[i], path_hash(path), __ATOMIC_RELAXED);
+}
+
+
+/**
+ * whether a capture is an HDR screenshot, as far as the loader found
+ **/
+static int
+capture_hdr(const capture_t *c) {
+  uint64_t h;
+
+  if(c->kind != CAPTURE_JXR) {
+    return 0;
+  }
+  h = path_hash(c->path);
+  for(int i=0; i < HDR_SEEN; i++) {
+    if(__atomic_load_n(&g_hdr_seen[i], __ATOMIC_RELAXED) == h) {
+      return 1;
+    }
+  }
+  return 0;
 }
 
 
@@ -9781,6 +14542,9 @@ ui_shot(const capture_t *c) {
     return;
   }
   if(compose_open(NULL, CM_POST)) {
+    // on the text, so ✕ writes about it: with the game's hashtag in it the
+    // focus went to Post, and ✕ posted it at once
+    g_compose.focus = C_FOCUS_TEXT;
     toast(0, "%s", L("Pronto a publicar \xc2\xb7 R2 publica \xc2\xb7 \xe2\x9c\x95 escreve",
                      "Ready to post \xc2\xb7 R2 posts it \xc2\xb7 \xe2\x9c\x95 to write"));
   }
@@ -9864,6 +14628,51 @@ pane_shadow(int x, int y, int w, int h, float r, float spread) {
 
 
 /**
+ * the glass of a pane at the box: the panel's own glass under it (the
+ * backdrop, as the room, the theme and the banner tint it), lifted toward
+ * white by lift, so that a sheet is the lit glass of the design over the
+ * dimmed screen as the panel is over the room; PANE before the backdrop
+ **/
+static uint32_t
+pane_glass(int x, int y, int w, int h, float lift) {
+  const int pw = pxs(UI_WIDTH), ph = pxs(UI_HEIGHT);
+  int x0 = x > PANEL_X + 40 ? x : PANEL_X + 40, x1 = x + w < PANEL_X + PANEL_W - 40 ? x + w : PANEL_X + PANEL_W - 40;
+  int y0 = y > PANEL_Y + 40 ? y : PANEL_Y + 40, y1 = y + h < PANEL_Y + PANEL_H - 40 ? y + h : PANEL_Y + PANEL_H - 40;
+  unsigned long long sum[3] = {0, 0, 0};
+  unsigned n = 0;
+
+  if(!g_backdrop) {
+    return PANE;
+  }
+  if(x1 <= x0 || y1 <= y0) { // off the panel: the glass under all of it
+    x0 = x;
+    x1 = x + w;
+    y0 = y;
+    y1 = y + h;
+  }
+  // a grid of 16 x 16 of its pixels, the glass being smooth
+  for(int j=0; j < 16; j++) {
+    const int py = pxs(y0 + (y1 - y0) * (2 * j + 1) / 32.0f);
+    for(int i=0; i < 16 && py >= 0 && py < ph; i++) {
+      const int px = pxs(x0 + (x1 - x0) * (2 * i + 1) / 32.0f);
+      if(px >= 0 && px < pw) {
+        const uint32_t p = g_backdrop[(size_t)py * (size_t)pw + (size_t)px];
+        sum[0] += p & 0xff;
+        sum[1] += p >> 8 & 0xff;
+        sum[2] += p >> 16 & 0xff;
+        n++;
+      }
+    }
+  }
+  if(!n) {
+    return PANE;
+  }
+  return toward(RGBA((unsigned)(sum[0] / n), (unsigned)(sum[1] / n), (unsigned)(sum[2] / n), 255),
+                RGBA(255, 255, 255, 255), lift);
+}
+
+
+/**
  * the pane of glass of a sheet over the dimmed screen, and the place
  * around it that closes it
  **/
@@ -9871,7 +14680,7 @@ static void
 draw_pane(int x, int y, int w, int h) {
   zone(Z_SHEET, 0, 0, 0, 0, UI_WIDTH, UI_HEIGHT);
   pane_shadow(x, y, w, h, SHEET_R, 120);
-  draw_box(&g_dst, x, y, w, h, SHEET_R, 0, PANE);
+  draw_box(&g_dst, x, y, w, h, SHEET_R, 0, pane_glass(x, y, w, h, 0.04f));
   draw_rim(&g_dst, x, y, w, h, SHEET_R, 2, RGBA(255, 255, 255, 96), 0.3f);
   zone(Z_PANE, 0, 0, x, y, w, h);
 }
@@ -9967,6 +14776,59 @@ tile_label(const char *s, int x, int y, int h) {
 
 
 /**
+ * the composer's clip playing in its tile, without sound and from its start
+ * again at its end, a spinner while it comes; the dark tile with its mark
+ * when it cannot play (a WebM, or a read that failed). Returns how long it
+ * is, 0 while unknown
+ **/
+static int
+compose_clip(const capture_t *c, int x, int y, int w, int h, float r) {
+  char url[IMAGES_URL_MAX];
+  player_status_t st;
+  int vw = w, vh = w * 9 / 16, pw, ph, drawn;
+
+  if(c->kind != CAPTURE_MP4 || g_viewer.open || g_sheet != SHEET_COMPOSE || !capture_url(c, url, sizeof url)) {
+    draw_capture(c, x, y, w, h, r);
+    return 0;
+  }
+  if(vh > h) {
+    vh = h;
+    vw = h * 16 / 9;
+  }
+  vw &= ~1;
+  vh &= ~1;
+  video_px(vw, vh, &pw, &ph);
+  g_player_wanted = 1;
+  memset(&st, 0, sizeof st);
+  if(!player_is(url)) {
+    player_open(url, pw, ph, 0, 0);
+    st.state = PLAYER_LOADING;
+  } else {
+    player_resize(pw, ph);
+    player_sound(0);
+    player_status(&st);
+  }
+  if(st.state == PLAYER_FAILED) {
+    draw_capture(c, x, y, w, h, r);
+    return 0;
+  }
+  draw_box(&g_dst, x, y, w, h, r, 0, RGBA(0, 0, 0, 255));
+  drawn = (st.state == PLAYER_PLAYING || st.state == PLAYER_PAUSED) &&
+          draw_player(x + (w - vw) / 2, y + (h - vh) / 2, vw, vh, r);
+  if(!drawn) {
+    draw_box(&g_dst, x, y, w, h, r, 0, TILE);
+  }
+  draw_box(&g_dst, x, y, w, h, r, 1.5f, EDGE);
+  if(!drawn || st.buffering) {
+    g_spinning = 1;
+    draw_circle(&g_dst, x + w / 2.0f, y + h / 2.0f, 40, RGBA(20, 16, 14, 150));
+    spinner(x + w / 2.0f, y + h / 2.0f, 24, 5, g_frame_no, WHITE);
+  }
+  return st.len_ms;
+}
+
+
+/**
  * the composer's media, w x h at x, y: one alone, two side by side, three
  * with the first tall, four in a grid
  **/
@@ -9993,11 +14855,23 @@ draw_compose_media(int x, int y, int w, int h) {
     const capture_t *c = &g_compose.media[i];
     int tx = x + r[i].x, ty = y + r[i].y, tw = r[i].w, th = r[i].h;
     over = zone(Z_C_MEDIA, 0, i, tx, ty, tw, th);
-    draw_capture(c, tx, ty, tw, th, 20);
     if(is_video(c)) {
+      char clock[16] = "";
+      int len_ms = compose_clip(c, tx, ty, tw, th, 20);
+      clip_known(&g_compose.media[i], len_ms);
       size_text(c->size, size, sizeof size);
-      snprintf(line, sizeof line, "MP4 \xc2\xb7 %s", size);
+      if(len_ms > 0) {
+        clock_text(len_ms, clock, sizeof clock);
+      }
+      // a part of it: which, of how long (its size is the whole one's)
+      snprintf(line, sizeof line, "%s \xc2\xb7 %s%s%s", c->kind == CAPTURE_WEBM ? "WebM" : "MP4",
+               c->clip && c->kind == CAPTURE_MP4 ? clip_name(c->clip) : size, clock[0] ? " \xc2\xb7 " : "", clock);
       tile_label(line, tx, ty, th);
+    } else {
+      draw_capture(c, tx, ty, tw, th, 20);
+      if(capture_hdr(c)) {
+        tile_label("HDR", tx, ty, th); // it goes to X as Ultra HDR
+      }
     }
     if(g_compose.focus == C_FOCUS_MEDIA + i || over) {
       draw_box(&g_dst, tx - 5, ty - 5, tw + 10, th + 10, 25, 3, g_compose.focus == C_FOCUS_MEDIA + i ?
@@ -10242,18 +15116,34 @@ draw_compose(long long now, unsigned frame) {
   } else if(over) {
     lit_box(tx - 16, y - 8, tw + 16, th, 22, 1);
   }
-  if(!g_compose.text[0]) {
-    text_fitted(body, tx, baseline(body, y, C_LINE_H), g_compose.reply ?
-                L("Publica a tua resposta", "Post your reply") : g_compose.quote ?
-                L("Adiciona um coment\xc3\xa1rio", "Add a comment") :
-                L("O que est\xc3\xa1 a acontecer?!", "What is happening?!"), tw - 24, DIM);
-  } else {
-    for(int i=0; i < lines; i++) {
-      int end = text_draw(body, &g_dst, tx, baseline(body, y + i * C_LINE_H, C_LINE_H),
-                          g_compose.text + start[i], len[i], FG);
+  {
+    // only the game's hashtag, which a capture brings: what to write still
+    // shows after it
+    int tag_only = g_compose.text[0] == '#' && !strpbrk(g_compose.text, " \n"), hint = 0, end = tx;
+    if(g_compose.focus == C_FOCUS_TEXT && (!g_compose.text[0] || tag_only)) {
+      // ✕ Write, on the right: what the button does here
+      text_font_t *k = font(F_SMALL);
+      const char *write = L("Escrever", "Write");
+      hint = width_of(k, write) + 70;
+      int kx = tx + tw - 24 - hint + 8;
+      kx += draw_key("\xe2\x9c\x95", kx, y + (C_LINE_H - 38) / 2) + 10;
+      text(k, kx, baseline(k, y, C_LINE_H), write, GREY);
+    }
+    for(int i=0; g_compose.text[0] && i < lines; i++) {
+      end = text_draw(body, &g_dst, tx, baseline(body, y + i * C_LINE_H, C_LINE_H),
+                      g_compose.text + start[i], len[i], FG);
       if(more && i == lines - 1) {
         text(body, end, baseline(body, y + i * C_LINE_H, C_LINE_H), "\xe2\x80\xa6", FG);
       }
+    }
+    if((!g_compose.text[0] || (tag_only && g_compose.count && lines == 1)) &&
+       tx + tw - 24 - hint - (g_compose.text[0] ? end + 18 : tx) > 80) {
+      int px = g_compose.text[0] ? end + 18 : tx;
+      text_fitted(body, px, baseline(body, y, C_LINE_H), g_compose.reply ?
+                  L("Publica a tua resposta", "Post your reply") : g_compose.quote ?
+                  L("Adiciona um coment\xc3\xa1rio", "Add a comment") : g_compose.count ?
+                  L("Escreve algo sobre isto", "Write something about it") :
+                  L("O que est\xc3\xa1 a acontecer?!", "What is happening?!"), tx + tw - 24 - hint - px, DIM);
     }
   }
   y += th + 18;
@@ -10282,6 +15172,29 @@ draw_compose(long long now, unsigned frame) {
              is_video(&g_compose.media[0]) ? 1 : UI_MEDIA_MAX);
   }
   px = width_of(font(F_LEGEND), line) + 96;
+  {
+    // what the rest of the bar takes: its round buttons, when the post
+    // goes out, what is left and the button; when it all does not fit, the
+    // photos' button keeps only its icon and how many there are
+    char when[64];
+    int rest = 14 + (C_BAR_H + 14) * (2 + share_dm_ok() + (!g_compose.quote && !g_compose.edit) + !g_compose.edit);
+    if(!g_compose.reply && !g_compose.quote && !g_compose.edit) {
+      schedule_text(g_compose.schedule, when, sizeof when);
+      rest += width_of(font(F_LEGEND), when) + 92;
+    }
+    rest += 16 + width_of(font(F_PILL), g_compose.reply ? L("Responder", "Reply") : g_compose.edit ?
+                          L("Guardar", "Save") : compose_scheduled() ? L("Agendar", "Schedule") :
+                          L("Publicar", "Post")) + 64 + (post_length(g_compose.text) ? 92 : 0);
+    if(px + rest > C_W - 2 * C_PAD + 8) {
+      if(g_compose.count) {
+        snprintf(line, sizeof line, "%d/%d", g_compose.count, is_video(&g_compose.media[0]) ? 1 : UI_MEDIA_MAX);
+        px = width_of(font(F_LEGEND), line) + 96;
+      } else {
+        line[0] = 0;
+        px = 82;
+      }
+    }
+  }
   over = zone(Z_C_ADD, 0, 0, x - 8, C_BAR_Y, px, C_BAR_H);
   if(g_compose.focus == C_FOCUS_ADD) {
     draw_box(&g_dst, x - 8, C_BAR_Y, px, C_BAR_H, C_BAR_H / 2.0f, 0, CHIP);
@@ -10306,6 +15219,38 @@ draw_compose(long long now, unsigned frame) {
     draw_icon(&g_dst, ICON_POLL, qx + (C_BAR_H - 38) / 2, C_BAR_Y + (C_BAR_H - 38) / 2, 38, ACCENT);
     qx += C_BAR_H + 14;
   }
+  // a voice note from the controller's microphone
+  if(!g_compose.edit) {
+    over = zone(Z_C_VOICE, 0, 0, qx, C_BAR_Y, C_BAR_H, C_BAR_H);
+    if(g_compose.focus == C_FOCUS_VOICE) {
+      draw_box(&g_dst, qx, C_BAR_Y, C_BAR_H, C_BAR_H, C_BAR_H / 2.0f, 0, CHIP);
+      draw_box(&g_dst, qx - 6, C_BAR_Y - 6, C_BAR_H + 12, C_BAR_H + 12, C_BAR_H / 2.0f + 6, 3, WHITE);
+    } else if(over) {
+      lit_box(qx, C_BAR_Y, C_BAR_H, C_BAR_H, C_BAR_H / 2.0f, 1);
+    }
+    draw_icon(&g_dst, ICON_MIC, qx + (C_BAR_H - 38) / 2, C_BAR_Y + (C_BAR_H - 38) / 2, 38, ACCENT);
+    qx += C_BAR_H + 14;
+  }
+  // the text said to the controller's microphone, written on the console
+  over = zone(Z_C_DICTATE, 0, 0, qx, C_BAR_Y, C_BAR_H, C_BAR_H);
+  if(g_compose.focus == C_FOCUS_DICTATE) {
+    draw_box(&g_dst, qx, C_BAR_Y, C_BAR_H, C_BAR_H, C_BAR_H / 2.0f, 0, CHIP);
+    draw_box(&g_dst, qx - 6, C_BAR_Y - 6, C_BAR_H + 12, C_BAR_H + 12, C_BAR_H / 2.0f + 6, 3, WHITE);
+  } else if(over) {
+    lit_box(qx, C_BAR_Y, C_BAR_H, C_BAR_H, C_BAR_H / 2.0f, 1);
+  }
+  draw_icon(&g_dst, ICON_DICTATE, qx + (C_BAR_H - 38) / 2, C_BAR_Y + (C_BAR_H - 38) / 2, 38, ACCENT);
+  qx += C_BAR_H + 14;
+  // the text written on the phone, by a QR
+  over = zone(Z_C_PHONE, 0, 0, qx, C_BAR_Y, C_BAR_H, C_BAR_H);
+  if(g_compose.focus == C_FOCUS_PHONE) {
+    draw_box(&g_dst, qx, C_BAR_Y, C_BAR_H, C_BAR_H, C_BAR_H / 2.0f, 0, CHIP);
+    draw_box(&g_dst, qx - 6, C_BAR_Y - 6, C_BAR_H + 12, C_BAR_H + 12, C_BAR_H / 2.0f + 6, 3, WHITE);
+  } else if(over) {
+    lit_box(qx, C_BAR_Y, C_BAR_H, C_BAR_H, C_BAR_H / 2.0f, 1);
+  }
+  draw_icon(&g_dst, ICON_PHONE, qx + (C_BAR_H - 38) / 2, C_BAR_Y + (C_BAR_H - 38) / 2, 38, ACCENT);
+  qx += C_BAR_H + 14;
   // the capture in a message, to a friend
   if(share_dm_ok()) {
     over = zone(Z_C_DM, 0, 0, qx, C_BAR_Y, C_BAR_H, C_BAR_H);
@@ -10367,6 +15312,32 @@ draw_compose(long long now, unsigned frame) {
     draw_hints(C_X + C_W / 2, C_Y + C_H - 56,
                L("\xe2\x9c\x95 Enviar numa mensagem direta  \xc2\xb7  R2 Publicar  \xc2\xb7  \xe2\x97\x8b Fechar",
                  "\xe2\x9c\x95 Send in a direct message  \xc2\xb7  R2 Post  \xc2\xb7  \xe2\x97\x8b Close"));
+  } else if(g_compose.focus == C_FOCUS_VOICE) {
+    draw_hints(C_X + C_W / 2, C_Y + C_H - 56,
+               L("\xe2\x9c\x95 Gravar uma nota de voz  \xc2\xb7  R2 Publicar  \xc2\xb7  \xe2\x97\x8b Fechar",
+                 "\xe2\x9c\x95 Record a voice note  \xc2\xb7  R2 Post  \xc2\xb7  \xe2\x97\x8b Close"));
+  } else if(g_compose.focus == C_FOCUS_DICTATE) {
+    draw_hints(C_X + C_W / 2, C_Y + C_H - 56,
+               L("\xe2\x9c\x95 Ditar o texto  \xc2\xb7  R2 Publicar  \xc2\xb7  \xe2\x97\x8b Fechar",
+                 "\xe2\x9c\x95 Dictate the text  \xc2\xb7  R2 Post  \xc2\xb7  \xe2\x97\x8b Close"));
+  } else if(g_compose.focus == C_FOCUS_PHONE) {
+    draw_hints(C_X + C_W / 2, C_Y + C_H - 56,
+               L("\xe2\x9c\x95 Escrever no telem\xc3\xb3vel  \xc2\xb7  R2 Publicar  \xc2\xb7  \xe2\x97\x8b Fechar",
+                 "\xe2\x9c\x95 Write on your phone  \xc2\xb7  R2 Post  \xc2\xb7  \xe2\x97\x8b Close"));
+  } else if(g_compose.focus == C_FOCUS_SEND) {
+    // ✕ posts here: the legend says so, not "Write"
+    draw_hints(C_X + C_W / 2, C_Y + C_H - 56,
+               L("\xe2\x9c\x95 Publicar  \xc2\xb7  \xe2\x96\xb3 Fotos e v\xc3\xad" "deos  \xc2\xb7  \xe2\x96\xa1 Tirar  \xc2\xb7  \xe2\x97\x8b Fechar",
+                 "\xe2\x9c\x95 Post  \xc2\xb7  \xe2\x96\xb3 Photos and videos  \xc2\xb7  \xe2\x96\xa1 Remove  \xc2\xb7  \xe2\x97\x8b Close"));
+  } else if(g_compose.focus >= C_FOCUS_MEDIA && g_compose.focus < C_FOCUS_MEDIA + g_compose.count &&
+            g_compose.media[g_compose.focus - C_FOCUS_MEDIA].kind == CAPTURE_MP4) {
+    draw_hints(C_X + C_W / 2, C_Y + C_H - 56,
+               L("\xe2\x9c\x95 Cortar  \xc2\xb7  \xe2\x96\xa1 Tirar  \xc2\xb7  \xe2\x96\xb3 Fotos e v\xc3\xad" "deos  \xc2\xb7  R2 Publicar  \xc2\xb7  \xe2\x97\x8b Fechar",
+                 "\xe2\x9c\x95 Trim  \xc2\xb7  \xe2\x96\xa1 Remove  \xc2\xb7  \xe2\x96\xb3 Photos and videos  \xc2\xb7  R2 Post  \xc2\xb7  \xe2\x97\x8b Close"));
+  } else if(g_compose.focus >= C_FOCUS_MEDIA && g_compose.focus < C_FOCUS_ADD) {
+    draw_hints(C_X + C_W / 2, C_Y + C_H - 56,
+               L("\xe2\x9c\x95 Tirar  \xc2\xb7  \xe2\x96\xb3 Fotos e v\xc3\xad" "deos  \xc2\xb7  R2 Publicar  \xc2\xb7  \xe2\x97\x8b Fechar",
+                 "\xe2\x9c\x95 Remove  \xc2\xb7  \xe2\x96\xb3 Photos and videos  \xc2\xb7  R2 Post  \xc2\xb7  \xe2\x97\x8b Close"));
   } else {
     draw_hints(C_X + C_W / 2, C_Y + C_H - 56, g_compose.reply || g_compose.quote || g_compose.edit ?
                L("\xe2\x9c\x95 Escrever  \xc2\xb7  \xe2\x96\xb3 Fotos e v\xc3\xad" "deos  \xc2\xb7  \xe2\x96\xa1 Tirar  \xc2\xb7  R2 Publicar  \xc2\xb7  \xe2\x97\x8b Fechar",
@@ -10439,7 +15410,7 @@ draw_gallery(long long now, unsigned frame) {
         snprintf(line + strlen(line), sizeof line - strlen(line), " \xc2\xb7 %s \xc2\xb7 %s",
                  c->kind == CAPTURE_WEBM ? "WebM" : "MP4", when);
       } else {
-        snprintf(line, sizeof line, "%s", when);
+        snprintf(line, sizeof line, "%s%s", capture_hdr(c) ? "HDR \xc2\xb7 " : "", when);
       }
       tile_label(line, tx, ty, G_TILE_H);
       if(c->kind == CAPTURE_WEBM) {
@@ -10509,8 +15480,9 @@ static void
 draw_settings(void) {
   static const int icons[S_ROWS] = { // -1: the pointer's own ring
     ICON_GLOBE, ICON_MOON, ICON_SCREEN, ICON_BELL, ICON_REFRESH, ICON_SOUND, -1, ICON_VIDEO, ICON_VIEWS,
-    ICON_EYE_OFF, ICON_LIGHT, ICON_CUP, ICON_RISING, ICON_PHOTO, ICON_PERSON, ICON_REFRESH,
-  };
+    ICON_EYE_OFF, ICON_SPARK, ICON_LIGHT, ICON_GAME, ICON_SOUND, ICON_CUP, ICON_RISING, ICON_GAME, ICON_MUTE, ICON_PHOTO,
+    ICON_PERSON, -2, ICON_REFRESH,
+  }; // -2: a green dot, as on someone online
   text_font_t *title = font(F_BRAND), *small = font(F_SMALL), *label = font(F_SIDE_BOLD), *value = font(F_PILL);
   const x_user_t *me = g_tabs[UI_ME].has_user ? &g_tabs[UI_ME].user : NULL;
   int x = S_X + 40, y = S_Y + 30, right = S_X + S_W - 48, ry, cy, over, focused, vw, accounts;
@@ -10554,10 +15526,13 @@ draw_settings(void) {
     } else if(over) {
       lit_box(S_X + 20, ry, S_W - 40, S_ROW_H - 8, 26, 1);
     }
-    color = (row == S_EVERY || row == S_RISING) && !g_settings.notify ? DIM : FG;
+    color = (row == S_EVERY || row == S_RISING || row == S_FRIENDS || row == S_QUIET) && !g_settings.notify ? DIM : FG;
     draw_circle(&g_dst, x + 30, cy, 28, CHIP);
     if(icons[row] >= 0) {
       draw_icon(&g_dst, icons[row], x + 13, cy - 17, 34, color);
+    } else if(icons[row] == -2) {
+      draw_arc(&g_dst, x + 30, cy, 15, 2.4f, 0, 6.2832f, color);
+      draw_circle(&g_dst, x + 30, cy, 8, GREEN);
     } else {
       draw_arc(&g_dst, x + 30, cy, 13, 2.6f, 0, 6.2832f, color);
       draw_circle(&g_dst, x + 30, cy, 3.5f, color);
@@ -10595,7 +15570,7 @@ draw_settings(void) {
       break;
     case S_NOTIFY:
       name = L("Notifica\xc3\xa7\xc3\xb5" "es sobre o jogo", "Notifications over the game");
-      desc = L("Gostos, respostas, men\xc3\xa7\xc3\xb5" "es e seguidores novos do X", "New X likes, replies, mentions and followers");
+      desc = L("Gostos, respostas, men\xc3\xa7\xc3\xb5" "es, mensagens e seguidores novos do X", "New X likes, replies, mentions, messages and followers");
       break;
     case S_EVERY:
       name = L("Ver se h\xc3\xa1 novas a cada", "Check for new ones every");
@@ -10637,10 +15612,25 @@ draw_settings(void) {
                  "Covers the posts about the game that is running \xc2\xb7 \xe2\x9c\x95 shows them");
       }
       break;
+    case S_CATCHUP:
+      name = L("Resumo do Grok ao abrir", "Grok's catch-up on opening");
+      desc = L("O que perdeste no A seguir, em tr\xc3\xaas linhas, quando abres o XPS5",
+               "What you missed in Following, in three lines, when you open XPS5");
+      break;
     case S_LIGHT:
       name = L("Luz do comando", "Controller light");
       desc = L("A barra de luz do comando ganha a cor do banner que se v\xc3\xaa",
                "The controller's light bar takes the colour of the banner shown");
+      break;
+    case S_RUMBLE:
+      name = L("Vibra\xc3\xa7\xc3\xa3o do comando", "Controller vibration");
+      desc = L("Vibra com notifica\xc3\xa7\xc3\xb5\x65s e mensagens novas, e no fim das listas",
+               "Vibrates on new notifications and messages, and at the end of lists");
+      break;
+    case S_SPEAKER:
+      name = L("Notas de voz no comando", "Voice notes on the controller");
+      desc = L("As notas de voz tocam no altifalante do comando",
+               "Voice notes play on the controller's speaker");
       break;
     case S_BREAK:
       name = L("Lembrete de pausa", "Break reminder");
@@ -10659,6 +15649,16 @@ draw_settings(void) {
       desc = L("Uma notifica\xc3\xa7\xc3\xa3o sobre o jogo quando um post teu ganha gostos depressa",
                "A notification over the game when a post of yours gets likes fast");
       break;
+    case S_FRIENDS:
+      name = L("Amigos a jogar e online", "Friends playing and online");
+      desc = L("Uma notifica\xc3\xa7\xc3\xa3o quando algu\xc3\xa9m que segues come\xc3\xa7" "a um jogo ou abre o XPS5",
+               "A notification when someone you follow starts a game or opens XPS5");
+      break;
+    case S_QUIET:
+      name = L("N\xc3\xa3o incomodar em jogos competitivos", "Do not disturb in competitive games");
+      desc = L("As notifica\xc3\xa7\xc3\xb5" "es esperam pelo fim do jogo e chegam num s\xc3\xb3 aviso",
+               "Notifications wait for the game to end and come in one notice");
+      break;
     case S_SHARE:
       name = L("Partilhar capturas e trof\xc3\xa9us", "Share captures and trophies");
       desc = L("Cada captura ou trof\xc3\xa9u novo do jogo chega numa notifica\xc3\xa7\xc3\xa3o e abre num post",
@@ -10668,6 +15668,11 @@ draw_settings(void) {
       name = L("A jogar no teu perfil", "Playing on your profile");
       desc = L("A localiza\xc3\xa7\xc3\xa3o do teu perfil do X mostra o jogo e volta quando paras",
                "Your X profile's location shows the game, then goes back when you stop");
+      break;
+    case S_ONLINE:
+      name = L("Online no teu perfil", "Online on your profile");
+      desc = L("Com o XPS5 aberto e sem jogo, o perfil diz que est\xc3\xa1s online no XPS5",
+               "With XPS5 open and no game, your profile says you are online on XPS5");
       break;
     case S_SESSION:
       name = L("Conta do X", "X account");
@@ -10749,12 +15754,18 @@ draw_settings(void) {
     vw = shown[0] ? width_of(value, shown) + (focused && row != S_UPDATE ? 64 : 28) : 100;
     text_fitted(small, x + 84, cy + 28, desc, right - vw - x - 84, GREY);
     if(row == S_NOTIFY || row == S_SOUND || row == S_HOVER || row == S_AUTOPLAY || row == S_SAVER ||
-       row == S_SPOILER || row == S_LIGHT || row == S_RISING || row == S_SHARE || row == S_PLAYING) {
+       row == S_SPOILER || row == S_CATCHUP || row == S_LIGHT || row == S_RUMBLE || row == S_SPEAKER ||
+       row == S_RISING || row == S_QUIET ||
+       row == S_FRIENDS || row == S_SHARE || row == S_PLAYING || row == S_ONLINE) {
       draw_toggle(right, cy, row == S_NOTIFY ? g_settings.notify : row == S_SOUND ? g_settings.sound :
                   row == S_HOVER ? g_settings.hover : row == S_AUTOPLAY ? g_settings.autoplay :
-                  row == S_SPOILER ? g_settings.spoilers : row == S_LIGHT ? g_settings.light :
-                  row == S_RISING ? g_settings.rising : row == S_SHARE ? g_settings.share :
-                  row == S_PLAYING ? g_settings.playing : g_settings.saver);
+                  row == S_SPOILER ? g_settings.spoilers : row == S_CATCHUP ? g_settings.catchup :
+                  row == S_LIGHT ? g_settings.light :
+                  row == S_RUMBLE ? g_settings.rumble : row == S_SPEAKER ? g_settings.speaker :
+                  row == S_RISING ? g_settings.rising : row == S_FRIENDS ? g_settings.friends : row == S_QUIET ? g_settings.quiet :
+                  row == S_SHARE ? g_settings.share :
+                  row == S_PLAYING ? g_settings.playing : row == S_ONLINE ? g_settings.online :
+                  g_settings.saver);
     } else if(shown[0]) {
       vw = width_of(value, shown);
       if(focused && row == S_UPDATE) { // ← and → do not change it
@@ -10842,7 +15853,7 @@ draw_menu(void) {
 
   zone(Z_SHEET, 0, 0, 0, 0, UI_WIDTH, UI_HEIGHT);
   pane_shadow(x, y, MENU_W, h, 24, 70);
-  draw_box(&g_dst, x, y, MENU_W, h, 24, 0, PANE);
+  draw_box(&g_dst, x, y, MENU_W, h, 24, 0, pane_glass(x, y, MENU_W, h, 0.12f));
   draw_rim(&g_dst, x, y, MENU_W, h, 24, 2, RGBA(255, 255, 255, 110), 0.3f);
   zone(Z_PANE, 0, 0, x, y, MENU_W, h);
   for(int i=0; i < g_menu.count; i++) {
@@ -11461,11 +16472,570 @@ draw_scheduled(long long now, unsigned frame) {
 }
 
 
+/**
+ * the game's trophies: how many of them the user has, then a row each, the
+ * ones still to get first; ✕ asks Grok how to get one, △ finds X's posts about it
+ **/
+static void
+draw_trophies(unsigned frame) {
+  text_font_t *title = font(F_BRAND), *small = font(F_SMALL), *bold = font(F_SIDE_BOLD), *f = font(F_LEGEND);
+  const int x = S_X + 40, right = S_X + S_W - 48, top = S_Y + 150, rows = (S_H - 150 - 90) / TR_ROW_H;
+  const int mine = !strcmp(g_tr.id, g_game.id) && g_tr.count;
+  int y = S_Y + 30, first, over;
+  char line[200];
+
+  draw_pane(S_X, S_Y, S_W, S_H);
+  draw_circle(&g_dst, x + 30, y + 32, 30, g_grade_colours[2]);
+  draw_icon(&g_dst, ICON_TROPHY, x + 12, y + 14, 36, INK);
+  text_fitted(title, x + 84, y + 31, g_game.name[0] ? g_game.name : L("Trof\xc3\xa9us", "Trophies"), right - x - 84 - 90, FG);
+  if(mine && g_tr.count > 0) {
+    snprintf(line, sizeof line, L("Tens %d de %d trof\xc3\xa9us (%d%%) \xc2\xb7 os que faltam primeiro",
+             "You have %d of %d trophies (%d%%) \xc2\xb7 the ones to get first"), g_tr.earned, g_tr.count,
+             g_tr.earned * 100 / g_tr.count);
+  } else {
+    snprintf(line, sizeof line, "%s", L("Os trof\xc3\xa9us do jogo que est\xc3\xa1 a correr", "The trophies of the game that runs"));
+  }
+  text_fitted(small, x + 84, y + 63, line, right - x - 84 - 90, GREY);
+  round_button(Z_TR_CLOSE, S_X + S_W - 70, y + 32, ICON_CROSS);
+  if(mine && g_tr.count > 0) {
+    const int w = right - x, done = g_tr.earned * w / g_tr.count;
+    draw_box(&g_dst, x, y + 92, w, 8, 4, 0, CHIP);
+    if(done > 0) {
+      draw_box(&g_dst, x, y + 92, done < 8 ? 8 : done, 8, 4, 0, g_grade_colours[2]);
+    }
+  }
+
+  if(!mine) {
+    spinner(S_X + S_W / 2.0f, S_Y + S_H / 2.0f - 30, 30, 6, frame, ACCENT);
+    g_spinning = 1;
+    snprintf(line, sizeof line, "%s", L("A ler os trof\xc3\xa9us do jogo\xe2\x80\xa6", "Reading the game's trophies\xe2\x80\xa6"));
+    text(f, S_X + (S_W - width_of(f, line)) / 2, S_Y + S_H / 2 + 50, line, GREY);
+  } else if(g_tr.count < 0) {
+    draw_icon(&g_dst, ICON_TROPHY, S_X + S_W / 2 - 40, S_Y + S_H / 2 - 130, 80, DIM);
+    snprintf(line, sizeof line, "%s", L("Este jogo n\xc3\xa3o tem trof\xc3\xa9us nesta PS5", "This game has no trophies on this PS5"));
+    text(font(F_HEADING), S_X + (S_W - width_of(font(F_HEADING), line)) / 2, S_Y + S_H / 2 + 10, line, FG);
+    snprintf(line, sizeof line, "%s", L("A PS5 guarda os trof\xc3\xa9us de um jogo depois de ele ser jogado.",
+                                        "The PS5 keeps a game's trophies once it has been played."));
+    text(small, S_X + (S_W - width_of(small, line)) / 2, S_Y + S_H / 2 + 56, line, GREY);
+  } else {
+    first = g_tr.sel >= rows ? g_tr.sel - rows + 1 : 0;
+    for(int i=first; i < g_tr.count && i < first + rows; i++) {
+      const ui_trophy_row_t *r = &g_tr.rows[i];
+      const int ry = top + (i - first) * TR_ROW_H, cy = ry + (TR_ROW_H - 8) / 2;
+      const int focused = i == g_tr.sel && !g_ptr.shown;
+      const uint32_t colour = g_grade_colours[r->grade & 3];
+      const char *detail = r->detail[0] ? r->detail : r->name[0] ? "" :
+                           L("Ganha-o para veres o que \xc3\xa9.", "Earn it to see what it is.");
+      int name_w = right - x - 76 - (r->earned ? 50 : 190);
+      over = zone(Z_TR_ROW, i, 0, S_X + 20, ry, S_W - 40, TR_ROW_H - 8);
+      if(focused) {
+        draw_box(&g_dst, S_X + 20, ry, S_W - 40, TR_ROW_H - 8, 26, 0, CHIP_ON);
+      } else if(over) {
+        lit_box(S_X + 20, ry, S_W - 40, TR_ROW_H - 8, 26, 1);
+      }
+      draw_circle(&g_dst, x + 28, cy, 26, r->earned ? CHIP_ON : CHIP);
+      draw_icon(&g_dst, ICON_TROPHY, x + 12, cy - 16, 32, r->earned ? colour : (colour & 0x00ffffffu) | 0x8c000000u);
+      text_fitted(bold, x + 76, cy - 6, r->name[0] ? r->name : L("Trof\xc3\xa9u escondido", "Hidden trophy"), name_w,
+                  r->earned ? GREY : FG);
+      text_fitted(small, x + 76, cy + 28, detail, right - x - 76 - (r->earned ? 50 : 20), GREY);
+      if(r->earned) {
+        draw_icon(&g_dst, ICON_CHECK, right - 36, cy - 18, 36, GREEN);
+      } else if(focused || over) {
+        draw_icon(&g_dst, ICON_SPARK, right - 170, cy - 30, 26, ACCENT);
+        text_fitted(small, right - 138, cy - 9, L("Dica do Grok", "Grok's tip"), 138, ACCENT);
+      }
+    }
+  }
+  draw_hints(S_X + S_W / 2, S_Y + S_H - 56,
+             L("\xe2\x9c\x95 Dica do Grok  \xc2\xb7  \xe2\x96\xb3 Posts sobre ele  \xc2\xb7  \xe2\x96\xa1 Atualizar  \xc2\xb7  \xe2\x97\x8b Fechar",
+               "\xe2\x9c\x95 Grok's tip  \xc2\xb7  \xe2\x96\xb3 Posts about it  \xc2\xb7  \xe2\x96\xa1 Refresh  \xc2\xb7  \xe2\x97\x8b Close"));
+}
+
+
+/**
+ * the voice note being taped: how long, how loud of late, and why the
+ * microphone does not hear when it does not; ✕ stops it for the post
+ **/
+static void
+draw_voice(unsigned frame) {
+  text_font_t *title = font(F_BRAND), *small = font(F_SMALL), *clock = font(F_CODE), *f = font(F_LEGEND);
+  const int vw = 860, vh = 800, vx = S_X + (S_W - vw) / 2, vy = (UI_HEIGHT - vh) / 2, cx = vx + vw / 2;
+  const int cy = vy + 290, r = 96, making = g_voice.state == VOICE_MAKING;
+  const int failed = !making && g_voice.mic == UI_MIC_FAILED;
+  const int hearing = !making && g_voice.mic == UI_MIC_ON && !g_voice.silent;
+  const int seconds = (int)(g_voice.samples / VOICE_RATE);
+  const char *says, *label;
+  uint32_t colour = GREY;
+  char line[200], tail[32];
+  int w, lw, x;
+
+  draw_pane(vx, vy, vw, vh);
+  text_fitted(title, vx + 44, vy + 61, g_voice.dictate ? L("Ditar", "Dictate") : L("Nota de voz", "Voice note"),
+              vw - 44 - 110, FG);
+  if(g_voice.dictate) {
+    snprintf(line, sizeof line, "%s", L("O que disseres fica escrito no post, pela PS5, sem internet",
+                                        "What you say is written into the post, by the PS5, offline"));
+  } else if(g_voice.dm[0]) {
+    snprintf(line, sizeof line, L("Uma mensagem para %s", "A message to %s"), g_voice.dm_name);
+  } else if(g_compose.reply && g_compose.to.user[0]) {
+    snprintf(line, sizeof line, L("Para a tua resposta a @%s", "For your reply to @%s"), g_compose.to.user);
+  } else {
+    snprintf(line, sizeof line, "%s", g_compose.count ?
+             L("Para o teu post, no lugar das fotos e v\xc3\xad" "deos dele", "For your post, in place of its photos and videos") :
+             L("Para o teu post, como um v\xc3\xad" "deo", "For your post, as a video"));
+  }
+  text_fitted(small, vx + 44, vy + 93, line, vw - 44 - 110, GREY);
+  round_button(Z_VOICE_CLOSE, vx + vw - 70, vy + 62, ICON_CROSS);
+
+  // the microphone, a bead of the glass with a lit rim, ringed in the
+  // accent as loud as it hears
+  if(hearing) {
+    draw_circle(&g_dst, cx, cy, r + 14 + g_voice.level * 36, (ACCENT & 0x00ffffffu) | 0x22000000u);
+    draw_arc(&g_dst, cx, cy, r + 8 + g_voice.level * 22, 5, 0, 6.2832f, ACCENT);
+  } else if(!failed && !making && g_voice.mic != UI_MIC_ON) {
+    spinner(cx, cy, r + 14, 5, frame, ACCENT);
+    g_spinning = 1;
+  }
+  draw_circle(&g_dst, cx, cy, r, CHIP_ON);
+  draw_arc(&g_dst, cx, cy, r - 1, 2, 0, 6.2832f, RGBA(255, 255, 255, 70));
+  draw_icon(&g_dst, ICON_MIC, cx - 42, cy - 42, 84, hearing ? ACCENT : failed || g_voice.silent ? DIM : FG);
+
+  // how long, of the longest
+  snprintf(line, sizeof line, "%d:%02d", seconds / 60, seconds % 60);
+  snprintf(tail, sizeof tail, " / %d:%02d", (g_voice.dictate ? DICT_MAX_S : VOICE_MAX_SECONDS) / 60,
+           (g_voice.dictate ? DICT_MAX_S : VOICE_MAX_SECONDS) % 60);
+  w = width_of(clock, line);
+  lw = width_of(f, tail);
+  x = cx - (w + lw) / 2;
+  text(clock, x, vy + 486, line, FG);
+  text(f, x + w, vy + 486, tail, GREY);
+
+  // the loudness of the last seconds, the newest on the right
+  for(int i=0; i < VOICE_TRAIL; i++) {
+    const float v = g_voice.trail[(g_voice.trail_at + i) % VOICE_TRAIL];
+    const int h = 6 + (int)(v * 48 + 0.5f), bx = cx - (VOICE_TRAIL * 15 - 7) / 2 + i * 15;
+    const unsigned alpha = 70u + 185u * (unsigned)i / (VOICE_TRAIL - 1);
+    draw_box(&g_dst, bx, vy + 546 - h / 2, 8, h, 4, 0, v > 0 ? (ACCENT & 0x00ffffffu) | alpha << 24 : CHIP);
+  }
+
+  if(making && g_voice.dictate) {
+    says = L("A passar a texto, na PS5\xe2\x80\xa6", "Turning it into text, on the PS5\xe2\x80\xa6");
+  } else if(making) {
+    says = L("A fazer a nota de voz\xe2\x80\xa6", "Making the voice note\xe2\x80\xa6");
+  } else if(failed && !g_voice.code) {
+    says = L("Falta mem\xc3\xb3ria para gravar a nota.", "There is no memory to record the note.");
+    colour = RED;
+  } else if(failed) {
+    snprintf(line, sizeof line, L("O microfone n\xc3\xa3o abriu (0x%08X).", "The microphone did not open (0x%08X)."),
+             (unsigned)g_voice.code);
+    says = line;
+    colour = RED;
+  } else if(g_voice.mic != UI_MIC_ON) {
+    says = L("A abrir o microfone do comando\xe2\x80\xa6", "Opening the controller's microphone\xe2\x80\xa6");
+  } else if(g_voice.silent & UI_MIC_PRIORITY_LOW) {
+    says = L("Outra app, como o chat de grupo, est\xc3\xa1 a usar o microfone.",
+             "Another app, such as party chat, is using the microphone.");
+    colour = RED;
+  } else if(g_voice.silent & UI_MIC_NO_DEVICE) {
+    says = L("A PS5 n\xc3\xa3o encontra nenhum microfone.", "The PS5 finds no microphone.");
+    colour = RED;
+  } else if(g_voice.dictate) {
+    says = L("A ouvir o microfone do comando \xc2\xb7 o som n\xc3\xa3o sai da PS5.",
+             "Listening to the controller's microphone \xc2\xb7 the sound never leaves the PS5.");
+  } else if(g_voice.dm[0]) {
+    says = L("A gravar do microfone do comando \xc2\xb7 nada sai da PS5 at\xc3\xa9 a enviares.",
+             "Recording from the controller's microphone \xc2\xb7 nothing leaves the PS5 until you send it.");
+  } else {
+    says = L("A gravar do microfone do comando \xc2\xb7 nada sai da PS5 at\xc3\xa9 publicares.",
+             "Recording from the controller's microphone \xc2\xb7 nothing leaves the PS5 until you post.");
+  }
+  w = width_of(small, says) < vw - 88 ? width_of(small, says) : vw - 88;
+  text_fitted(small, cx - w / 2, vy + 612, says, vw - 88, colour);
+
+  label = failed ? L("Tentar de novo", "Try again") : g_voice.dictate ? L("Parar e escrever", "Stop and write") :
+          g_voice.dm[0] ? L("Parar e enviar", "Stop and send") :
+          L("Parar e juntar ao post", "Stop and add to the post");
+  w = width_of(font(F_PILL), label) + 64 + (making ? 40 : 0);
+  accent_pill(Z_VOICE_STOP, label, cx + w / 2, vy + 652, 64,
+              failed || (hearing && g_voice.samples >= (size_t)VOICE_RATE * VOICE_MIN_SECONDS), !g_ptr.shown && !making,
+              making, frame);
+  draw_hints(cx, vy + vh - 56, making ? L("\xe2\x97\x8b Cancelar", "\xe2\x97\x8b Cancel") : failed ?
+             L("\xe2\x9c\x95 Tentar de novo  \xc2\xb7  \xe2\x97\x8b Cancelar", "\xe2\x9c\x95 Try again  \xc2\xb7  \xe2\x97\x8b Cancel") :
+             g_voice.dictate ? L("\xe2\x9c\x95 Parar e escrever  \xc2\xb7  \xe2\x97\x8b Cancelar",
+                                 "\xe2\x9c\x95 Stop and write  \xc2\xb7  \xe2\x97\x8b Cancel") :
+             g_voice.dm[0] ? L("\xe2\x9c\x95 Parar e enviar  \xc2\xb7  \xe2\x97\x8b Cancelar",
+                               "\xe2\x9c\x95 Stop and send  \xc2\xb7  \xe2\x97\x8b Cancel") :
+             L("\xe2\x9c\x95 Parar e juntar ao post  \xc2\xb7  \xe2\x97\x8b Cancelar",
+               "\xe2\x9c\x95 Stop and add to the post  \xc2\xb7  \xe2\x97\x8b Cancel"));
+}
+
+
+/*
+ * Writing on the phone (src/phone.h): a window with a QR that opens a page
+ * on a phone in the same network; what is typed there shows here as it is
+ * typed, and goes into the post, or into the message, with ✕ here or with
+ * the page's Send. main.c asks the payload for it (ui_phone_wanted).
+ */
+
+#define PH_W     1180
+#define PH_H     800
+#define PH_QR    360
+#define PH_LINES 7
+
+static struct {
+  unsigned   serial;                     // the windows opened, for main.c
+  int        dm;                         // for the conversation dm_id, not for the composer
+  char       dm_id[X_ID_MAX];
+  char       dm_user[64];
+  char       draft[PHONE_TEXT_MAX + 1];  // what was written when it opened
+  char       text[PHONE_TEXT_MAX + 1];   // what the phone wrote
+  int        got;                        // the phone wrote something
+  int        max;                        // characters the text takes
+  const char *what;                      // "post", "reply", "dm"
+  ui_phone_t st;
+} g_phone;
+
+
+static void
+phone_open(void) {
+  g_phone.serial++;
+  g_phone.text[0] = 0;
+  g_phone.got = 0;
+  memset(&g_phone.st, 0, sizeof g_phone.st);
+  g_ptr.shown = 0;
+  g_sheet = SHEET_PHONE;
+}
+
+
+static int
+phone_open_compose(void) {
+  if(g_act.kind || g_compose.sending) {
+    return 0;
+  }
+  g_phone.dm = 0;
+  snprintf(g_phone.draft, sizeof g_phone.draft, "%s", g_compose.text);
+  g_phone.max = premium() ? LONG_MAX : POST_MAX;
+  g_phone.what = g_compose.reply ? "reply" : "post";
+  phone_open();
+  return 1;
+}
+
+
+static int
+phone_open_dm(tab_t *t) {
+  if(t->feed != UI_DM || g_act.kind) {
+    return 0;
+  }
+  if(strcmp(g_dm.conv, t->arg)) {
+    snprintf(g_dm.conv, sizeof g_dm.conv, "%s", t->arg);
+    g_dm.text[0] = 0;
+  }
+  g_phone.dm = 1;
+  snprintf(g_phone.dm_id, sizeof g_phone.dm_id, "%s", t->arg);
+  snprintf(g_phone.dm_user, sizeof g_phone.dm_user, "%s", t->user.user);
+  snprintf(g_phone.draft, sizeof g_phone.draft, "%s", g_dm.text);
+  g_phone.max = 10000;
+  g_phone.what = "dm";
+  phone_open();
+  return 1;
+}
+
+
+/**
+ * ○: the window closes, and what was written before stays
+ **/
+static int
+phone_close(void) {
+  g_sheet = g_phone.dm ? SHEET_NONE : SHEET_COMPOSE;
+  memset(g_phone.text, 0, sizeof g_phone.text);
+  return 1;
+}
+
+
+/**
+ * ✕, or the page's Send: what the phone wrote into the post (the composer
+ * comes back with it), or sent to the conversation
+ **/
+static int
+phone_use(void) {
+  const char *text = g_phone.got ? g_phone.text : g_phone.draft;
+
+  if(g_phone.dm) {
+    if(g_act.kind) {
+      return 0;
+    }
+    memset(&g_act, 0, sizeof g_act);
+    g_act.kind = UI_ACT_DM_TEXT;
+    g_act.taken = 1; // no keyboard: the words are here
+    snprintf(g_act.id, sizeof g_act.id, "%s", g_phone.dm_id);
+    snprintf(g_act.user, sizeof g_act.user, "%s", g_phone.dm_user);
+    ui_dm_text(text);
+    g_sheet = SHEET_NONE;
+  } else {
+    snprintf(g_compose.text, sizeof g_compose.text, "%s", text);
+    g_compose.focus = compose_can_send() ? C_FOCUS_SEND : C_FOCUS_TEXT;
+    g_sheet = SHEET_COMPOSE;
+  }
+  memset(g_phone.text, 0, sizeof g_phone.text);
+  return 1;
+}
+
+
+static int
+phone_keys(unsigned keys) {
+  if(keys & UI_CIRCLE) {
+    return phone_close();
+  }
+  if(keys & UI_CROSS) {
+    return phone_use();
+  }
+  return 0;
+}
+
+
+unsigned
+ui_phone_wanted(char *draft, size_t size, int *max, char *what, size_t wsize) {
+  if(g_sheet != SHEET_PHONE) {
+    return 0;
+  }
+  snprintf(draft, size, "%s", g_phone.draft);
+  *max = g_phone.max;
+  snprintf(what, wsize, "%s", g_phone.what ? g_phone.what : "post");
+  return g_phone.serial;
+}
+
+
+void
+ui_phone_status(const ui_phone_t *st) {
+  g_phone.st = *st;
+}
+
+
+void
+ui_phone_text(const char *text, int done) {
+  if(g_sheet != SHEET_PHONE) {
+    return;
+  }
+  snprintf(g_phone.text, sizeof g_phone.text, "%s", text);
+  g_phone.got = 1;
+  if(done) {
+    const int dm = g_phone.dm;
+    if(phone_use() && !dm) {
+      toast(0, "%s", L("O texto do telem\xc3\xb3vel est\xc3\xa1 no post.", "The text from your phone is in the post."));
+    }
+  }
+}
+
+
+/**
+ * the QR of the page's address with the window's token after '#', which the
+ * browser keeps to itself; NULL while there is none
+ **/
+static const qr_t *
+phone_qr(const char *ip, const char *token, char *url, size_t size) {
+  static qr_t qr;
+  static char made[64];
+
+  url[0] = 0;
+  if(!ip[0] || !token[0]) {
+    return NULL;
+  }
+  snprintf(url, size, "http://%s:%d/#%s", ip, PHONE_PORT, token);
+  if(strcmp(url, made)) {
+    if(qr_encode(url, strlen(url), &qr)) {
+      made[0] = 0;
+      return NULL;
+    }
+    snprintf(made, sizeof made, "%s", url);
+  }
+  return &qr;
+}
+
+
+static void
+draw_phone(unsigned frame) {
+  text_font_t *title = font(F_BRAND), *small = font(F_SMALL), *body = font(F_BODY), *bold = font(F_SIDE_BOLD);
+  const int vx = S_X + (S_W - PH_W) / 2, vy = (UI_HEIGHT - PH_H) / 2;
+  const int qx = vx + 60, qy = vy + 150, rx = qx + PH_QR + 70, rw = vx + PH_W - 56 - rx;
+  const ui_phone_t *st = &g_phone.st;
+  const char *shown = g_phone.got ? g_phone.text : g_phone.draft, *says;
+  uint16_t start[PH_LINES], len[PH_LINES];
+  char url[64] = "", line[160];
+  const qr_t *qr = st->state == UI_PHONE_WAITING ? phone_qr(st->ip, st->token, url, sizeof url) : NULL;
+  int lines, more, y, n;
+  uint32_t colour = GREY;
+
+  draw_pane(vx, vy, PH_W, PH_H);
+  text_fitted(title, vx + 44, vy + 61, L("Escrever no telem\xc3\xb3vel", "Write on your phone"), PH_W - 44 - 110, FG);
+  if(g_phone.dm) {
+    snprintf(line, sizeof line, L("Uma mensagem para @%s", "A message to @%s"), g_phone.dm_user);
+  } else {
+    snprintf(line, sizeof line, "%s", !strcmp(g_phone.what, "reply") ? L("A tua resposta", "Your reply") :
+             L("O teu post", "Your post"));
+  }
+  text_fitted(small, vx + 44, vy + 93, line, PH_W - 44 - 110, GREY);
+  round_button(Z_PHONE_CLOSE, vx + PH_W - 70, vy + 62, ICON_CROSS);
+
+  // the QR, or why there is none yet
+  if(qr) {
+    draw_qr(qr, qx, qy, PH_QR, 0);
+  } else {
+    draw_box(&g_dst, qx - 14, qy - 14, PH_QR + 28, PH_QR + 28, 30, 0, CHIP);
+    if(st->state == UI_PHONE_STARTING) {
+      spinner(qx + PH_QR / 2, qy + PH_QR / 2, 40, 5, frame, ACCENT);
+      g_spinning = 1;
+    } else {
+      draw_icon(&g_dst, ICON_PHONE, qx + PH_QR / 2 - 60, qy + PH_QR / 2 - 60, 120, DIM);
+    }
+  }
+  switch(st->state) {
+  case UI_PHONE_WAITING:
+    says = st->seen ? L("Telem\xc3\xb3vel ligado", "Phone connected") :
+           L("L\xc3\xaa com a c\xc3\xa2mara do telem\xc3\xb3vel", "Scan it with your phone's camera");
+    colour = st->seen ? GREEN : GREY;
+    break;
+  case UI_PHONE_NO_NETWORK:
+    says = L("A PS5 n\xc3\xa3o est\xc3\xa1 ligada \xc3\xa0 rede", "The PS5 is not on a network");
+    colour = RED;
+    break;
+  case UI_PHONE_NO_HELPER:
+    says = L("O servi\xc3\xa7o do XPS5 n\xc3\xa3o responde: fecha e abre o XPS5",
+             "XPS5's service does not answer: close and open XPS5");
+    colour = RED;
+    break;
+  default:
+    says = L("A preparar\xe2\x80\xa6", "Getting ready\xe2\x80\xa6");
+    break;
+  }
+  // what goes on, in up to three lines under it, then the address in two:
+  // the page's, and the window's token after '#'
+  y = qy + PH_QR + 62;
+  lines = break_lines(small, says, PH_QR + 28, 3, start, len, &more);
+  for(int i=0; i < lines; i++, y += 34) {
+    text_draw(small, &g_dst, qx - 14, y, says + start[i], len[i], colour);
+  }
+  if(url[0]) {
+    const char *hash = strchr(url, '#');
+
+    y += 6;
+    text_draw(small, &g_dst, qx - 14, y, url, hash ? (int)(hash - url) : (int)strlen(url), DIM);
+    if(hash) {
+      text_fitted(small, qx - 14, y + 34, hash, PH_QR + 28, DIM);
+    }
+  }
+
+  // the steps, then what the phone wrote as it comes
+  y = vy + 150;
+  text_fitted(bold, rx, baseline(bold, y, 44), L("1. L\xc3\xaa o QR com o telem\xc3\xb3vel", "1. Scan the QR with your phone"), rw, FG);
+  y += 48;
+  text_fitted(bold, rx, baseline(bold, y, 44), L("2. Escreve l\xc3\xa1: aparece aqui", "2. Type there: it shows here"), rw, FG);
+  y += 48;
+  text_fitted(bold, rx, baseline(bold, y, 44), L("3. Carrega em Enviar, ou em \xe2\x9c\x95 aqui", "3. Press Send, or \xe2\x9c\x95 here"), rw, FG);
+  y += 72;
+  draw_box(&g_dst, rx, y, rw, PH_LINES * LINE_H + 40, RADIUS, 0, RGBA(0, 0, 0, 40));
+  draw_box(&g_dst, rx, y, rw, PH_LINES * LINE_H + 40, RADIUS, 1.5f, g_phone.got ? ACCENT : EDGE);
+  if(shown[0]) {
+    lines = break_lines(body, shown, rw - 48, PH_LINES, start, len, &more);
+    for(int i=0; i < lines; i++) {
+      n = text_draw(body, &g_dst, rx + 24, baseline(body, y + 20 + i * LINE_H, LINE_H), shown + start[i], len[i], FG);
+      if(more && i == lines - 1) {
+        text(body, n, baseline(body, y + 20 + i * LINE_H, LINE_H), "\xe2\x80\xa6", FG);
+      }
+    }
+  } else {
+    text_fitted(body, rx + 24, baseline(body, y + 20, LINE_H),
+                L("O que escreveres no telem\xc3\xb3vel aparece aqui.", "What you type on the phone shows here."), rw - 48, DIM);
+  }
+  draw_hints(vx + PH_W / 2, vy + PH_H - 56, g_phone.dm ?
+             L("\xe2\x9c\x95 Enviar a mensagem  \xc2\xb7  \xe2\x97\x8b Cancelar", "\xe2\x9c\x95 Send the message  \xc2\xb7  \xe2\x97\x8b Cancel") :
+             L("\xe2\x9c\x95 Usar no post  \xc2\xb7  \xe2\x97\x8b Cancelar", "\xe2\x9c\x95 Use in the post  \xc2\xb7  \xe2\x97\x8b Cancel"));
+  (void)zone(Z_PHONE_USE, 0, 0, rx, y, rw, PH_LINES * LINE_H + 40);
+}
+
+
+/**
+ * Grok's card: a post translated, or what came in Following; its words
+ * (↑ ↓ through them, with a bar beside them), Grok at it, or why it did not
+ * answer and ✕ to ask again
+ **/
+static void
+draw_gcard(unsigned frame) {
+  text_font_t *title = font(F_BRAND), *small = font(F_SMALL), *body = font(F_BODY);
+  const int vx = S_X + (S_W - GC_W) / 2, vy = (UI_HEIGHT - GC_H) / 2;
+  const int bx = vx + 44, bw = GC_W - 88 - 24, top = vy + 156, tw = GC_W - 44 - 56 - 110;
+  const int translating = g_gcard.what == UI_GROK_TRANSLATE;
+  uint16_t start[GC_MOST], len[GC_MOST];
+  char line[300], why[160];
+  int lines = 0, more, first, y = top;
+
+  draw_pane(vx, vy, GC_W, GC_H);
+  draw_icon(&g_dst, ICON_SPARK, bx, vy + 40, 40, ACCENT);
+  text_fitted(title, bx + 56, vy + 61, translating ? L("Tradu\xc3\xa7\xc3\xa3o", "Translation") :
+              L("O que perdeste", "What you missed"), tw, FG);
+  if(translating) {
+    snprintf(line, sizeof line, L("Pelo Grok \xc2\xb7 o post de @%s", "By Grok \xc2\xb7 @%s's post"), g_gcard.user);
+  } else if(g_gcard.since) {
+    snprintf(line, sizeof line, L("Pelo Grok \xc2\xb7 %d posts do A seguir desde a \xc3\xbaltima vez",
+             "By Grok \xc2\xb7 %d posts in Following since last time"), g_gcard.count);
+  } else {
+    snprintf(line, sizeof line, L("Pelo Grok \xc2\xb7 os %d posts mais recentes do A seguir",
+             "By Grok \xc2\xb7 the %d newest posts in Following"), g_gcard.count);
+  }
+  text_fitted(small, bx + 56, vy + 93, line, tw, GREY);
+  round_button(Z_GCARD_CLOSE, vx + GC_W - 70, vy + 62, ICON_CROSS);
+  draw_box(&g_dst, bx, vy + 128, GC_W - 88, 1, 0, 0, EDGE);
+
+  if(g_gcard.pending || g_gcard.asking) {
+    spinner(bx + 14, y + LINE_H / 2.0f, 12, 4, frame, ACCENT);
+    g_spinning = 1;
+    text(body, bx + 44, baseline(body, y, LINE_H), translating ?
+         L("O Grok est\xc3\xa1 a traduzir\xe2\x80\xa6", "Grok is translating\xe2\x80\xa6") :
+         L("O Grok est\xc3\xa1 a ler os posts\xe2\x80\xa6", "Grok is reading the posts\xe2\x80\xa6"), GREY);
+  } else if(g_gcard.error) {
+    action_error(g_gcard.error, g_gcard.code, g_gcard.x_code, why, sizeof why);
+    snprintf(line, sizeof line, L("O Grok n\xc3\xa3o respondeu (%s)", "Grok did not answer (%s)"), why);
+    text_wrapped(body, bx, y, LINE_H, line, bw, RED);
+  } else {
+    lines = break_lines(body, g_gcard.answer, bw, GC_MOST, start, len, &more);
+    first = lines > GC_LINES ? (g_gcard.scroll > lines - GC_LINES ? lines - GC_LINES : g_gcard.scroll) : 0;
+    g_gcard.scroll = first;
+    for(int i=first; i < lines && i < first + GC_LINES; i++, y += LINE_H) {
+      text_draw(body, &g_dst, bx, baseline(body, y, LINE_H), g_gcard.answer + start[i], len[i], FG);
+    }
+    if(lines > GC_LINES) {
+      // where the lines shown are among them all
+      const int th = GC_LINES * LINE_H, bar = th * GC_LINES / lines, at = (th - bar) * first / (lines - GC_LINES);
+      draw_box(&g_dst, vx + GC_W - 40, top, 6, th, 3, 0, CHIP);
+      draw_box(&g_dst, vx + GC_W - 40, top + at, 6, bar < 24 ? 24 : bar, 3, 0, ACCENT);
+    }
+  }
+  draw_hints(vx + GC_W / 2, vy + GC_H - 56, g_gcard.error && !g_gcard.pending && !g_gcard.asking ?
+             L("\xe2\x9c\x95 Tentar outra vez  \xc2\xb7  \xe2\x97\x8b Fechar", "\xe2\x9c\x95 Try again  \xc2\xb7  \xe2\x97\x8b Close") :
+             lines > GC_LINES ? L("\xe2\x86\x91 \xe2\x86\x93 Ler  \xc2\xb7  \xe2\x97\x8b Fechar", "\xe2\x86\x91 \xe2\x86\x93 Read  \xc2\xb7  \xe2\x97\x8b Close") :
+             L("\xe2\x97\x8b Fechar", "\xe2\x97\x8b Close"));
+  if(g_gcard.error) {
+    (void)zone(Z_GCARD_RETRY, 0, 0, bx, top, GC_W - 88, 3 * LINE_H);
+  }
+}
+
+
 static void
 draw_sheet(long long now, unsigned frame) {
   switch(g_sheet) {
   case SHEET_SCHEDULED:
     draw_scheduled(now, frame);
+    break;
+  case SHEET_TROPHIES:
+    draw_trophies(frame);
+    break;
+  case SHEET_VOICE:
+    draw_voice(frame);
+    break;
+  case SHEET_PHONE:
+    draw_phone(frame);
+    break;
+  case SHEET_GROK:
+    draw_gcard(frame);
     break;
   case SHEET_MENU:
     draw_menu();
@@ -12025,12 +17595,20 @@ ui_draw(const text_surface_t *dst, long long now, unsigned frame) {
   g_player_wanted = 0;
   g_mini.here = 0;
   g_frame_no = frame;
+  gcard_go(); // Grok's card, once nothing else is being sent
   g_spinning = 0;
   images_frame();
   backdrop_aim(t);
   if(g_bg_dirty) {
     backdrop_draw();
     g_under_stale = 1;
+  }
+  trans_check(t, bytes, whole);
+  // the way in, while its dark covers the whole screen: only the letters
+  if(g_intro.state == INTRO_RUN && whole && intro_cover() >= 255) {
+    draw_intro();
+    g_trans.drawn = 1;
+    return;
   }
   // under a sheet, what was drawn there before while nothing there changed
   // (the ages too, every half a minute)
@@ -12079,10 +17657,20 @@ ui_draw(const text_surface_t *dst, long long now, unsigned frame) {
   if((g_sheet || g_viewer.open) && g_toast.frames > 0) {
     draw_snackbar();
   }
+  draw_trans(whole);
   if(g_ptr.shown) {
     draw_pointer();
   }
+  if(g_intro.state != INTRO_OFF) {
+    if(whole) {
+      draw_intro();
+    } else {
+      intro_end();
+    }
+  }
+  g_trans.drawn = 1;
   hover_check();
+  card_step();
   // nothing shows the video any more: it stops
   if(!g_player_wanted) {
     player_close();

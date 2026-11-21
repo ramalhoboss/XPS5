@@ -201,11 +201,35 @@ test_set(void) {
 }
 
 
+static void
+test_list(void) {
+  char conf[] = "{\"trophies\":[{\"id\":0,\"grade\":\"P\",\"hidden\":false},{\"id\":\"1\",\"grade\":\"G\"},"
+                "{\"id\":2,\"grade\":\"S\",\"hidden\":true},{\"grade\":\"B\"},{\"id\":3,\"grade\":\"B\"}]}";
+  char meta[] = "{\"metadata\":{\"trophyMetadata\":[{\"id\":2,\"name\":\"Secret\",\"detail\":\"Beat the\\nboss\"},"
+                "{\"id\":0,\"name\":\"All of them\",\"detail\":\"Earn every trophy\"}]}}";
+  char conf2[sizeof conf], bad[] = "{\"items\":[]}";
+  trophy_info_t list[8];
+
+  memcpy(conf2, conf, sizeof conf);
+  // the one without an id is left out; names where the meta has them
+  CHECK(trophy_list(conf, strlen(conf), meta, strlen(meta), list, 8) == 4);
+  CHECK(list[0].id == 0 && list[0].grade == TROPHY_PLATINUM && !list[0].hidden &&
+        !strcmp(list[0].name, "All of them") && !strcmp(list[0].detail, "Earn every trophy"));
+  CHECK(list[1].id == 1 && list[1].grade == TROPHY_GOLD && !list[1].name[0] && !list[1].detail[0]);
+  CHECK(list[2].id == 2 && list[2].grade == TROPHY_SILVER && list[2].hidden && !strcmp(list[2].detail, "Beat the boss"));
+  CHECK(list[3].id == 3 && list[3].grade == TROPHY_BRONZE);
+  // no meta, and room for two
+  CHECK(trophy_list(conf2, strlen(conf2), NULL, 0, list, 2) == 2 && !list[0].name[0]);
+  CHECK(trophy_list(bad, strlen(bad), NULL, 0, list, 8) == -1);
+}
+
+
 int
 main(void) {
   test_npbind();
   test_record();
   test_set();
+  test_list();
   if(g_failed) {
     return 1;
   }

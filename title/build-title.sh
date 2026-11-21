@@ -5,7 +5,7 @@
 # FSELF. Runs on Linux/WSL with clang 18 and python3.
 #
 # The title is the timeline screen (main.c, ui.c, draw.c, images.c, text.c,
-# video.c, ime.c, lang.c, player.c, sound.c, workers.c, loginlink.c) with the X
+# video.c, ime.c, lang.c, player.c, space.c, sound.c, workers.c, loginlink.c, jxr.c) with the X
 # and HTTPS code it shares with the payloads (src/; loginproto.h with the login
 # engine), stb_truetype and stb_image, the Inter and DejaVu fonts and the root
 # certificates, embedded as C arrays. video.c comes from
@@ -17,6 +17,10 @@
 # pthread_create, localtime_r and gmtime_r renamed to the functions of
 # ffmem.c (see there why).
 #
+# The PS5's HDR screenshots (.jxr) are decoded by jxrlib (Microsoft's JPEG XR
+# library, BSD 2-Clause), built by tools/jxrlib/build.sh into one archive,
+# its malloc, calloc, realloc and free renamed the same way.
+#
 # Usage: bash title/build-title.sh <out-dir>
 #   PS5VK   a PS5_Vulkan checkout with tools/setup-native-dependencies.sh done
 #           (default ~/src/PS5_Vulkan)
@@ -24,6 +28,9 @@
 #   FFMPEG  FFmpeg built for the PS5: include/ and lib/ with libavcodec.a,
 #           libswresample.a and libavutil.a (default: the one in
 #           ~/browserps5-build, read only)
+#   JXRLIB  where libxps5jxr.a for the PS5 is (default ~/xps5-build/jxrlib);
+#           built there from JXRLIB_SRC (default
+#           ~/xps5-build/jxrlib-dl/jxrlib-master) when it is not
 
 set -euo pipefail
 
@@ -33,6 +40,8 @@ root=$(cd -- "$here/.." && pwd)
 ps5vk=${PS5VK:-$HOME/src/PS5_Vulkan}
 work=${WORK:-$HOME/src/twps/app}
 ffmpeg=${FFMPEG:-$HOME/browserps5-build/media/stage-ffmpeg/user/homebrew}
+jxrlib=${JXRLIB:-$HOME/xps5-build/jxrlib}
+jxrlib_src=${JXRLIB_SRC:-$HOME/xps5-build/jxrlib-dl/jxrlib-master}
 export PATH=/usr/lib/llvm-18/bin:$PATH
 
 [[ -f $ffmpeg/lib/libavcodec.a && -f $ffmpeg/include/libavcodec/avcodec.h ]] || {
@@ -45,19 +54,48 @@ export PATH=/usr/lib/llvm-18/bin:$PATH
     exit 2
 }
 
+if [[ ! -f $jxrlib/libxps5jxr.a ]]; then
+    [[ -f $jxrlib_src/jxrgluelib/JXRGlue.c ]] || {
+        echo "no jxrlib in $jxrlib, nor its source in $jxrlib_src (set JXRLIB or JXRLIB_SRC)" >&2
+        exit 2
+    }
+    PS5VK=$ps5vk sh "$root/tools/jxrlib/build.sh" "$jxrlib_src" "$jxrlib" ps5
+fi
+
 # PS5_Vulkan's build script compiles every file under src/ and copies assets/
 # and probes/ into the title, so it runs in a tree of its own with only ours.
 mkdir -p "$work/src"
 for dir in tools tooling vendor runtime sce_sys; do
     rsync -a --delete "$ps5vk/$dir/" "$work/$dir/"
 done
-ln -sfn "$ps5vk/.deps" "$work/.deps"
+# PS5_Vulkan's .deps as links, with the SDK's library stubs in a directory of
+# our own: the build links every stub there, and the SDK has none of the
+# microphone's library (libSceAudioIn), which title/stubs makes
+rm -rf "$work/.deps"
+sdk="$ps5vk/.deps/native/ps5-payload-sdk"
+stubs="$work/.deps/native/ps5-payload-sdk/target/lib"
+mkdir -p "$stubs"
+link_all() { # <from> <the entry kept out> <to>, the hidden ones too (the SDK's revision)
+    for entry in "$1"/* "$1"/.[!.]*; do
+        [[ -e $entry || -L $entry ]] || continue
+        [[ ${entry##*/} == "$2" ]] || ln -s "$entry" "$3/${entry##*/}"
+    done
+}
+link_all "$ps5vk/.deps" native "$work/.deps"
+link_all "$ps5vk/.deps/native" ps5-payload-sdk "$work/.deps/native"
+link_all "$sdk" target "$work/.deps/native/ps5-payload-sdk"
+link_all "$sdk/target" lib "$work/.deps/native/ps5-payload-sdk/target"
+link_all "$sdk/target/lib" "" "$stubs"
+PS5_PAYLOAD_SDK="$sdk" sh "$ps5vk/tooling/prospero-clang18" -std=c11 -O2 -fPIC -Wall -Wextra -Werror \
+    -c "$here/stubs/audioin_link_stub.c" -o "$work/audioin_link_stub.o"
+"$sdk/bin/prospero-lld" --shared -soname libSceAudioIn.sprx -o "$stubs/libSceAudioIn.so" \
+    "$work/audioin_link_stub.o"
 rm -rf "$work"/src/*
 cp "$here"/main.c "$here"/ui.[ch] "$here"/draw.[ch] "$here"/images.[ch] \
-    "$here"/text.[ch] "$here"/video.[ch] "$here"/ime.[ch] "$here"/lang.[ch] \
-    "$here"/lang_table.h "$here"/player.[ch] "$here"/sound.[ch] "$here"/workers.[ch] "$here"/loginlink.[ch] \
-    "$here"/ffmem.c "$root/src/loginproto.h" "$work/src/"
-for name in json xapi xtid xsign play tls https mem settings mp4 captures jpeg game link qr update; do
+    "$here"/text.[ch] "$here"/video.[ch] "$here"/ime.[ch] "$here"/mic.[ch] "$here"/cards.[ch] "$here"/lang.[ch] \
+    "$here"/lang_table.h "$here"/player.[ch] "$here"/space.[ch] "$here"/sound.[ch] "$here"/workers.[ch] "$here"/loginlink.[ch] \
+    "$here"/jxr.[ch] "$here"/ffmem.c "$root/src/loginproto.h" "$root/src/dictproto.h" "$work/src/"
+for name in json xapi xchat xtid xsign play tls https mem settings mp4 clip hls radio spacecmd captures jpeg ultrahdr game link qr update sessions seen voice xcrypt juicebox xchatopen phone; do
     cp "$root/src/$name.c" "$root/src/$name.h" "$work/src/"
 done
 
@@ -72,6 +110,27 @@ for lib in avcodec swresample avutil; do
         --redefine-sym=localtime_r=ff_sys_localtime_r --redefine-sym=gmtime_r=ff_sys_gmtime_r \
         "$ffmpeg/lib/lib$lib.a" "$work/ffmpeg/lib/lib$lib.a"
 done
+# jxrlib, its memory sent to ffmem.c too
+llvm-objcopy --redefine-sym=malloc=ff_sys_malloc --redefine-sym=calloc=ff_sys_calloc \
+    --redefine-sym=realloc=ff_sys_realloc --redefine-sym=free=ff_sys_free \
+    "$jxrlib/libxps5jxr.a" "$work/ffmpeg/lib/libxps5jxr.a"
+
+# X Chat's cryptography (libsodium and BearSSL): one archive, its memory sent
+# to ffmem.c too so Argon2's 16 MiB comes from the PS5's flexible memory, not
+# the title's small heap. xcrypt.c and juicebox.c link against it.
+# -DNDEBUG: the PS5 libc has no __assert, and libsodium's asserts (blake2b,
+# base64, generichash) are only sanity checks, so they are compiled out
+PS5_PAYLOAD_SDK="$sdk" sh "$root/tools/build-crypto.sh" \
+    sh "$ps5vk/tooling/prospero-clang18" -std=c11 -O2 -fPIC -DNDEBUG -- llvm-ar "$work/libxps5crypto-raw.a" >/dev/null
+llvm-objcopy --redefine-sym=malloc=ff_sys_malloc --redefine-sym=calloc=ff_sys_calloc \
+    --redefine-sym=realloc=ff_sys_realloc --redefine-sym=free=ff_sys_free \
+    --redefine-sym=posix_memalign=ff_sys_posix_memalign \
+    "$work/libxps5crypto-raw.a" "$work/libxps5crypto.a"
+rm -rf "$work/crypto"
+mkdir -p "$work/crypto"
+cp -r "$root/third_party/libsodium/src/include" "$work/crypto/sodium"
+cp -r "$root/third_party/bearssl/inc" "$work/crypto/bearssl"
+
 cp "$root/third_party/stb/stb_truetype.h" "$root/third_party/stb/stb_image.h" "$work/src/"
 python3 "$root/tools/embed.py" "$work/src/certs.h" \
     "isrg_root_x1_pem=$root/certs/isrg-root-x1.pem" \
@@ -84,13 +143,15 @@ python3 "$root/tools/embed.py" "$work/src/fonts.h" \
     "inter_bold=$here/fonts/Inter-Bold.ttf" \
     "dejavu_sans=$here/fonts/DejaVuSans.ttf" \
     "dejavu_sans_bold=$here/fonts/DejaVuSans-Bold.ttf" \
-    "xps5_logo=$here/art/logo.png"
+    "xps5_logo=$here/art/logo.png" \
+    "xps5_logo_full=$here/art/logo-full.png"
 
 # The build script keeps the compilers' warnings to itself when they pass,
 # so our sources go through the same compiler first with warnings as errors.
 for source in "$work"/src/*.c; do
     PS5_PAYLOAD_SDK="$ps5vk/.deps/native/ps5-payload-sdk" sh "$work/tooling/prospero-clang18" \
-        -std=c11 -O2 -Wall -Wextra -Werror -fsyntax-only -I "$work/ffmpeg/include" "$source"
+        -std=c11 -O2 -Wall -Wextra -Werror -fsyntax-only -I "$work/ffmpeg/include" \
+        -I "$work/crypto/sodium" -I "$work/crypto/bearssl" "$source"
 done
 
 # The script only accepts PPSA identities; the eboot does not carry the title
@@ -110,8 +171,8 @@ PY
 # app_crt.cpp calls ps5_fp_ieee, which lives in the SDK fork's platform
 # archive; FFmpeg's archives go in the order they call each other.
 PARAM_PATH="$work/param-build.json" \
-APP_INCLUDE_PATHS=ffmpeg/include \
-APP_STATIC_ARCHIVES="ffmpeg/lib/libavcodec.a ffmpeg/lib/libswresample.a ffmpeg/lib/libavutil.a .deps/native/ps5-payload-sdk/target/lib/libps5platform.a" \
+APP_INCLUDE_PATHS="ffmpeg/include crypto/sodium crypto/bearssl" \
+APP_STATIC_ARCHIVES="libxps5crypto.a ffmpeg/lib/libxps5jxr.a ffmpeg/lib/libavcodec.a ffmpeg/lib/libswresample.a ffmpeg/lib/libavutil.a .deps/native/ps5-payload-sdk/target/lib/libps5platform.a" \
     bash "$work/tools/build.sh" Folder
 
 mkdir -p "$out"

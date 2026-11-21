@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="referrer" content="no-referrer">
+  <meta name="color-scheme" content="dark light">
+  <title>XPS5</title>
+  <link rel="stylesheet" href="phone.css">
+  <script src="phone.js" defer></script>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="brand">XPS5</p>
+      <p id="status" class="status" role="status" data-t="connecting">Connecting to the PS5&#8230;</p>
+    </header>
+
+    <h1 id="title" data-t="post">Write your post</h1>
+
+    <label class="box" for="text">
+      <span class="sr" data-t="field">What you write</span>
+      <textarea id="text" rows="8" autocomplete="off" autocapitalize="sentences" spellcheck="true"
+                enterkeyhint="send" disabled></textarea>
+    </label>
+
+    <div class="row">
+      <span id="count" class="count" aria-live="polite"></span>
+      <button id="send" type="button" class="send" disabled data-t="send">Send to the PS5</button>
+    </div>
+
+    <p class="hint" data-t="hint">What you type shows on the TV as you type it.</p>
+    <p id="error" class="error" role="alert" hidden></p>
+  </main>
+</body>
+</html>

@@ -10,12 +10,18 @@ Run with tests/preview.sh <out-dir>. */
 #include <stdlib.h>
 #include <string.h>
 
+#include "cards.h"
+#include "clip.h"
+#include "dictproto.h"
 #include "game.h"
 #include "images.h"
 #include "loginproto.h"
 #include "mem.h"
 #include "play.h"
+#include "seen.h"
+#include "sessions.h"
 #include "player.h"
+#include "space.h"
 #include "text.h"
 #include "ui.h"
 #include "workers.h"
@@ -288,6 +294,12 @@ player_sound(int on) {
 
 
 void
+player_speaker(int on) {
+  (void)on;
+}
+
+
+void
 player_status(player_status_t *st) {
   memset(st, 0, sizeof *st);
   st->state = !g_video[0] ? PLAYER_IDLE : g_paused ? PLAYER_PAUSED : PLAYER_PLAYING;
@@ -317,6 +329,56 @@ player_changed(void) {
 
   g_video_changed = 0;
   return changed;
+}
+
+
+/*
+ * A Space in the background (space.h): main.c plays it; here it is on the
+ * air at once, 1 min 23 s in, until it is stopped.
+ */
+
+static int g_space_state, g_space_live;
+
+void
+space_init(void (*log)(const char *fmt, ...), int (*ask)(const char *cmd, char *answer, size_t size)) {
+  (void)log;
+  (void)ask;
+}
+
+
+void
+space_play(const char *url, int live, const char *id, const char *host) {
+  (void)id;
+  (void)host;
+  g_space_state = strncmp(url, "https://", 8) ? SPACE_FAILED : SPACE_ON;
+  g_space_live = live;
+}
+
+
+void
+space_stop(void) {
+  g_space_state = SPACE_IDLE;
+}
+
+
+void
+space_hush(int on) {
+  (void)on;
+}
+
+
+void
+space_status(space_status_t *s) {
+  memset(s, 0, sizeof *s);
+  s->state = g_space_state;
+  s->heard_ms = g_space_state == SPACE_ON ? 83000 : 0;
+}
+
+
+int
+space_found(x_space_t *s) {
+  (void)s;
+  return 0;
 }
 
 
@@ -425,6 +487,9 @@ make_posts(x_post_t *posts) {
   snprintf(p->quote_text, sizeof p->quote_text,
            "Dica: na PS5 podes manter o bot\xc3\xa3o PS carregado para ir direto ao centro de "
            "controlo. Poupa imenso tempo quando est\xc3\xa1s a meio de um jogo.");
+  // a Community Note under it, as x.com shows one
+  snprintf(p->note, sizeof p->note, "Manter o bot\xc3\xa3o PS carregado abre o menu inicial. O centro de "
+           "controlo abre com um toque curto. https://t.co/ps5ajuda");
 
   p = post(&posts[n++], "Ana Lopes \xf0\x9f\x90\xb1", "analopes", X_BADGE_NONE, 26 * 3600,
            "O meu gato descobriu o comando \xf0\x9f\x98\x82", 120, 940, 15200, 410000);
@@ -580,7 +645,8 @@ make_people(x_post_t *posts) {
 
 
 /**
- * the people the user follows, as Following gives them: three play now
+ * the people the user follows, as Following gives them: two play now, and
+ * one is on XPS5 with no game
  **/
 static int
 make_friends(x_post_t *posts) {
@@ -589,7 +655,7 @@ make_friends(x_post_t *posts) {
     {"PlayStation", "PlayStation", "", X_BADGE_GOLD},
     {"anaplays", "Ana \xc2\xb7 speedruns e caf\xc3\xa9 com um nome bem comprido",
      "Marvel's Spider-Man\xe2\x80\xa6", X_BADGE_BLUE},
-    {"pedrosilva", "Pedro Silva", "Gran Turismo 7", X_BADGE_NONE},
+    {"pedrosilva", "Pedro Silva", "", X_BADGE_NONE},
     {"martaf", "Marta Ferreira", "", X_BADGE_NONE},
   };
   int n = 0;
@@ -603,6 +669,7 @@ make_friends(x_post_t *posts) {
     snprintf(p->name, sizeof p->name, "%s", made[i].name);
     snprintf(p->avatar, sizeof p->avatar, "https://pbs.twimg.com/profile_images/1/%s_normal.jpg", made[i].user);
     snprintf(p->playing, sizeof p->playing, "%s", made[i].game);
+    p->online = !strcmp(made[i].user, "pedrosilva");
     p->badge = made[i].badge;
     p->following = 1;
   }
@@ -840,6 +907,10 @@ settle(void) {
 }
 
 
+static int  card_drawn(const char *dir, const char *name);
+static void card_made(int n);
+
+
 static int
 draw(const char *dir, const char *name) {
   text_surface_t screen = {g_pixels, UI_WIDTH, UI_HEIGHT, g_scale, 0};
@@ -918,6 +989,7 @@ make_chats(x_post_t *p) {
     {"55", "", "Squad PS5", "Eu levo o comando extra", 0, 0, 0, 1, X_DM_TEXT, 3600},
     {"1-91", "anacosta", "Ana Costa", "", 1, 1, 0, 0, X_DM_PHOTO, 7200},
     {"1-42", "pedrosilva", "Pedro Silva", "Obrigado pela dica do trof\xc3\xa9u!", 0, 0, 1, 0, X_DM_TEXT, 86400 * 3},
+    {"g8812", "inesgomes", "In\xc3\xaas Gomes", "", 1, 0, 0, 0, X_DM_TEXT, 86400 * 4},
   };
   int n = sizeof c / sizeof c[0];
 
@@ -947,12 +1019,156 @@ make_chats(x_post_t *p) {
     p[i].replies = p[i].reposts = p[i].likes = p[i].views = -1;
   }
   snprintf(p[0].playing, sizeof p[0].playing, "ASTRO BOT");
+  p[3].online = 1; // Pedro, on XPS5
+  p[4].xchat = p[4].sealed = 1; // Inês wrote on X Chat: encrypted
   return n;
 }
 
 
 /**
- * a conversation with João, oldest first: his, the user's (me) and his,
+ * the people of the group "Squad PS5" as its answer lists them, the user
+ * (me) among them: two play, one is on XPS5, two are not around
+ **/
+static int
+make_party(x_post_t *p, const char *me) {
+  static const struct { const char *user, *name, *game; int online; } made[] = {
+    {"ritasousa", "Rita Sousa", "", 1},
+    {"pedrosilva", "Pedro Silva", "", 0},
+    {"tiagolopes", "Tiago Lopes", "", 1},
+    {"anacosta", "Ana Costa", "ASTRO BOT", 0},
+    {"joaomarques", "Jo\xc3\xa3o Marques", "Gran Turismo 7", 0},
+    {"martaf", "Marta Ferreira", "", 0},
+  };
+  int n = sizeof made / sizeof made[0];
+
+  memset(p, 0, n * sizeof *p);
+  for(int i=0; i < n; i++) {
+    p[i].kind = X_KIND_USER;
+    if(i) {
+      snprintf(p[i].user_id, sizeof p[i].user_id, "%u", 1000 + hash(made[i].user) % 9000);
+    } else {
+      snprintf(p[i].user_id, sizeof p[i].user_id, "%s", me);
+    }
+    snprintf(p[i].user, sizeof p[i].user, "%s", made[i].user);
+    snprintf(p[i].name, sizeof p[i].name, "%s", made[i].name);
+    snprintf(p[i].avatar, sizeof p[i].avatar, "https://pbs.twimg.com/profile_images/1/%s_normal.jpg", made[i].user);
+    snprintf(p[i].playing, sizeof p[i].playing, "%s", made[i].game);
+    p[i].online = made[i].online;
+    p[i].badge = i == 4 ? X_BADGE_BLUE : X_BADGE_NONE;
+    p[i].replies = p[i].reposts = p[i].likes = p[i].views = -1;
+  }
+  return n;
+}
+
+
+/**
+ * the group's messages, oldest first, the user's (me) among them
+ **/
+static int
+make_group(x_post_t *p, const char *me) {
+  static const struct { const char *user, *name, *text; int ago; } m[] = {
+    {"anacosta", "Ana Costa", "Quem entra hoje \xc3\xa0 noite?", 5400},
+    {"tiagolopes", "Tiago Lopes", "Eu! S\xc3\xb3 tenho de acabar o jantar", 5000},
+    {"", "Rita Sousa", "Contem comigo \xf0\x9f\x8e\xae", 4200},
+    {"anacosta", "Ana Costa", "Eu levo o comando extra", 3600},
+  };
+  int n = sizeof m / sizeof m[0];
+
+  memset(p, 0, n * sizeof *p);
+  for(int i=0; i < n; i++) {
+    p[i].kind = X_KIND_DM;
+    p[i].group = 1;
+    snprintf(p[i].id, sizeof p[i].id, "%d", 5500 + i);
+    p[i].mine = !m[i].user[0];
+    if(p[i].mine) {
+      snprintf(p[i].user_id, sizeof p[i].user_id, "%s", me);
+      snprintf(p[i].user, sizeof p[i].user, "ritasousa");
+    } else {
+      snprintf(p[i].user_id, sizeof p[i].user_id, "%u", 1000 + hash(m[i].user) % 9000);
+      snprintf(p[i].user, sizeof p[i].user, "%s", m[i].user);
+      snprintf(p[i].avatar, sizeof p[i].avatar, "https://pbs.twimg.com/profile_images/1/%s_normal.jpg", m[i].user);
+    }
+    snprintf(p[i].name, sizeof p[i].name, "%s", m[i].name);
+    snprintf(p[i].text, sizeof p[i].text, "%s", m[i].text);
+    p[i].icon = X_DM_TEXT;
+    p[i].time = NOW - m[i].ago;
+    p[i].replies = p[i].reposts = p[i].likes = p[i].views = -1;
+  }
+  return n;
+}
+
+
+/**
+ * the group on X Chat, oldest first: who made it and added people, a
+ * message with reactions, the user's reply to it (edited), one taken
+ * back, a missed call, a file and a reply to it, a screenshot, a video
+ * call and messages that disappear
+ **/
+static int
+make_xchat_group(x_post_t *p, const char *me) {
+  static const struct { const char *user, *name; int icon, event; long long n; const char *text; int ago; } m[] = {
+    {"anacosta", "Ana Costa", X_DM_EVENT, X_EV_GROUP_MADE, 0, "Squad PS5", 9000},
+    {"anacosta", "Ana Costa", X_DM_EVENT, X_EV_ADDED, 2, "", 8990},
+    {"anacosta", "Ana Costa", X_DM_TEXT, 0, 0, "Quem alinha no torneio de s\xc3\xa1" "bado?", 7200},
+    {"", "Rita Sousa", X_DM_TEXT, 0, 0, "Eu! Levo o comando extra \xf0\x9f\x8e\xae", 7000},
+    {"tiagolopes", "Tiago Lopes", X_DM_DELETED, 0, 0, "", 6800},
+    {"anacosta", "Ana Costa", X_DM_CALL, X_EV_CALL_MISSED, 0, "", 5000},
+    {"anacosta", "Ana Costa", X_DM_FILE, 0, 0, "As regras, para lerem antes", 4000},
+    {"tiagolopes", "Tiago Lopes", X_DM_TEXT, 0, 0, "Perfeito, li tudo \xf0\x9f\x91\x8c", 3500},
+    {"tiagolopes", "Tiago Lopes", X_DM_EVENT, X_EV_SCREENSHOT, 1, "", 3400},
+    {"", "Rita Sousa", X_DM_CALL, X_EV_CALL_ENDED, 754, "", 600},
+    {"", "Rita Sousa", X_DM_EVENT, X_EV_DISAPPEAR, 86400, "", 300},
+  };
+  int n = sizeof m / sizeof m[0];
+
+  memset(p, 0, n * sizeof *p);
+  for(int i=0; i < n; i++) {
+    p[i].kind = X_KIND_DM;
+    p[i].group = 1;
+    p[i].xchat = 1;
+    snprintf(p[i].id, sizeof p[i].id, "%d", 5600 + i);
+    p[i].mine = !m[i].user[0];
+    if(p[i].mine) {
+      snprintf(p[i].user_id, sizeof p[i].user_id, "%s", me);
+      snprintf(p[i].user, sizeof p[i].user, "ritasousa");
+    } else {
+      snprintf(p[i].user_id, sizeof p[i].user_id, "%u", 1000 + hash(m[i].user) % 9000);
+      snprintf(p[i].user, sizeof p[i].user, "%s", m[i].user);
+      snprintf(p[i].avatar, sizeof p[i].avatar, "https://pbs.twimg.com/profile_images/1/%s_normal.jpg", m[i].user);
+    }
+    snprintf(p[i].name, sizeof p[i].name, "%s", m[i].name);
+    snprintf(p[i].text, sizeof p[i].text, "%s", m[i].text);
+    p[i].icon = m[i].icon;
+    p[i].event = m[i].event;
+    p[i].event_n = m[i].n;
+    p[i].time = NOW - m[i].ago;
+    p[i].replies = p[i].reposts = p[i].likes = p[i].views = -1;
+  }
+  // reactions on Ana's question, the user's among them
+  snprintf(p[2].reactions, sizeof p[2].reactions, "\xf0\x9f\x94\xa5\xf0\x9f\x91\x8d");
+  p[2].reaction_count = 3;
+  p[2].reacted = 1;
+  // the user's reply to it, edited since
+  snprintf(p[3].quote_name, sizeof p[3].quote_name, "Ana Costa");
+  snprintf(p[3].quote_user, sizeof p[3].quote_user, "%s", p[2].user_id);
+  snprintf(p[3].quote_text, sizeof p[3].quote_text, "%s", p[2].text);
+  p[3].edited = 1;
+  // the file, and Tiago's reply to it
+  snprintf(p[6].file_name, sizeof p[6].file_name, "regras-do-torneio.pdf");
+  p[6].file_size = 2400000;
+  snprintf(p[7].quote_name, sizeof p[7].quote_name, "Ana Costa");
+  p[7].quote_badge = X_DM_FILE;
+  snprintf(p[7].reactions, sizeof p[7].reactions, "\xe2\x9d\xa4\xef\xb8\x8f");
+  p[7].reaction_count = 1;
+  // a video call
+  p[9].event_video = 1;
+  return n;
+}
+
+
+/**
+ * a conversation with João, oldest first: his, the user's (me) and his (a
+ * photo, a video and a voice note of X Chat among them),
  * the newest an invite to the game he plays
  **/
 static int
@@ -963,6 +1179,8 @@ make_messages(x_post_t *p, const char *me) {
     {0, "", X_DM_PHOTO, 6900},
     {1, "Que loucura \xf0\x9f\x98\x82 Logo \xc3\xa0 noite jogamos, combinado?", X_DM_TEXT, 600},
     {0, "Bora jogar logo \xc3\xa0 noite? Tenho o novo mapa", X_DM_TEXT, 240},
+    {1, "", X_DM_VOICE, 200},
+    {0, "O mapa novo \xf0\x9f\x91\x80", X_DM_VIDEO, 160},
     {0, "\xf0\x9f\x8e\xae ASTRO BOT \xc2\xb7 bora jogar? (XPS5 PPSA07399)", X_DM_INVITE, 120},
   };
   int n = sizeof m / sizeof m[0];
@@ -986,8 +1204,134 @@ make_messages(x_post_t *p, const char *me) {
     p[i].icon = m[i].icon;
     p[i].time = NOW - m[i].ago;
     p[i].replies = p[i].reposts = p[i].likes = p[i].views = -1;
+    if(m[i].icon == X_DM_PHOTO || m[i].icon == X_DM_VIDEO || m[i].icon == X_DM_VOICE) {
+      // X Chat's, encrypted: what xchat.c's put_media makes of it
+      x_media_t *media = &p[i].media[0];
+      p[i].xchat = 1;
+      p[i].media_count = 1;
+      snprintf(media->url, sizeof media->url, "https://ton.x.com/xchat/media/%d", 5000 + i);
+      media->width = 1280;
+      media->height = 720;
+      media->xchat = 1;
+      memset(media->xchat_key, i, sizeof media->xchat_key);
+      if(m[i].icon != X_DM_PHOTO) {
+        snprintf(media->video_url, sizeof media->video_url, "file://xchat/%016x", 5000 + i);
+        media->video = m[i].icon == X_DM_VIDEO;
+        media->voice = m[i].icon == X_DM_VOICE;
+        media->duration_ms = media->voice ? 14000 : 31000;
+      }
+    }
   }
   return n;
+}
+
+
+/**
+ * who XPS5 saw around before the look of the Friends scene, five minutes
+ * before it: Ana and Tiago already played, João was seen yesterday, Inês
+ * three hours ago in the game that runs, Hugo two days ago on XPS5
+ **/
+static void
+make_seen(seen_t *s) {
+  static const struct {
+    const char *user, *name, *game, *games[SEEN_GAMES];
+    int state;
+    long long ago;
+  } made[] = {
+    {"joaomarques", "Jo\xc3\xa3o Marques", "ASTRO BOT", {"ASTRO BOT", "Gran Turismo\xe2\x84\xa2 7", "Returnal"},
+     SEEN_AWAY, 86400 + 4000},
+    {"anaplays", "Ana", "Marvel's Spider-Man\xe2\x80\xa6", {"Marvel's Spider-Man\xe2\x80\xa6", "ASTRO BOT", ""},
+     SEEN_PLAYING, 300},
+    {"tiagolopes", "Tiago Lopes", "Gran Turismo\xe2\x84\xa2 7", {"Gran Turismo\xe2\x84\xa2 7", "", ""}, SEEN_PLAYING, 300},
+    {"pedrosilva", "Pedro Silva", "", {"Returnal", "", ""}, SEEN_AWAY, 3 * 86400},
+    {"inesgomes", "In\xc3\xaas Gomes", "Gran Turismo\xe2\x84\xa2 7", {"Gran Turismo\xe2\x84\xa2 7", "ASTRO BOT", ""},
+     SEEN_AWAY, 3 * 3600},
+    {"hugoreis", "Hugo Reis", "", {"Returnal", "", ""}, SEEN_AWAY, 2 * 86400 + 600},
+  };
+  static const struct { const char *user, *name, *game; long long ago; } news[] = {
+    {"inesgomes", "In\xc3\xaas Gomes", "Gran Turismo\xe2\x84\xa2 7", 3 * 3600 + 1800},
+    {"joaomarques", "Jo\xc3\xa3o Marques", "ASTRO BOT", 86400 + 9000},
+    {"hugoreis", "Hugo Reis", "", 2 * 86400 + 4000},
+  };
+
+  memset(s, 0, sizeof *s);
+  s->looked = NOW - 300;
+  for(size_t i=0; i < sizeof made / sizeof made[0]; i++) {
+    seen_person_t *p = &s->people[s->count++];
+    snprintf(p->id, sizeof p->id, "%u", 1000 + hash(made[i].user) % 9000);
+    p->at = NOW - made[i].ago;
+    p->state = made[i].state;
+    p->in = s->looked;
+    snprintf(p->game, sizeof p->game, "%s", made[i].game);
+    for(int g=0; g < SEEN_GAMES; g++) {
+      snprintf(p->games[g], sizeof p->games[g], "%s", made[i].games[g]);
+    }
+  }
+  for(size_t i=0; i < sizeof news / sizeof news[0]; i++) {
+    seen_event_t *e = &s->event[s->events++];
+    e->at = NOW - news[i].ago;
+    snprintf(e->id, sizeof e->id, "%u", 1000 + hash(news[i].user) % 9000);
+    snprintf(e->game, sizeof e->game, "%s", news[i].game);
+    snprintf(e->name, sizeof e->name, "%s", news[i].name);
+    snprintf(e->user, sizeof e->user, "%s", news[i].user);
+    snprintf(e->avatar, sizeof e->avatar, "https://pbs.twimg.com/profile_images/1/%s_normal.jpg", news[i].user);
+  }
+}
+
+
+/**
+ * the people the user follows as the Friends tab reads them: Following's
+ * five, and three more (one plays the game that runs here)
+ **/
+static int
+make_all_friends(x_post_t *posts) {
+  static const struct { const char *user, *name, *game, *bio; } more[] = {
+    {"inesgomes", "In\xc3\xaas Gomes", "", "Fotos em modo foto e platinas lentas \xf0\x9f\x93\xb8"},
+    {"tiagolopes", "Tiago Lopes", "Gran Turismo\xe2\x84\xa2 7", ""},
+    {"hugoreis", "Hugo Reis", "", "Roguelikes, caf\xc3\xa9 e pouco sono"},
+  };
+  int n = make_friends(posts);
+
+  snprintf(posts[4].text, sizeof posts[4].text, "Jogos de ritmo e speedruns ao domingo");
+  for(size_t i=0; i < sizeof more / sizeof more[0]; i++, n++) {
+    x_post_t *p = &posts[n];
+    memset(p, 0, sizeof *p);
+    p->kind = X_KIND_USER;
+    snprintf(p->user_id, sizeof p->user_id, "%u", 1000 + hash(more[i].user) % 9000);
+    snprintf(p->user, sizeof p->user, "%s", more[i].user);
+    snprintf(p->name, sizeof p->name, "%s", more[i].name);
+    snprintf(p->avatar, sizeof p->avatar, "https://pbs.twimg.com/profile_images/1/%s_normal.jpg", more[i].user);
+    snprintf(p->playing, sizeof p->playing, "%s", more[i].game);
+    snprintf(p->text, sizeof p->text, "%s", more[i].bio);
+    p->following = 1;
+  }
+  return n;
+}
+
+
+/**
+ * the user's week of play, as the payload sums it
+ **/
+static void
+make_week_info(week_t *w) {
+  static const struct { const char *id, *name; int hours, minutes, trophies, times; } g[] = {
+    {"PPSA01316", "Gran Turismo\xe2\x84\xa2 7", 5, 40, 4, 3}, {"PPSA07399", "ASTRO BOT", 3, 15, 7, 2},
+    {"PPSA01399", "Uncharted\xe2\x84\xa2: Drake's Fortune Remastered", 1, 5, 1, 1},
+  };
+
+  memset(w, 0, sizeof *w);
+  for(size_t i=0; i < sizeof g / sizeof g[0]; i++) {
+    for(int k=0; k < g[i].times; k++) {
+      session_t one;
+      memset(&one, 0, sizeof one);
+      snprintf(one.id, sizeof one.id, "%s", g[i].id);
+      snprintf(one.name, sizeof one.name, "%s", g[i].name);
+      one.start = NOW - 86400 * (k + 1);
+      one.end = one.start + (g[i].hours * 3600 + g[i].minutes * 60) / g[i].times;
+      one.trophies[0] = k ? 0 : g[i].trophies;
+      week_add(w, &one);
+    }
+  }
 }
 
 
@@ -995,6 +1339,367 @@ static int
 fail(const char *what) {
   fprintf(stderr, "%s\n", what);
   return 1;
+}
+
+
+/**
+ * the question of a hint for Grok's page, as main.c takes it; -1 when what
+ * goes is not a hint
+ **/
+static int
+grok_get(char *question, size_t qsize, char *game, size_t gsize, int *fresh) {
+  char author[64];
+  int what = -1, n = ui_grok_get(question, qsize, game, gsize, fresh, &what, author, sizeof author);
+
+  return what == UI_GROK_HINT && !author[0] ? n : -1;
+}
+
+
+static void settled(void);
+static int card_drawn(const char *dir, const char *name);
+static int translate_scenes(const char *dir);
+static int catchup_scenes(const char *dir);
+static int friends_scenes(const char *dir, const char *me);
+static int make_game_feed(x_post_t *posts);
+
+
+/**
+ * Chat's second tab, Friends: the people the user follows as a PS5's
+ * friends, with who XPS5 saw around; R2 asks João to let the user into his
+ * game, L2 opens his conversation, ✕ his profile with its player card
+ **/
+static int
+friends_scenes(const char *dir, const char *me) {
+  static seen_t seen;
+  char id[X_ID_MAX], user[64], text[X_REPLY_MAX + 1], conv[X_ID_MAX], joao[16];
+  x_post_t *more;
+  ui_request_t req;
+  const seen_t *kept;
+  int count;
+
+  (void)me;
+  snprintf(joao, sizeof joao, "%u", 1000 + hash("joaomarques") % 9000);
+  ui_keys(UI_CIRCLE); // back to Chat
+  if(ui_wanted(&req) == 1 && req.feed == UI_CHAT && (more=mem_calloc(8, sizeof *more))) {
+    ui_result(&req, more, make_chats(more), "", NULL, ERR_NONE, 200, -1, NOW);
+  }
+  make_seen(&seen);
+  ui_seen_set(&seen);
+  ui_keys(UI_RIGHT); // Chat's second tab
+  if(ui_wanted(&req) != 1 || req.feed != UI_FRIENDS || !req.id[0] || !(more=mem_calloc(12, sizeof *more))) {
+    return fail("Friends does not read the people the user follows");
+  }
+  count = make_all_friends(more);
+  ui_result(&req, more, count, "", NULL, ERR_NONE, 200, -1, NOW);
+  if(!ui_seen_get(&kept) || kept->events < 5 || !seen_find(kept, joao) ||
+     seen_find(kept, joao)->state != SEEN_PLAYING) {
+    return fail("the look of Friends is not noted");
+  }
+  if(strcmp(kept->event[0].user, "joaomarques") && strcmp(kept->event[1].user, "joaomarques")) {
+    return fail("João's game is not in the friends' activity");
+  }
+  settled();
+  if(draw(dir, "preview-friends.png")) {
+    return 1;
+  }
+  // a minute and a half on, the side column's look at the same people: Hugo
+  // is on XPS5 now, and Friends shows him with the others on it at once
+  {
+    text_surface_t screen = {g_pixels, UI_WIDTH, UI_HEIGHT, g_scale, 0};
+    frame();
+    ui_draw(&screen, NOW + 90, g_frame++);
+  }
+  if(ui_wanted(&req) != 1 || req.side != UI_SIDE_PLAYING || !(more=mem_calloc(12, sizeof *more))) {
+    return fail("who plays now is not asked for again a minute on");
+  }
+  count = make_all_friends(more);
+  for(int i=0; i < count; i++) {
+    more[i].online = !strcmp(more[i].user, "hugoreis") || more[i].online;
+  }
+  ui_result(&req, more, count, "", NULL, ERR_NONE, 200, -1, NOW + 90);
+  settled();
+  if(draw(dir, "preview-friends-fresh.png")) {
+    return 1;
+  }
+  // João, the second: R2 asks to join his game
+  ui_keys(UI_DOWN);
+  ui_keys(UI_R2);
+  if(ui_action(id, sizeof id, user, sizeof user) != UI_ACT_INVITE || strcmp(user, "joaomarques") ||
+     ui_invite_get(text, sizeof text) <= 0 || strncmp(text, PLAY_JOIN "ASTRO BOT", strlen(PLAY_JOIN "ASTRO BOT")) ||
+     !strstr(text, "(XPS5)") || play_conversation(me, joao, conv, sizeof conv) || strcmp(id, conv)) {
+    return fail("R2 on a friend who plays does not ask to join");
+  }
+  ui_action_done(ERR_NONE, 200, -1);
+  settled();
+  if(draw(dir, "preview-friends-join.png")) {
+    return 1;
+  }
+  if(ui_wanted(&req) == 1 && req.feed == UI_CHAT && (more=mem_calloc(8, sizeof *more))) {
+    ui_result(&req, more, make_chats(more), "", NULL, ERR_NONE, 200, -1, NOW);
+  }
+  // L2: his conversation, even before it has a message
+  ui_keys(UI_L2);
+  if(ui_wanted(&req) != 1 || req.feed != UI_DM || strcmp(req.id, conv) || !(more=mem_calloc(12, sizeof *more))) {
+    return fail("L2 on a friend does not open their conversation");
+  }
+  ui_result(&req, more, make_messages(more, me), "", NULL, ERR_NONE, 200, -1, NOW);
+  ui_keys(UI_CIRCLE);
+  // ✕: his profile, with the player card
+  ui_keys(UI_CROSS);
+  if(ui_wanted(&req) != 1 || req.feed != UI_USER || !(more=mem_calloc(6, sizeof *more))) {
+    return fail("the cross on a friend does not open their profile");
+  }
+  {
+    static x_user_t u;
+    memset(&u, 0, sizeof u);
+    snprintf(u.id, sizeof u.id, "%s", joao);
+    snprintf(u.user, sizeof u.user, "joaomarques");
+    snprintf(u.name, sizeof u.name, "Jo\xc3\xa3o Marques");
+    snprintf(u.avatar, sizeof u.avatar, "https://pbs.twimg.com/profile_images/1/joaomarques_normal.jpg");
+    snprintf(u.bio, sizeof u.bio, "Plataformas, corridas e tudo o que tiver trof\xc3\xa9us \xf0\x9f\x8f\x86");
+    if(play_status("ASTRO BOT", u.location, sizeof u.location)) {
+      return fail("no location for João's game");
+    }
+    u.badge = X_BADGE_BLUE;
+    u.followed = 1;
+    u.follows_you = 1;
+    u.following = 240;
+    u.followers = 812;
+    u.posts = 1630;
+    snprintf(u.banner, sizeof u.banner, "https://pbs.twimg.com/profile_banners/1/joaomarques");
+    count = make_game_feed(more);
+    for(int i=0; i < count; i++) { // his
+      snprintf(more[i].user_id, sizeof more[i].user_id, "%s", u.id);
+      snprintf(more[i].user, sizeof more[i].user, "%s", u.user);
+      snprintf(more[i].name, sizeof more[i].name, "%s", u.name);
+      snprintf(more[i].avatar, sizeof more[i].avatar, "%s", u.avatar);
+      more[i].badge = u.badge;
+    }
+    ui_result(&req, more, count, "", &u, ERR_NONE, 200, -1, NOW);
+  }
+  ui_keys(UI_DOWN); // the pointer goes away
+  ui_keys(UI_UP);
+  settled();
+  if(draw(dir, "preview-player-card.png")) {
+    return 1;
+  }
+  ui_keys(UI_CIRCLE);
+  return 0;
+}
+
+
+/**
+ * PSN's social side on X, from João's conversation (me the user's number):
+ * R2's voice note to it, then the group's conversation with its side card
+ * of who plays, and R1's invite to the game for all of it
+ **/
+static int
+psn_scenes(const char *dir, const char *me) {
+  char id[X_ID_MAX], user[64], text[X_REPLY_MAX + 1];
+  float bars[CARD_VOICE_BARS];
+  capture_t c, media[UI_MEDIA_MAX];
+  x_post_t people[UI_PARTY_MAX], *more;
+  ui_request_t req;
+  int retry = 0, count;
+
+  ui_keys(UI_R2);
+  if(!ui_voice_wanted(&retry) || retry) {
+    return fail("R2 in a conversation does not tape a voice note");
+  }
+  for(int i=0; i < 40; i++) {
+    const float s = sinf(i * 0.5f);
+    ui_elapsed(100000);
+    ui_voice_heard(UI_MIC_ON, 0, 0, 0.2f + 0.7f * s * s, (size_t)(16000 + i * 1600));
+  }
+  settled();
+  if(draw(dir, "preview-voice-dm.png")) {
+    return 1;
+  }
+  ui_keys(UI_CROSS);
+  if(!ui_voice_take()) {
+    return fail("the cross does not stop the conversation's voice note");
+  }
+  for(int i=0; i < CARD_VOICE_BARS; i++) {
+    const float s = sinf(i * 0.29f) * cosf(i * 0.13f);
+    bars[i] = 0.12f + 0.88f * s * s;
+  }
+  if(!ui_voice_card(bars, CARD_VOICE_BARS, 5) || card_drawn(dir, "preview-card-voice-dm.png")) {
+    return fail("the conversation's voice note gets no card");
+  }
+  memset(&c, 0, sizeof c);
+  snprintf(c.path, sizeof c.path, "/xps5-cards/voice-5.mp4");
+  c.kind = CAPTURE_MP4;
+  c.size = 900000;
+  c.time = NOW;
+  ui_card_done(&c);
+  if(ui_action(id, sizeof id, user, sizeof user) != UI_ACT_VOICE_DM || strcmp(id, "1-77") ||
+     strcmp(user, "@joaomarques")) {
+    return fail("the voice note does not go to the conversation");
+  }
+  memset(&c, 0, sizeof c);
+  if(ui_voice_dm_get(&c) != 1 || strcmp(c.path, "/xps5-cards/voice-5.mp4") || c.kind != CAPTURE_MP4) {
+    return fail("the voice note sent is not the one made");
+  }
+  count = ui_compose_get(text, sizeof text, media, UI_MEDIA_MAX);
+  for(int i=0; i < count; i++) {
+    if(!strcmp(media[i].path, "/xps5-cards/voice-5.mp4")) {
+      return fail("the conversation's voice note went into the post");
+    }
+  }
+  ui_action_done(ERR_NONE, 200, -1);
+  if(draw(dir, "preview-voice-dm-sent.png")) {
+    return 1;
+  }
+  if(ui_wanted(&req) != 1 || req.feed != UI_DM || strcmp(req.id, "1-77") || !(more=mem_calloc(12, sizeof *more))) {
+    return fail("the conversation is not read again with the voice note");
+  }
+  count = make_messages(more, me);
+  more[count] = more[3]; // the user's: the note
+  snprintf(more[count].id, sizeof more[count].id, "5100");
+  more[count].text[0] = 0;
+  more[count].icon = X_DM_VIDEO;
+  more[count].time = NOW;
+  ui_result(&req, more, count + 1, "", NULL, ERR_NONE, 200, -1, NOW);
+
+  // the group's conversation, from Chat
+  ui_keys(UI_CIRCLE);
+  if(ui_wanted(&req) != 1 || req.feed != UI_CHAT || !(more=mem_calloc(8, sizeof *more))) {
+    return fail("Chat is not read again after the voice note");
+  }
+  count = make_chats(more);
+  ui_result(&req, more, count, "", NULL, ERR_NONE, 200, -1, NOW);
+  ui_keys(UI_DOWN);
+  ui_keys(UI_CROSS);
+  if(ui_wanted(&req) != 1 || req.feed != UI_DM || strcmp(req.id, "55") || !(more=mem_calloc(8, sizeof *more))) {
+    return fail("the group's conversation is not read");
+  }
+  ui_party(req.id, people, make_party(people, me));
+  count = make_group(more, me);
+  ui_result(&req, more, count, "", NULL, ERR_NONE, 200, -1, NOW);
+  settled();
+  if(draw(dir, "preview-party.png")) {
+    return 1;
+  }
+  // R1: one invite to the game that runs, to the whole group
+  ui_keys(UI_R1);
+  if(ui_action(id, sizeof id, user, sizeof user) != UI_ACT_INVITE || strcmp(id, "55") || strcmp(user, "Squad PS5") ||
+     ui_invite_get(text, sizeof text) <= 0 || !strstr(text, "(XPS5 PPSA01316)")) {
+    return fail("R1 does not invite the group to the game");
+  }
+  ui_action_done(ERR_NONE, 200, -1);
+  if(draw(dir, "preview-party-invited.png")) {
+    return 1;
+  }
+  if(ui_wanted(&req) != 1 || req.feed != UI_DM || strcmp(req.id, "55") || !(more=mem_calloc(8, sizeof *more))) {
+    return fail("the group's conversation is not read again with the invite");
+  }
+  ui_party(req.id, people, make_party(people, me));
+  count = make_group(more, me);
+  ui_result(&req, more, count, "", NULL, ERR_NONE, 200, -1, NOW);
+  // the same group as X Chat reads it: its events, reactions, a reply, an
+  // edit, one taken back, calls and a file
+  if(!(more=mem_calloc(16, sizeof *more))) {
+    return fail("no memory for X Chat's group");
+  }
+  ui_result(&req, more, make_xchat_group(more, me), "", NULL, ERR_NONE, 200, -1, NOW);
+  settled();
+  if(draw(dir, "preview-xchat-group.png")) {
+    return 1;
+  }
+  for(int i=0; i < 7; i++) {
+    ui_keys(UI_UP);
+  }
+  settled();
+  if(draw(dir, "preview-xchat-group-top.png")) {
+    return 1;
+  }
+  // a one-to-one conversation has no group's card: R1 does not invite
+  ui_keys(UI_CIRCLE);
+  if(ui_wanted(&req) == 1 && req.feed == UI_CHAT && (more=mem_calloc(8, sizeof *more))) {
+    ui_result(&req, more, make_chats(more), "", NULL, ERR_NONE, 200, -1, NOW);
+  }
+  ui_keys(UI_UP);
+  ui_keys(UI_CROSS);
+  if(ui_wanted(&req) != 1 || req.feed != UI_DM || strcmp(req.id, "1-77") || !(more=mem_calloc(12, sizeof *more))) {
+    return fail("João's conversation is not read again");
+  }
+  ui_result(&req, more, make_messages(more, me), "", NULL, ERR_NONE, 200, -1, NOW);
+  // R1 in a one-to-one conversation: the invite goes into it
+  ui_keys(UI_R1);
+  if(ui_action(id, sizeof id, user, sizeof user) != UI_ACT_INVITE || strcmp(id, "1-77") ||
+     ui_invite_get(text, sizeof text) <= 0 || !strstr(text, "(XPS5 PPSA01316)")) {
+    return fail("R1 does not invite João in his conversation");
+  }
+  ui_action_done(ERR_NONE, 200, -1);
+  if(ui_wanted(&req) != 1 || req.feed != UI_DM || strcmp(req.id, "1-77") || !(more=mem_calloc(12, sizeof *more))) {
+    return fail("João's conversation is not read again with the invite");
+  }
+  // his answer: a request to join the game he plays
+  count = make_messages(more, me);
+  more[count] = more[4];
+  snprintf(more[count].id, sizeof more[count].id, "5200");
+  if(play_join("ASTRO BOT", "posso entrar?", more[count].text, sizeof more[count].text)) {
+    return fail("no request to join");
+  }
+  more[count].icon = X_DM_JOIN;
+  more[count].time = NOW - 30;
+  ui_result(&req, more, count + 1, "", NULL, ERR_NONE, 200, -1, NOW);
+  settled();
+  if(draw(dir, "preview-dm-join.png")) {
+    return 1;
+  }
+  // ✕ on it: an invite back, to the game that runs here
+  ui_keys(UI_CROSS);
+  if(ui_action(id, sizeof id, user, sizeof user) != UI_ACT_INVITE || strcmp(id, "1-77") ||
+     ui_invite_get(text, sizeof text) <= 0 || !strstr(text, "(XPS5 PPSA01316)")) {
+    return fail("the cross on a request to join does not invite back");
+  }
+  ui_action_done(ERR_NONE, 200, -1);
+  if(ui_wanted(&req) == 1 && req.feed == UI_DM && (more=mem_calloc(12, sizeof *more))) {
+    ui_result(&req, more, make_messages(more, me), "", NULL, ERR_NONE, 200, -1, NOW);
+  }
+  // his newest message came on X Chat, encrypted: the conversation ends with
+  // a bubble that says so; then as it was
+  for(int sealed=1; sealed >= 0; sealed--) {
+    ui_keys(UI_CIRCLE);
+    if(!sealed) {
+      ui_keys(UI_SQUARE); // the conversations read again, as they are now
+    }
+    if(ui_wanted(&req) == 1 && req.feed == UI_CHAT && (more=mem_calloc(8, sizeof *more))) {
+      count = make_chats(more);
+      if(sealed) {
+        more[0].sealed = 1; // João's
+        more[0].text[0] = 0;
+        more[0].icon = X_DM_TEXT;
+        more[0].time = NOW - 20;
+        snprintf(more[0].reposter, sizeof more[0].reposter, "77:1"); // its number on X Chat (xchat_merge)
+      }
+      ui_result(&req, more, count, "", NULL, ERR_NONE, 200, -1, NOW);
+    }
+    ui_keys(UI_UP);
+    ui_keys(UI_CROSS);
+    // it opens as before, answered there, its X Chat messages read too
+    if(ui_wanted(&req) != 1 || req.feed != UI_DM || strcmp(req.id, "1-77") || req.xchat ||
+       strcmp(req.xchat_id, sealed ? "77:1" : "") || !(more=mem_calloc(12, sizeof *more))) {
+      return fail("João's conversation does not open again");
+    }
+    count = make_messages(more, me);
+    ui_result(&req, more, count, "", NULL, ERR_NONE, 200, -1, NOW);
+    // with its X Chat messages locked, the keyboard for the PIN comes up by itself (cancelled here)
+    if((ui_action(id, sizeof id, user, sizeof user) == UI_ACT_XCHAT_PIN) != sealed) {
+      return fail(sealed ? "João's X Chat messages do not ask for the PIN" : "a plain conversation asks for the PIN");
+    }
+    if(sealed) {
+      ui_action_done(ERR_CANCELLED, 0, -1);
+    }
+    if(sealed) {
+      settled();
+      if(draw(dir, "preview-dm-sealed.png")) {
+        return 1;
+      }
+    }
+  }
+  return friends_scenes(dir, me);
 }
 
 
@@ -1246,6 +1951,19 @@ extras(const char *dir) {
   if(draw(dir, "preview-week.png")) {
     return 1;
   }
+  // the card of the user's own profile asks for the week, once
+  if(ui_week_info_wanted() != 1 || ui_week_info_wanted()) {
+    return fail("the user's profile does not ask for the week");
+  }
+  {
+    week_t w;
+    make_week_info(&w);
+    ui_week_info(&w);
+  }
+  settle();
+  if(draw(dir, "preview-my-week.png")) {
+    return 1;
+  }
   ui_game("PPSA07399", "ASTRO BOT");
 
   // Settings' new rows, further down
@@ -1258,7 +1976,7 @@ extras(const char *dir) {
   }
   ui_keys(UI_CROSS);
   ui_keys(UI_DOWN); // the pointer goes away, and the second row
-  for(int i=0; i<12; i++) { // to the captures' row
+  for(int i=0; i<16; i++) { // to the captures' row (past the controller's vibration and speaker)
     ui_keys(UI_DOWN);
   }
   if(draw(dir, "preview-settings-more.png")) {
@@ -1268,7 +1986,26 @@ extras(const char *dir) {
   if(draw(dir, "preview-settings-playing.png")) {
     return 1;
   }
-  for(int i=0; i<14; i++) {
+  ui_keys(UI_DOWN); // the profile's game, then what it says while XPS5 is open with no game:
+  ui_keys(UI_DOWN); // on, then off again
+  ui_keys(UI_CROSS);
+  {
+    settings_t changed;
+    if(!ui_settings_changed(&changed) || !changed.online) {
+      return fail("Online on your profile does not turn on");
+    }
+  }
+  if(draw(dir, "preview-settings-online.png")) {
+    return 1;
+  }
+  ui_keys(UI_CROSS);
+  {
+    settings_t changed;
+    if(!ui_settings_changed(&changed) || changed.online) {
+      return fail("Online on your profile does not turn off");
+    }
+  }
+  for(int i=0; i<19; i++) {
     ui_keys(UI_UP);
   }
   ui_keys(UI_CIRCLE);
@@ -1292,14 +2029,29 @@ extras(const char *dir) {
     if(draw(dir, "preview-shot.png")) {
       return 1;
     }
-    // a gold trophy, before what the composer holds
+    // a gold trophy, before what the composer holds, and its card first
+    // of its pictures
     ui_trophy(2, "Bot Master");
     if(ui_compose_get(text, sizeof text, media, 4) != 1 ||
        strcmp(text, "Trof\xc3\xa9u de ouro desbloqueado: \xe2\x80\x9c" "Bot Master\xe2\x80\x9d\n#ASTROBOT")) {
       return fail("the trophy is not in the composer");
     }
+    if(card_drawn(dir, "preview-card-gold.png")) {
+      return 1;
+    }
+    card_made(9);
+    if(ui_compose_get(text, sizeof text, media, 4) != 2 || strcmp(media[0].path, "/xps5-cards/card-9.jpg") ||
+       strcmp(media[1].path, shot.path) || strncmp(text, "Trof\xc3\xa9u de ouro desbloqueado", 28)) {
+      return fail("the gold trophy's card is not first in the composer");
+    }
     if(draw(dir, "preview-trophy.png")) {
       return 1;
+    }
+    // □ on the card takes it out: the capture stays, for the scenes after
+    ui_keys(UI_RIGHT);
+    ui_keys(UI_SQUARE);
+    if(ui_compose_get(text, sizeof text, media, 4) != 1 || strcmp(media[0].path, shot.path)) {
+      return fail("\xe2\x96\xa1 does not take the trophy's card out");
     }
     ui_keys(UI_CIRCLE);
   }
@@ -1316,9 +2068,11 @@ extras(const char *dir) {
   ui_result(&req, list, count, "", NULL, ERR_NONE, 200, -1, NOW);
   ui_keys(UI_DOWN); // the pointer goes away
   ui_keys(UI_UP);
+  ui_badges(3, 12, 0); // the bar's counts: new notices and messages
   if(draw(dir, "preview-game-feed.png")) {
     return 1;
   }
+  ui_badges(0, 0, 0);
   // the game stops: the tab stays while it is shown, and goes once it is left
   ui_game("", "");
   ui_keys(UI_LEFT);
@@ -1327,11 +2081,46 @@ extras(const char *dir) {
     return fail("the game's tab stays without a game");
   }
 
-  // Grok's hints without spoilers: asked with ✕, thinking, answered
+  // Calls' test of the microphone: off, hearing, failed and asked again,
+  // and over once Calls is left
   ui_game("PPSA07399", "ASTRO BOT");
-  for(int i=0; i<4; i++) { // Explore, Notifications, Chat, Calls, Grok
+  for(int i=0; i<4; i++) { // Explore, Notifications, Chat, Friends, Calls
     ui_keys(UI_RIGHT);
   }
+  {
+    int retry;
+    if(ui_mic_wanted(&retry) || draw(dir, "preview-calls.png")) {
+      return fail("the microphone is on before it is asked");
+    }
+    ui_keys(UI_CROSS);
+    if(!ui_mic_wanted(&retry) || retry) {
+      return fail("the cross does not test the microphone");
+    }
+    ui_mic(UI_MIC_ON, 0, 0, 0.72f, 0.86f);
+    if(draw(dir, "preview-calls-mic.png")) {
+      return 1;
+    }
+    ui_mic(UI_MIC_ON, 0, UI_MIC_PRIORITY_LOW, 0, 0);
+    if(draw(dir, "preview-calls-mic-busy.png")) {
+      return 1;
+    }
+    ui_mic(UI_MIC_FAILED, (int)0x80260105, 0, 0, 0);
+    if(draw(dir, "preview-calls-mic-failed.png")) {
+      return 1;
+    }
+    ui_keys(UI_CROSS);
+    if(!ui_mic_wanted(&retry) || !retry || (ui_mic_wanted(&retry), retry)) {
+      return fail("the cross does not try the microphone again, once");
+    }
+    ui_mic(UI_MIC_OPENING, 0, 0, 0, 0);
+    ui_keys(UI_RIGHT); // Grok
+    if(ui_mic_wanted(&retry)) {
+      return fail("the microphone stays on away from Calls");
+    }
+    ui_mic(UI_MIC_OFF, 0, 0, 0, 0);
+  }
+
+  // Grok's hints without spoilers: asked with ✕, thinking, answered
   if(draw(dir, "preview-grok.png")) {
     return 1;
   }
@@ -1344,7 +2133,7 @@ extras(const char *dir) {
     }
     ui_grok_text("  Como passo o n\xc3\xadvel do gelo?");
     if(ui_action(id, sizeof id, user, sizeof user) != UI_ACT_GROK ||
-       ui_grok_get(question, sizeof question, game, sizeof game, &fresh) <= 0 ||
+       grok_get(question, sizeof question, game, sizeof game, &fresh) <= 0 ||
        strcmp(question, "Como passo o n\xc3\xadvel do gelo?") || strcmp(game, "ASTRO BOT") || !fresh) {
       return fail("the question to Grok is not what was written");
     }
@@ -1357,11 +2146,11 @@ extras(const char *dir) {
     if(draw(dir, "preview-grok-answer.png")) {
       return 1;
     }
-    if(ui_grok_get(question, sizeof question, game, sizeof game, &fresh) <= 0 || fresh) {
+    if(grok_get(question, sizeof question, game, sizeof game, &fresh) <= 0 || fresh) {
       return fail("the second question starts a new conversation");
     }
     ui_keys(UI_SQUARE); // a new conversation
-    if(ui_grok_get(question, sizeof question, game, sizeof game, &fresh) != 0 || !fresh) {
+    if(grok_get(question, sizeof question, game, sizeof game, &fresh) != 0 || !fresh) {
       return fail("the square does not start a new conversation");
     }
   }
@@ -1381,7 +2170,7 @@ extras(const char *dir) {
   }
   ui_keys(UI_CROSS);
   ui_keys(UI_DOWN); // the pointer goes away, and the second row
-  for(int i=0; i<15; i++) { // to the last one
+  for(int i=0; i<21; i++) { // to the last one
     ui_keys(UI_DOWN);
   }
   ui_keys(UI_LEFT); // ← does not install
@@ -1489,7 +2278,7 @@ share_scenes(const char *dir) {
  **/
 static int
 link_in_language(const char *dir, const char *name) {
-  enum { S_SESSION_ROW = 15 }; // the X account's row of Settings (ui.c, S_SESSION), below the language
+  enum { S_SESSION_ROW = 21 }; // the X account's row of Settings (ui.c, S_SESSION), below the language
   ui_link_t st;
 
   for(int i=0; i<S_SESSION_ROW; i++) { // from the language to the X account
@@ -1684,6 +2473,126 @@ login_inputs(ui_login_input_t *list, int max) {
 
 
 /**
+ * a frame as it is now, without the steps frame() takes first
+ **/
+static int
+shot(const char *dir, const char *name) {
+  text_surface_t screen = {g_pixels, UI_WIDTH, UI_HEIGHT, g_scale, 0};
+  char path[512];
+
+  ui_draw(&screen, NOW, g_frame++);
+  snprintf(path, sizeof path, "%s/%s", dir, name);
+  if(!stbi_write_png(path, g_pw, g_ph, 4, g_pixels, g_pw * 4)) {
+    fprintf(stderr, "cannot write %s\n", path);
+    return -1;
+  }
+  printf("%s\n", path);
+  return 0;
+}
+
+
+/**
+ * time going by in frames of a sixtieth of a second
+ **/
+static void
+pass(unsigned us) {
+  for(unsigned gone=0; gone < us; gone += 16667) {
+    ui_elapsed(16667);
+  }
+}
+
+
+/**
+ * a clip the payload offered: the composer plays it in its tile, on the
+ * text, so ✕ writes about it
+ **/
+static int
+clip_scene(const char *dir) {
+  capture_t clip;
+
+  for(int i=0; i < 3; i++) { // the sheets the scenes before left open
+    ui_keys(UI_CIRCLE);
+    frame();
+  }
+  memset(&clip, 0, sizeof clip);
+  snprintf(clip.path, sizeof clip.path, "%s",
+           "/user/av_contents/video/NPXS40087/PPSA07399/014/ASTRO BOT_20261114_183000.mp4");
+  clip.time = 1794600000;
+  clip.size = 23400000;
+  clip.kind = CAPTURE_MP4;
+  ui_shot(&clip);
+  frame(); // the first frame opens the player
+  if(draw(dir, "preview-shot-clip.png")) {
+    return 1;
+  }
+  // on it, ✕ goes to its last 30 s, then the last 15; □ would take it out
+  ui_keys(UI_DOWN);
+  ui_keys(UI_CROSS);
+  {
+    capture_t media[UI_MEDIA_MAX];
+    char text[64];
+
+    if(ui_compose_get(text, sizeof text, media, UI_MEDIA_MAX) != 1 || media[0].clip != CLIP_LAST_30) {
+      return fail("\xe2\x9c\x95 on the clip does not take its last 30 s");
+    }
+    if(draw(dir, "preview-shot-trim.png")) {
+      return 1;
+    }
+    ui_keys(UI_CROSS);
+    if(ui_compose_get(text, sizeof text, media, UI_MEDIA_MAX) != 1 || media[0].clip != CLIP_LAST_15) {
+      return fail("\xe2\x9c\x95 again does not take its last 15 s");
+    }
+  }
+  return 0;
+}
+
+
+/**
+ * the way in at five moments (XPS5's letters small, growing, filling the
+ * screen, going through it, gone), then Following coming in over For you,
+ * a moment in and settled
+ **/
+static int
+motion_scenes(const char *dir) {
+  static const struct {
+    unsigned    us;
+    const char *name;
+  } moments[] = {
+    {150000, "preview-intro-start.png"}, {800000, "preview-intro-growing.png"},
+    {500000, "preview-intro-fill.png"}, {300000, "preview-intro-through.png"},
+    {400000, "preview-intro-gone.png"},
+  };
+  text_surface_t screen = {g_pixels, UI_WIDTH, UI_HEIGHT, g_scale, 0};
+  ui_request_t req;
+
+  for(int i=0; i < 3; i++) { // the sheets the scenes before left open
+    ui_keys(UI_CIRCLE);
+    frame();
+  }
+  ui_motion();
+  ui_draw(&screen, NOW, g_frame++); // the first frame starts the letters
+  for(size_t i=0; i < sizeof moments / sizeof moments[0]; i++) {
+    pass(moments[i].us);
+    if(shot(dir, moments[i].name)) {
+      return 1;
+    }
+  }
+  // Following, from For you: it slides in from the right as its tab sits
+  ui_keys(UI_RIGHT);
+  for(int i=0; i < 8 && ui_wanted(&req) == 1; i++) {
+    ui_result(&req, NULL, 0, "", NULL, ERR_NONE, 200, -1, NOW);
+  }
+  ui_draw(&screen, NOW, g_frame++); // the frame before stays at first
+  pass(100000);
+  if(shot(dir, "preview-page-coming.png")) {
+    return 1;
+  }
+  pass(400000);
+  return shot(dir, "preview-page-come.png");
+}
+
+
+/**
  * the login window inside XPS5, opened by the cross over a session X
  * refused once the engine is on the console: starting, the page loading
  * and shown, the pointer's click, the keyboard asked for a field that is
@@ -1692,7 +2601,7 @@ login_inputs(ui_login_input_t *list, int max) {
  **/
 static int
 login_scenes(const char *dir) {
-  enum { S_SESSION_ROW = 15 }; // the X account's row of Settings, below the language
+  enum { S_SESSION_ROW = 21 }; // the X account's row of Settings, below the language
   ui_login_t st;
   ui_login_input_t in[64]; // as many as the window keeps
   int w, h, zoom, n, x, y, account;
@@ -1954,6 +2863,918 @@ account_scenes(const char *dir) {
     return fail("Log out does not log out of account 1, once, and go to account 2");
   }
   return draw(dir, "preview-logged-out.png");
+}
+
+
+/**
+ * a frame drawn, and the transition it began (the scenes before turned
+ * them on) over, for the next one to show what stays
+ **/
+static void
+settled(void) {
+  text_surface_t screen = {g_pixels, UI_WIDTH, UI_HEIGHT, g_scale, 0};
+
+  frame();
+  ui_draw(&screen, NOW, g_frame++);
+  ui_elapsed(1000000);
+  ui_elapsed(16667);
+}
+
+
+/**
+ * frames until the card asked for is drawn (its pictures come as the
+ * loader's would), and it written as a picture of its own; 0, or -1
+ **/
+static int
+card_drawn(const char *dir, const char *name) {
+  uint32_t *px = NULL;
+  char path[512];
+  int w = 0, h = 0;
+
+  for(int i=0; i < 20 && !ui_card_take(&px, &w, &h); i++) {
+    frame();
+    load_pictures();
+  }
+  if(!px) {
+    fprintf(stderr, "the card %s is not drawn\n", name);
+    return -1;
+  }
+  snprintf(path, sizeof path, "%s/%s", dir, name);
+  if(!stbi_write_png(path, w, h, 4, px, w * 4)) {
+    fprintf(stderr, "cannot write %s\n", path);
+    mem_free(px);
+    return -1;
+  }
+  printf("%s\n", path);
+  mem_free(px);
+  return 0;
+}
+
+
+/**
+ * the card made a JPEG by main.c, under the path it keeps it by
+ **/
+static void
+card_made(int n) {
+  capture_t c;
+
+  memset(&c, 0, sizeof c);
+  snprintf(c.path, sizeof c.path, "/xps5-cards/card-%d.jpg", n);
+  c.kind = CAPTURE_JPEG;
+  c.size = 512000;
+  c.time = NOW;
+  ui_card_done(&c);
+}
+
+
+// what Grok answers in the preview: the post (in Portuguese already, so as
+// it is), and the three lines of what the user missed
+#define TRANSLATED "P\xc3\xb4r do sol na Ribeira ontem \xc3\xa0 noite. Obrigado a todos os que vieram ao passeio!"
+#define CAUGHT_UP \
+  "A @ritasousa acabou o jogo depois de 60 horas e diz que o final valeu cada minuto.\n" \
+  "O @noticiasjogos resumiu a atualiza\xc3\xa7\xc3\xa3o da semana: modo de foto novo, menos carregamentos e " \
+  "corre\xc3\xa7\xc3\xb5" "es no cooperativo.\n" \
+  "A @martaf procura quem jogue logo \xc3\xa0 noite, e o @joaomatos chama malta para o torneio de sexta \xf0\x9f\x8f\x86"
+
+
+/**
+ * a post translated by Grok from its •••: asked in a conversation of its
+ * own, Grok at it, its words; a failure and ✕ asking again; the same post
+ * opened again without asking
+ **/
+static int
+translate_scenes(const char *dir) {
+  char id[64], user[64], question[X_GROK_INPUT + 64], game[GAME_NAME], author[64];
+  int fresh = 0, what = -1;
+
+  if(ui_action(id, sizeof id, user, sizeof user) != UI_ACT_GROK ||
+     ui_grok_get(question, sizeof question, game, sizeof game, &fresh, &what, author, sizeof author) <= 0 ||
+     what != UI_GROK_TRANSLATE || !fresh || !author[0] || game[0]) {
+    return fail("Translate with Grok does not ask Grok");
+  }
+  if(draw(dir, "preview-translate-asking.png")) {
+    return 1;
+  }
+  // it fails, and ✕ asks again
+  ui_action_done(ERR_HTTP, 503, -1);
+  if(draw(dir, "preview-translate-failed.png")) {
+    return 1;
+  }
+  ui_keys(UI_CROSS);
+  if(ui_action(id, sizeof id, user, sizeof user) != UI_ACT_GROK ||
+     ui_grok_get(question, sizeof question, game, sizeof game, &fresh, &what, author, sizeof author) <= 0 ||
+     what != UI_GROK_TRANSLATE) {
+    return fail("✕ does not ask Grok again for the translation");
+  }
+  ui_grok_answer(TRANSLATED);
+  ui_action_done(ERR_NONE, 200, -1);
+  if(draw(dir, "preview-translate.png")) {
+    return 1;
+  }
+  ui_keys(UI_CIRCLE);
+  if(ui_action(id, sizeof id, user, sizeof user) != UI_ACT_NONE) {
+    return fail("closing the translation asks for something");
+  }
+  return 0;
+}
+
+
+/**
+ * More's "What you missed": Grok sums up the newest posts of Following (only
+ * two came since last time), its card while it reads them and with its
+ * three lines
+ **/
+static int
+catchup_scenes(const char *dir) {
+  char id[64], user[64], question[X_GROK_INPUT + 64], game[GAME_NAME], author[64];
+  int fresh = 0, what = -1, lines = 0;
+
+  if(point_at(120, 788)) {
+    return 1;
+  }
+  ui_keys(UI_CROSS);
+  if(draw(dir, "preview-more.png") || point_at(200, 402)) {
+    return 1;
+  }
+  ui_keys(UI_CROSS);
+  if(ui_action(id, sizeof id, user, sizeof user) != UI_ACT_GROK ||
+     ui_grok_get(question, sizeof question, game, sizeof game, &fresh, &what, author, sizeof author) <= 0 ||
+     what != UI_GROK_CATCHUP || !fresh || author[0] || question[0] != '@') {
+    return fail("What you missed does not ask Grok");
+  }
+  for(const char *s=question; s; s=strchr(s + 1, '\n')) {
+    lines++;
+  }
+  if(lines < 3 || lines > X_CATCHUP_MOST || strstr(question, "\n\n")) {
+    return fail("What you missed does not send a line a post");
+  }
+  if(draw(dir, "preview-catchup-asking.png")) {
+    return 1;
+  }
+  ui_grok_answer(CAUGHT_UP);
+  ui_action_done(ERR_NONE, 200, -1);
+  if(draw(dir, "preview-catchup.png")) {
+    return 1;
+  }
+  ui_keys(UI_CIRCLE);
+  return 0;
+}
+
+
+/**
+ * writing on the phone, from the composer the voice note left (its text and
+ * its MP4): the phone's button, its window with the QR, the words as they
+ * come, ✕ putting them in the post, ○ keeping what was there, and the
+ * page's Send
+ **/
+static int
+phone_scenes(const char *dir) {
+  static const char typed[] = "Escrito no telem\xc3\xb3vel: o boss final cai com tr\xc3\xaas saltos "
+                              "e um ataque carregado \xf0\x9f\x8e\xae";
+  char draft[4001], what[8], text[X_REPLY_MAX + 1], before[X_REPLY_MAX + 1];
+  capture_t media[UI_MEDIA_MAX];
+  ui_phone_t st;
+  unsigned serial;
+  int max = 0;
+
+  ui_keys(UI_OPTIONS); // the draft comes back, on Post
+  if(ui_compose_get(before, sizeof before, media, UI_MEDIA_MAX) != 1 || !before[0]) {
+    return fail("the composer does not keep the voice note's draft");
+  }
+  ui_keys(UI_LEFT); // the message's button, then the phone's
+  ui_keys(UI_LEFT);
+  settled();
+  if(draw(dir, "preview-phone-button.png")) {
+    return 1;
+  }
+  ui_keys(UI_CROSS);
+  serial = ui_phone_wanted(draft, sizeof draft, &max, what, sizeof what);
+  if(!serial || strcmp(draft, before) || strcmp(what, "post") || max < 280) {
+    return fail("the phone's button does not open its window with the draft");
+  }
+  memset(&st, 0, sizeof st);
+  st.state = UI_PHONE_STARTING;
+  ui_phone_status(&st);
+  settled();
+  if(draw(dir, "preview-phone-starting.png")) {
+    return 1;
+  }
+  st.state = UI_PHONE_WAITING;
+  snprintf(st.ip, sizeof st.ip, "192.168.1.70");
+  snprintf(st.token, sizeof st.token, "3f9a0c7e51b2d846");
+  ui_phone_status(&st);
+  settled();
+  if(draw(dir, "preview-phone.png")) {
+    return 1;
+  }
+  st.seen = 1;
+  ui_phone_status(&st);
+  ui_phone_text(typed, 0);
+  settled();
+  if(draw(dir, "preview-phone-typing.png")) {
+    return 1;
+  }
+  ui_keys(UI_CROSS);
+  if(ui_phone_wanted(draft, sizeof draft, &max, what, sizeof what) ||
+     ui_compose_get(text, sizeof text, media, UI_MEDIA_MAX) != 1 || strcmp(text, typed)) {
+    return fail("\xe2\x9c\x95 does not put the phone's words in the post");
+  }
+
+  // again, let go of with ○: the post keeps its words
+  ui_keys(UI_LEFT);
+  ui_keys(UI_LEFT);
+  ui_keys(UI_CROSS);
+  if(ui_phone_wanted(draft, sizeof draft, &max, what, sizeof what) <= serial || strcmp(draft, typed)) {
+    return fail("the phone's window does not open again, as a new one");
+  }
+  ui_phone_text("outra coisa", 0);
+  ui_keys(UI_CIRCLE);
+  if(ui_phone_wanted(draft, sizeof draft, &max, what, sizeof what) ||
+     ui_compose_get(text, sizeof text, media, UI_MEDIA_MAX) != 1 || strcmp(text, typed)) {
+    return fail("\xe2\x97\x8b does not keep what the post had");
+  }
+
+  // the page's Send: the words go in, and the composer comes back
+  ui_keys(UI_CROSS); // the phone's button keeps the focus
+  if(!ui_phone_wanted(draft, sizeof draft, &max, what, sizeof what)) {
+    return fail("\xe2\x9c\x95 on the phone's button does not open it");
+  }
+  ui_phone_text(before, 1);
+  if(ui_phone_wanted(draft, sizeof draft, &max, what, sizeof what) ||
+     ui_compose_get(text, sizeof text, media, UI_MEDIA_MAX) != 1 || strcmp(text, before)) {
+    return fail("the page's Send does not put its words in the post");
+  }
+  settled();
+  if(draw(dir, "preview-phone-sent.png")) {
+    return 1;
+  }
+  ui_keys(UI_CIRCLE);
+  return 0;
+}
+
+
+/**
+ * a voice note: the composer's microphone button, its sheet taping (too
+ * short at first, then the trail of its loudness, and another app with the
+ * microphone), its card, and the MP4 in the post; then one let go of
+ **/
+static int
+voice_scenes(const char *dir) {
+  char id[X_ID_MAX], user[64], text[X_REPLY_MAX + 1];
+  capture_t media[UI_MEDIA_MAX], c;
+  float bars[CARD_VOICE_BARS];
+  int retry = 0;
+
+  ui_keys(UI_OPTIONS);
+  if(ui_action(id, sizeof id, user, sizeof user) == UI_ACT_COMPOSE_TEXT) {
+    ui_compose_text("A dica para o boss final \xf0\x9f\x8e\xae");
+  }
+  for(int i=0; i < 12; i++) { // the text, then the bar: photos, poll, microphone
+    ui_keys(UI_UP);
+  }
+  for(int i=0; i < 3; i++) {
+    ui_keys(UI_RIGHT);
+  }
+  settled();
+  if(draw(dir, "preview-voice-button.png")) {
+    return 1;
+  }
+  ui_keys(UI_CROSS);
+  if(!ui_voice_wanted(&retry) || retry) {
+    return fail("the microphone button does not tape a voice note");
+  }
+  ui_voice_heard(UI_MIC_OPENING, 0, 0, 0, 0);
+  settled();
+  if(draw(dir, "preview-voice-opening.png")) {
+    return 1;
+  }
+  ui_voice_heard(UI_MIC_ON, 0, 0, 0.4f, 8000); // half a second
+  ui_keys(UI_CROSS);
+  if(ui_voice_take() || !ui_voice_wanted(&retry)) {
+    return fail("a voice note of half a second is made");
+  }
+  for(int i=0; i < 60; i++) {
+    const float s = sinf(i * 0.55f);
+    ui_elapsed(100000);
+    ui_voice_heard(UI_MIC_ON, 0, 0, i % 9 == 8 ? 0.05f : 0.25f + 0.6f * s * s, (size_t)(16000 * 2 + i * 1600));
+  }
+  settled();
+  if(draw(dir, "preview-voice.png")) {
+    return 1;
+  }
+  ui_voice_heard(UI_MIC_ON, 0, UI_MIC_PRIORITY_LOW, 0, 16000 * 8);
+  settled();
+  if(draw(dir, "preview-voice-busy.png")) {
+    return 1;
+  }
+  ui_voice_heard(UI_MIC_ON, 0, 0, 0.5f, 16000 * 8 + 4000);
+  ui_keys(UI_CROSS);
+  if(!ui_voice_take() || ui_voice_wanted(&retry)) {
+    return fail("the cross does not stop the voice note");
+  }
+  for(int i=0; i < CARD_VOICE_BARS; i++) {
+    const float s = sinf(i * 0.37f) * cosf(i * 0.11f);
+    bars[i] = i % 11 == 10 ? 0.04f : 0.15f + 0.85f * s * s;
+  }
+  if(!ui_voice_card(bars, CARD_VOICE_BARS, 8)) {
+    return fail("the voice note's card is not made");
+  }
+  settled();
+  if(draw(dir, "preview-voice-making.png") || card_drawn(dir, "preview-card-voice.png")) {
+    return 1;
+  }
+  memset(&c, 0, sizeof c);
+  snprintf(c.path, sizeof c.path, "/xps5-cards/voice-4.mp4");
+  c.kind = CAPTURE_MP4;
+  c.size = 1500000;
+  c.time = NOW;
+  ui_card_done(&c);
+  if(ui_compose_get(text, sizeof text, media, UI_MEDIA_MAX) != 1 || strcmp(media[0].path, c.path) ||
+     media[0].kind != CAPTURE_MP4 || !text[0]) {
+    return fail("the voice note is not the post's video");
+  }
+  settled();
+  if(draw(dir, "preview-voice-composer.png")) {
+    return 1;
+  }
+
+  // another, let go of with ○ at once: no tape, the post keeps the first
+  ui_keys(UI_LEFT); // from Post: the message's button, the phone's, dictation's, then the microphone
+  ui_keys(UI_LEFT);
+  ui_keys(UI_LEFT);
+  ui_keys(UI_LEFT);
+  ui_keys(UI_CROSS);
+  if(!ui_voice_wanted(&retry)) {
+    return fail("the microphone button is not reached again");
+  }
+  ui_keys(UI_CIRCLE);
+  if(ui_voice_wanted(&retry) || ui_voice_take() || ui_compose_get(text, sizeof text, media, UI_MEDIA_MAX) != 1 ||
+     strcmp(media[0].path, "/xps5-cards/voice-4.mp4")) {
+    return fail("\xe2\x97\x8b does not let the voice note go");
+  }
+  ui_keys(UI_CIRCLE);
+  return phone_scenes(dir);
+}
+
+
+/**
+ * one dictation from the composer's button to ✕: the microphone heard for
+ * seconds, then stopped; whether it was taken to be made
+ **/
+static int
+dictate_once(float seconds) {
+  int retry = 0;
+
+  ui_keys(UI_CROSS);
+  if(!ui_voice_wanted(&retry) || retry || !ui_voice_dictating()) {
+    return 0;
+  }
+  ui_voice_heard(UI_MIC_ON, 0, 0, 0.5f, (size_t)(16000 * seconds));
+  ui_keys(UI_CROSS);
+  return ui_voice_take();
+}
+
+
+/**
+ * dictation: the composer's button, its sheet listening, the words being
+ * made on the console, and the words at the end of the post's text; then
+ * one too short, one without its model, one stopped at its longest and let
+ * go of while its words were made
+ **/
+static int
+dictate_scene(const char *dir) {
+  static const char said[] = "e depois salta para a plataforma da esquerda antes do segundo ataque";
+  char id[X_ID_MAX], user[64], before[X_REPLY_MAX + 1], text[X_REPLY_MAX + 1], want[X_REPLY_MAX + 1];
+  capture_t media[UI_MEDIA_MAX];
+  int retry = 0;
+
+  ui_keys(UI_OPTIONS);
+  if(ui_action(id, sizeof id, user, sizeof user) == UI_ACT_COMPOSE_TEXT) {
+    ui_compose_text("A dica para o boss final:");
+  }
+  if(ui_compose_get(before, sizeof before, media, UI_MEDIA_MAX) != 1) {
+    return fail("the composer does not open for dictation");
+  }
+  for(int i=0; i < 12; i++) { // the text, then the draft's video and the bar: photos, poll, microphone, dictation
+    ui_keys(UI_UP);
+  }
+  for(int i=0; i < 5; i++) {
+    ui_keys(UI_RIGHT);
+  }
+  settled();
+  if(draw(dir, "preview-dictate-button.png")) {
+    return 1;
+  }
+  ui_keys(UI_CROSS);
+  if(!ui_voice_wanted(&retry) || retry || !ui_voice_dictating()) {
+    return fail("the dictation button does not listen");
+  }
+  ui_voice_heard(UI_MIC_OPENING, 0, 0, 0, 0);
+  ui_voice_heard(UI_MIC_ON, 0, 0, 0.4f, 8000); // half a second
+  ui_keys(UI_CROSS);
+  if(ui_voice_take() || !ui_voice_wanted(&retry)) {
+    return fail("a dictation of half a second is made");
+  }
+  for(int i=0; i < 50; i++) {
+    const float v = sinf(i * 0.7f);
+    ui_elapsed(100000);
+    ui_voice_heard(UI_MIC_ON, 0, 0, i % 7 == 6 ? 0.04f : 0.2f + 0.7f * v * v, (size_t)(16000 + i * 1600));
+  }
+  settled();
+  if(draw(dir, "preview-dictate.png")) {
+    return 1;
+  }
+  ui_keys(UI_CROSS);
+  if(!ui_voice_take() || ui_voice_wanted(&retry) || !ui_voice_dictating()) {
+    return fail("the cross does not stop the dictation to be made");
+  }
+  settled();
+  if(draw(dir, "preview-dictate-making.png")) {
+    return 1;
+  }
+  ui_dictated(DICT_OK, said);
+  snprintf(want, sizeof want, "%s%s%s", before, before[0] ? " " : "", said);
+  if(ui_voice_dictating() || ui_compose_get(text, sizeof text, media, UI_MEDIA_MAX) != 1 || strcmp(text, want)) {
+    return fail("the dictation's words do not go at the end of the post");
+  }
+  settled();
+  if(draw(dir, "preview-dictate-done.png")) {
+    return 1;
+  }
+
+  // without its model: the post as it was, and why
+  if(!dictate_once(3)) {
+    return fail("the dictation button is not reached again");
+  }
+  ui_dictated(DICT_NO_MODEL, NULL);
+  if(ui_compose_get(text, sizeof text, media, UI_MEDIA_MAX) != 1 || strcmp(text, want)) {
+    return fail("a dictation without its model changes the post");
+  }
+  settled();
+  if(draw(dir, "preview-dictate-no-model.png")) {
+    return 1;
+  }
+
+  // at its longest it stops by itself; let go of while made, its words do
+  // not come
+  ui_keys(UI_CROSS);
+  ui_voice_heard(UI_MIC_ON, 0, 0, 0.5f, (size_t)16000 * DICT_MAX_S);
+  if(!ui_voice_take()) {
+    return fail("a dictation does not stop at its longest");
+  }
+  ui_keys(UI_CIRCLE);
+  if(ui_voice_dictating()) {
+    return fail("\xe2\x97\x8b does not let the dictation go");
+  }
+  ui_dictated(DICT_OK, "isto n\xc3\xa3o");
+  if(ui_compose_get(text, sizeof text, media, UI_MEDIA_MAX) != 1 || strcmp(text, want)) {
+    return fail("a dictation let go of still writes");
+  }
+  ui_keys(UI_CIRCLE);
+  return 0;
+}
+
+
+/**
+ * a post that shares a Space: its ••• hears it, the top line says so while
+ * it plays (and the rest goes on), and the ••• stops it
+ **/
+static int
+space_scene(const char *dir) {
+  char id[X_ID_MAX], user[64];
+  ui_request_t req;
+  x_post_t *list;
+  x_space_t s;
+
+  for(int i=0; i < 4; i++) { // the sheets and pages the scenes before left open
+    ui_keys(UI_CIRCLE);
+  }
+  for(int i=0; i < 20; i++) { // For you, the first section
+    ui_keys(UI_LEFT);
+  }
+  ui_keys(UI_SQUARE);
+  if(want_feed(UI_FOR_YOU, &req) || !(list=mem_calloc(2, sizeof *list))) {
+    return fail("For you is not read again for the Space");
+  }
+  for(int i=0; i < 2; i++) {
+    x_post_t *p = &list[i];
+    p->kind = X_KIND_POST;
+    snprintf(p->id, sizeof p->id, "%d", 3900 + i);
+    snprintf(p->user, sizeof p->user, "%s", i ? "joaomarques" : "astroclube");
+    snprintf(p->user_id, sizeof p->user_id, "%d", 900 + i);
+    snprintf(p->name, sizeof p->name, "%s", i ? "Jo\xc3\xa3o Marques" : "Clube ASTRO BOT");
+    snprintf(p->text, sizeof p->text, "%s", i ? "Algu\xc3\xa9m para o modo cooperativo logo \xc3\xa0 noite?" :
+             "Estamos no ar: truques para os n\xc3\xadveis secretos. Entra e pergunta! x.com/i/spaces/1OdKrBnaEPXKX");
+    p->time = NOW - 600 * (i + 1);
+    p->replies = 12;
+    p->reposts = 4;
+    p->likes = 61;
+    p->views = 2300;
+    p->bookmarks = -1;
+  }
+  snprintf(list[0].space, sizeof list[0].space, "%s", "1OdKrBnaEPXKX");
+  ui_result(&req, list, 2, "", NULL, ERR_NONE, 200, -1, NOW);
+  ui_keys(UI_DOWN); // the pointer goes away
+  ui_keys(UI_UP);
+  frame();
+  if(point_at(1342, 277)) {
+    return 1;
+  }
+  ui_keys(UI_CROSS);
+  settled();
+  if(draw(dir, "preview-space-menu.png")) {
+    return 1;
+  }
+  ui_keys(UI_UP); // the pointer goes away; Listen to the Space is the first row
+  ui_keys(UI_CROSS);
+  if(ui_action(id, sizeof id, user, sizeof user) != UI_ACT_SPACE || strcmp(id, "1OdKrBnaEPXKX") ||
+     strcmp(user, "astroclube")) {
+    return fail("the \xe2\x80\xa2\xe2\x80\xa2\xe2\x80\xa2 does not ask for the Space");
+  }
+  // as main.c does once X said where its sound is
+  memset(&s, 0, sizeof s);
+  snprintf(s.id, sizeof s.id, "%s", id);
+  snprintf(s.host, sizeof s.host, "%s", user);
+  snprintf(s.title, sizeof s.title, "%s", "Segredos do ASTRO BOT");
+  s.state = X_SPACE_LIVE;
+  space_play("https://prod-fastly-eu-west-3.video.pscp.tv/Transcoding/v1/hls/a/playlist_16.m3u8", 1, id, user);
+  ui_space(&s);
+  ui_action_done(ERR_NONE, 200, -1);
+  settled();
+  if(draw(dir, "preview-space.png")) {
+    return 1;
+  }
+  if(g_space_state != SPACE_ON || !g_space_live) {
+    return fail("the Space does not play");
+  }
+  // its ••• again: Stop the Space
+  frame();
+  if(point_at(1342, 277)) {
+    return 1;
+  }
+  ui_keys(UI_CROSS);
+  ui_keys(UI_UP);
+  ui_keys(UI_CROSS);
+  if(g_space_state != SPACE_IDLE || ui_action(id, sizeof id, user, sizeof user) != UI_ACT_NONE) {
+    return fail("the \xe2\x80\xa2\xe2\x80\xa2\xe2\x80\xa2 does not stop the Space");
+  }
+  settled();
+  return draw(dir, "preview-space-stopped.png");
+}
+
+
+/**
+ * Notifications with two accounts linked: its tabs, this account's or
+ * every account's, the latter in one list with a stripe of each account's
+ * colour and whose colour is whose on top
+ **/
+static int later_scene(const char *dir);
+
+static int
+inbox_scene(const char *dir) {
+  enum { TAB_Y = 90, THIS_X = 880, EVERY_X = 1060 };
+  static const char *const likes[] = {"analopes", "hugoreis"};
+  static const char *const follow[] = {"joaomatos"};
+  static const char *const reposts[] = {"ritasousa"};
+  ui_request_t req;
+  x_post_t *list;
+
+  for(int i=0; i < 4; i++) { // the sheets and pages the scenes before left open
+    ui_keys(UI_CIRCLE);
+  }
+  ui_accounts(3); // accounts 1 and 2 have a session
+  ui_open_told(1);
+  if(want_feed(UI_NOTIFICATIONS, &req) || req.latest || !(list=mem_calloc(2, sizeof *list))) {
+    return fail("Notifications is not read with two accounts");
+  }
+  notice(&list[0], X_ICON_LIKE, 20 * 60, "Ana Lopes e Hugo Reis gostaram do teu post", "Platina no ASTRO BOT!",
+         likes, 2);
+  notice(&list[1], X_ICON_FOLLOW, 2 * 3600, "Jo\xc3\xa3o Matos come\xc3\xa7ou a seguir-te", NULL, follow, 1);
+  ui_result(&req, list, 2, "", NULL, ERR_NONE, 200, -1, NOW);
+  ui_keys(UI_DOWN); // the pointer goes away
+  ui_keys(UI_UP);
+  settled();
+  if(draw(dir, "preview-inbox-tabs.png")) {
+    return 1;
+  }
+  if(point_at(EVERY_X, TAB_Y)) {
+    return 1;
+  }
+  ui_keys(UI_CROSS);
+  if(ui_wanted(&req) != 1 || req.feed != UI_NOTIFICATIONS || !req.latest || req.cursor[0]) {
+    return fail("Every account's notifications are not read");
+  }
+  // as main.c merges them: by time, each with its account
+  if(!(list=mem_calloc(4, sizeof *list))) {
+    return fail("no memory");
+  }
+  notice(&list[0], X_ICON_LIKE, 20 * 60, "Ana Lopes e Hugo Reis gostaram do teu post", "Platina no ASTRO BOT!",
+         likes, 2);
+  list[0].account = 1;
+  notice(&list[1], X_ICON_REPOST, 50 * 60, "Rita Sousa repostou o teu post", "Clip do boss final, sem cortes",
+         reposts, 1);
+  list[1].account = 2;
+  notice(&list[2], X_ICON_FOLLOW, 2 * 3600, "Jo\xc3\xa3o Matos come\xc3\xa7ou a seguir-te", NULL, follow, 1);
+  list[2].account = 1;
+  post(&list[3], "Hugo Reis", "hugoreis", X_BADGE_NONE, 3 * 3600,
+       "@xps5_segunda bora jogar Rocket League logo \xc3\xa0 noite?", 1, 0, 3, 120);
+  list[3].account = 2;
+  ui_result(&req, list, 4, "", NULL, ERR_NONE, 200, -1, NOW);
+  ui_keys(UI_DOWN); // the pointer goes away
+  ui_keys(UI_UP);
+  settled();
+  if(draw(dir, "preview-inbox.png")) {
+    return 1;
+  }
+  // and this account's again
+  if(point_at(THIS_X, TAB_Y)) {
+    return 1;
+  }
+  ui_keys(UI_CROSS);
+  if(ui_wanted(&req) != 1 || req.feed != UI_NOTIFICATIONS || req.latest) {
+    return fail("this account's notifications are not read again");
+  }
+  ui_result(&req, NULL, 0, "", NULL, ERR_EMPTY, 200, -1, NOW);
+  return later_scene(dir);
+}
+
+
+/**
+ * a post kept for later from its •••, in History's second tab, and taken
+ * out of it again
+ **/
+static int
+later_scene(const char *dir) {
+  enum { HISTORY_X = 170, HISTORY_Y = 596, TAB_Y = 90, LATER_X = 1080 };
+  const x_post_t *kept;
+  ui_request_t req;
+  x_post_t *list;
+  int changed, n;
+
+  for(int i=0; i < 20; i++) { // For you, the first section
+    ui_keys(UI_LEFT);
+  }
+  ui_keys(UI_SQUARE);
+  if(want_feed(UI_FOR_YOU, &req) || !(list=mem_calloc(1, sizeof *list))) {
+    return fail("For you is not read again for Read later");
+  }
+  post(&list[0], "Marta Fonseca", "martaf", X_BADGE_NONE, 40 * 60,
+       "Guia completo dos n\xc3\xadveis secretos do ASTRO BOT, com mapas de cada mundo. Vale a pena ler com calma.",
+       30, 80, 900, 12000);
+  ui_result(&req, list, 1, "", NULL, ERR_NONE, 200, -1, NOW);
+  ui_keys(UI_DOWN); // the pointer goes away
+  ui_keys(UI_UP);
+  frame();
+  if(point_at(1342, 277)) {
+    return 1;
+  }
+  ui_keys(UI_CROSS);
+  ui_keys(UI_UP);   // Open the post, Quote, Translate with Grok, Read later
+  for(int i=0; i < 3; i++) {
+    ui_keys(UI_DOWN);
+  }
+  ui_keys(UI_CROSS);
+  n = ui_later_get(&kept, &changed);
+  if(n != 1 || !changed || strcmp(kept[0].user, "martaf")) {
+    return fail("Read later does not keep the post");
+  }
+  // History, and its Read later tab
+  if(point_at(HISTORY_X, HISTORY_Y)) {
+    return 1;
+  }
+  ui_keys(UI_CROSS);
+  if(point_at(LATER_X, TAB_Y)) {
+    return 1;
+  }
+  ui_keys(UI_CROSS);
+  ui_keys(UI_DOWN); // the pointer goes away
+  ui_keys(UI_UP);
+  settled();
+  if(draw(dir, "preview-later.png")) {
+    return 1;
+  }
+  // its ••• there: Remove from Read later
+  frame();
+  if(point_at(1342, 277)) {
+    return 1;
+  }
+  ui_keys(UI_CROSS);
+  ui_keys(UI_UP);
+  for(int i=0; i < 3; i++) {
+    ui_keys(UI_DOWN);
+  }
+  ui_keys(UI_CROSS);
+  if(ui_later_get(&kept, &changed) != 0 || !changed) {
+    return fail("Remove from Read later does not take it out");
+  }
+  settled();
+  return draw(dir, "preview-later-empty.png");
+}
+
+
+/**
+ * the game's corner: its box on its tab of Home, the trophies' sheet and
+ * Grok's tip for one, and the cards of a session, of the week and of a
+ * platinum in the composer
+ **/
+static int
+game_corner_scenes(const char *dir) {
+  static const ui_trophy_row_t rows[] = {
+    {1, 1, 0, 1, "Primeiros passos", "Acaba o primeiro n\xc3\xadvel."},
+    {0, 3, 0, 0, "Mestre dos Bots", "Ganha todos os outros trof\xc3\xa9us."},
+    {2, 2, 0, 1, "Bot Master", "Salva 300 bots."},
+    {3, 1, 0, 0, "Salto perfeito", "Acaba o n\xc3\xadvel do gelo sem cair."},
+    {4, 0, 1, 0, "", ""},
+    {5, 0, 0, 1, "Colecionador", "Encontra 20 pe\xc3\xa7" "as do puzzle."},
+  };
+  char id[X_ID_MAX], user[64], text[X_REPLY_MAX + 1], question[X_GROK_QUESTION], game[GAME_NAME];
+  capture_t media[UI_MEDIA_MAX];
+  ui_request_t req;
+  session_t s;
+  week_t w;
+  x_post_t *list;
+  int fresh = 0;
+
+  for(int i=0; i < 4; i++) { // the sheets and pages the scenes before left open
+    ui_keys(UI_CIRCLE);
+  }
+  ui_game("PPSA07399", "ASTRO BOT");
+  for(int i=0; i < 20; i++) { // For you, the first section
+    ui_keys(UI_LEFT);
+  }
+  ui_keys(UI_RIGHT);
+  ui_keys(UI_RIGHT); // Home's tab of the game
+  if(ui_wanted(&req) == 1 && req.feed == UI_GAME && (list=mem_calloc(6, sizeof *list))) {
+    ui_result(&req, list, make_game_feed(list), "", NULL, ERR_NONE, 200, -1, NOW);
+  }
+  // the box, before the trophies came and with them
+  if(draw(dir, "preview-game-side-reading.png")) {
+    return 1;
+  }
+  ui_trophies("PPSA07399", rows, (int)(sizeof rows / sizeof rows[0]));
+  if(draw(dir, "preview-game-side.png")) {
+    return 1;
+  }
+  // the week's button asks main.c for the week
+  if(point_at(1662, 291)) {
+    return 1;
+  }
+  ui_keys(UI_CROSS);
+  if(!ui_week_wanted() || ui_week_wanted()) {
+    return fail("the week's button does not ask for the week once");
+  }
+  // the trophies' button: their sheet, read again, the ones to get first
+  if(point_at(1662, 231)) {
+    return 1;
+  }
+  ui_keys(UI_CROSS);
+  if(!ui_trophies_wanted()) {
+    return fail("the trophies' sheet does not read them again");
+  }
+  ui_keys(UI_DOWN); // the pointer goes away
+  ui_keys(UI_UP);
+  settled();
+  if(draw(dir, "preview-trophies.png")) {
+    return 1;
+  }
+  // ✕: Grok's tip for the first one still to get, asked at once on its page
+  ui_keys(UI_CROSS);
+  if(ui_action(id, sizeof id, user, sizeof user) != UI_ACT_GROK ||
+     grok_get(question, sizeof question, game, sizeof game, &fresh) <= 0 || !fresh || strcmp(game, "ASTRO BOT") ||
+     strcmp(question, "Como consigo o trof\xc3\xa9u \xe2\x80\x9cMestre dos Bots\xe2\x80\x9d em ASTRO BOT? Diz: "
+                      "\xe2\x80\x9cGanha todos os outros trof\xc3\xa9us.\xe2\x80\x9d")) {
+    return fail("the trophy's tip is not asked of Grok");
+  }
+  settled();
+  if(draw(dir, "preview-grok-trophy.png")) {
+    return 1;
+  }
+  ui_grok_answer("O Mestre dos Bots chega sozinho quando tiveres todos os outros: falta-te o Salto perfeito e um escondido.");
+  ui_action_done(ERR_NONE, 200, -1);
+  settled();
+  if(draw(dir, "preview-grok-trophy-answer.png")) {
+    return 1;
+  }
+
+  // a session that ended: its card, then the composer with it first
+  memset(&s, 0, sizeof s);
+  snprintf(s.id, sizeof s.id, "PPSA07399");
+  snprintf(s.name, sizeof s.name, "ASTRO BOT");
+  s.start = NOW - 2 * 3600 - 13 * 60;
+  s.end = NOW;
+  s.trophies[0] = 3;
+  s.trophies[1] = 1;
+  s.trophies[2] = 1;
+  s.shots = 5;
+  snprintf(s.best, sizeof s.best, "Bot Master");
+  snprintf(s.pics[0], sizeof s.pics[0], "/user/av_contents/photo/NPXS40087/PPSA07399/014/ASTRO BOT_20261115.jpg");
+  s.pic_count = 1;
+  ui_session(&s);
+  if(card_drawn(dir, "preview-card-session.png")) {
+    return 1;
+  }
+  card_made(1);
+  if(ui_compose_get(text, sizeof text, media, UI_MEDIA_MAX) < 1 || strcmp(media[0].path, "/xps5-cards/card-1.jpg") ||
+     strncmp(text, "2 h 13 min de ASTRO BOT \xc2\xb7 5 trof\xc3\xa9us \xf0\x9f\x8f\x86", 40) || !strstr(text, "#ASTROBOT")) {
+    return fail("the session's card is not in the composer");
+  }
+  settled();
+  if(draw(dir, "preview-card-composer.png")) {
+    return 1;
+  }
+  ui_keys(UI_CIRCLE);
+
+  // the week: four games, the most played first
+  memset(&w, 0, sizeof w);
+  {
+    static const struct { const char *id, *name; int hours, minutes, trophies; } g[] = {
+      {"PPSA07399", "ASTRO BOT", 4, 10, 6}, {"PPSA01325", "Gran Turismo 7", 6, 45, 3},
+      {"PPSA01399", "Uncharted: Drake's Fortune", 1, 20, 0}, {"PPSA00001", "Returnal", 0, 40, 1},
+    };
+    for(size_t i=0; i < sizeof g / sizeof g[0]; i++) {
+      session_t one;
+      memset(&one, 0, sizeof one);
+      snprintf(one.id, sizeof one.id, "%s", g[i].id);
+      snprintf(one.name, sizeof one.name, "%s", g[i].name);
+      one.start = NOW - 86400;
+      one.end = one.start + g[i].hours * 3600 + g[i].minutes * 60;
+      one.trophies[0] = g[i].trophies;
+      week_add(&w, &one);
+      week_add(&w, &one); // twice each
+    }
+  }
+  ui_week(&w);
+  if(card_drawn(dir, "preview-card-week.png")) {
+    return 1;
+  }
+  card_made(2);
+  if(ui_compose_get(text, sizeof text, media, UI_MEDIA_MAX) != 1 || strcmp(media[0].path, "/xps5-cards/card-2.jpg") ||
+     strncmp(text, "A minha semana na PS5: 25 h 50 min em 4 jogos \xc2\xb7 20 trof\xc3\xa9us", 55) ||
+     strstr(text, "2 h 13 min de")) {
+    return fail("the week's card is not alone in the composer");
+  }
+  ui_keys(UI_CIRCLE);
+
+  // a platinum: its line at once, and its card after
+  ui_trophy(3, "Mestre dos Bots");
+  if(card_drawn(dir, "preview-card-platinum.png")) {
+    return 1;
+  }
+  card_made(3);
+  if(ui_compose_get(text, sizeof text, media, UI_MEDIA_MAX) != 1 || strcmp(media[0].path, "/xps5-cards/card-3.jpg") ||
+     strncmp(text, "Trof\xc3\xa9u de platina desbloqueado", 30)) {
+    return fail("the platinum's card is not in the composer");
+  }
+  settled();
+  if(draw(dir, "preview-card-platinum-composer.png")) {
+    return 1;
+  }
+  ui_keys(UI_CIRCLE);
+
+  // looking for a group: a post of it in the composer, and the posts of
+  // others looking for one in Explore
+  for(int i=0; i < 20; i++) {
+    ui_keys(UI_LEFT);
+  }
+  ui_keys(UI_RIGHT);
+  ui_keys(UI_RIGHT);
+  for(int i=0; i < 10 && ui_wanted(&req) == 1; i++) { // the sections on the way, and the tab kept
+    ui_result(&req, NULL, 0, "", NULL, ERR_EMPTY, 200, -1, NOW);
+  }
+  if(point_at(1662, 351)) {
+    return 1;
+  }
+  ui_keys(UI_CROSS);
+  if(ui_compose_get(text, sizeof text, media, UI_MEDIA_MAX) < 0 ||
+     strncmp(text, "\xc3\x80 procura de grupo para ASTRO BOT", 34) || !strstr(text, "#LFG") ||
+     !strstr(text, "#ASTROBOT") || strstr(text, "platina")) {
+    return fail("the button does not write a post looking for a group");
+  }
+  settled();
+  if(draw(dir, "preview-lfg-post.png")) {
+    return 1;
+  }
+  ui_keys(UI_CIRCLE);
+  if(point_at(1662, 411)) {
+    return 1;
+  }
+  ui_keys(UI_CROSS);
+  if(want_feed(UI_SEARCH, &req) || !req.latest || !strstr(req.query, "\"ASTRO BOT\"") || !strstr(req.query, "#LFG") ||
+     !strstr(req.query, "#ASTROBOT")) {
+    return fail("the button does not look for groups in Explore");
+  }
+  // the groups found, where R1 invites a post's author to the game that
+  // runs (the invite itself is the friends' scenes'; the account here has
+  // no number by now, after its switches)
+  list = mem_calloc(6, sizeof *list);
+  ui_result(&req, list, make_game_feed(list), "", NULL, ERR_NONE, 200, -1, NOW);
+  ui_keys(UI_DOWN); // the pointer goes away
+  ui_keys(UI_UP);
+  settled();
+  if(draw(dir, "preview-lfg-groups.png")) {
+    return 1;
+  }
+  return voice_scenes(dir) || dictate_scene(dir) || space_scene(dir) || inbox_scene(dir);
 }
 
 
@@ -2499,6 +4320,10 @@ main(int argc, char **argv) {
   }
   ui_keys(UI_CIRCLE);
 
+  if(catchup_scenes(argv[1])) {
+    return 1;
+  }
+
   // More's scheduled posts: loading, the list, the question and one taken back
   if(point_at(120, 788)) {
     return 1;
@@ -2594,7 +4419,7 @@ main(int argc, char **argv) {
   }
   // ✕ opens João's, the newest message at the bottom
   ui_keys(UI_CROSS);
-  if(ui_wanted(&req) != 1 || req.feed != UI_DM || strcmp(req.id, "1-77") || !(more=mem_calloc(8, sizeof *more))) {
+  if(ui_wanted(&req) != 1 || req.feed != UI_DM || strcmp(req.id, "1-77") || !(more=mem_calloc(12, sizeof *more))) {
     return fail("the conversation is not read");
   }
   count = make_messages(more, profile.id);
@@ -2625,9 +4450,28 @@ main(int argc, char **argv) {
      ui_dm_get(text, sizeof text) != (int)strlen("Combinado, \xc3\xa0s 22h!")) {
     return fail("the message is not sent");
   }
+  // its bubble at once, while it goes; nothing is read meanwhile
+  if(ui_wanted(&req) || draw(argv[1], "preview-dm-sending.png")) {
+    return fail("the conversation is read while a message goes");
+  }
+  // it did not go: its bubble says so, and ✕ on it writes it again
+  ui_action_done(ERR_NETWORK, 0, -1);
+  settled();
+  if(ui_wanted(&req) || draw(argv[1], "preview-dm-failed.png")) {
+    return 1;
+  }
+  ui_keys(UI_CROSS);
+  if(ui_action(id, sizeof id, user, sizeof user) != UI_ACT_DM_TEXT || strcmp(id, "1-77") ||
+     ui_dm_get(text, sizeof text) != (int)strlen("Combinado, \xc3\xa0s 22h!")) {
+    return fail("the cross on a message that did not go does not write it again");
+  }
+  ui_dm_text("Combinado, \xc3\xa0s 22h!");
+  if(ui_action(id, sizeof id, user, sizeof user) != UI_ACT_DM || strcmp(id, "1-77")) {
+    return fail("the message is not sent again");
+  }
   ui_action_done(ERR_NONE, 200, -1);
   if(ui_dm_get(text, sizeof text) || ui_wanted(&req) != 1 || req.feed != UI_DM ||
-     !(more=mem_calloc(8, sizeof *more))) {
+     !(more=mem_calloc(12, sizeof *more))) {
     return fail("the conversation is not read again");
   }
   count = make_messages(more, profile.id);
@@ -2636,7 +4480,7 @@ main(int argc, char **argv) {
   snprintf(more[count].text, sizeof more[count].text, "Combinado, \xc3\xa0s 22h!");
   more[count].time = NOW;
   ui_result(&req, more, count + 1, "", NULL, ERR_NONE, 200, -1, NOW);
-  if(draw(argv[1], "preview-dm-sent.png")) {
+  if(draw(argv[1], "preview-dm-sent.png") || psn_scenes(argv[1], profile.id)) {
     return 1;
   }
   ui_keys(UI_CIRCLE);
@@ -2723,7 +4567,21 @@ main(int argc, char **argv) {
   if(draw(argv[1], "preview-menu-other.png")) {
     return 1;
   }
-  ui_keys(UI_UP);   // Open the post, Quote, Follow
+  ui_keys(UI_UP);   // Open the post, Quote, Translate with Grok
+  ui_keys(UI_DOWN);
+  ui_keys(UI_DOWN);
+  ui_keys(UI_CROSS);
+  if(translate_scenes(argv[1])) {
+    return 1;
+  }
+  frame();
+  if(point_at(1342, 315)) {
+    return 1;
+  }
+  ui_keys(UI_CROSS);
+  ui_keys(UI_UP);   // Open the post, Quote, Translate with Grok, Read later, Follow
+  ui_keys(UI_DOWN);
+  ui_keys(UI_DOWN);
   ui_keys(UI_DOWN);
   ui_keys(UI_DOWN);
   ui_keys(UI_CROSS);
@@ -2795,7 +4653,10 @@ main(int argc, char **argv) {
       return fail("the composer does not open for the poll");
     }
     ui_compose_text("Qual \xc3\xa9 o melhor exclusivo da PS5? \xf0\x9f\x8e\xae");
-    ui_keys(UI_LEFT); // from Post to the poll's button
+    ui_keys(UI_LEFT); // from Post, past the phone's, dictation's and the voice note's buttons, to the poll's
+    ui_keys(UI_LEFT);
+    ui_keys(UI_LEFT);
+    ui_keys(UI_LEFT);
     ui_keys(UI_CROSS);
     if(ui_action(id, sizeof id, user, sizeof user) != UI_ACT_POLL_TEXT || ui_poll_choice(text, sizeof text) != 1) {
       return fail("the poll does not start with its first choice");
@@ -2839,7 +4700,7 @@ main(int argc, char **argv) {
   }
   ui_keys(UI_CROSS);
   ui_keys(UI_UP);
-  for(int i=0; i<3; i++) {
+  for(int i=0; i<5; i++) { // past Translate with Grok and Read later, to the profile
     ui_keys(UI_DOWN);
   }
   ui_keys(UI_CROSS);
@@ -2917,5 +4778,6 @@ main(int argc, char **argv) {
   if(link_scenes(argv[1])) {
     return 1;
   }
-  return extras(argv[1]) || share_scenes(argv[1]) || account_scenes(argv[1]) || login_scenes(argv[1]);
+  return extras(argv[1]) || share_scenes(argv[1]) || account_scenes(argv[1]) || login_scenes(argv[1]) ||
+         clip_scene(argv[1]) || motion_scenes(argv[1]) || game_corner_scenes(argv[1]);
 }

@@ -64,3 +64,12 @@ void mp4_free(mp4_t *m);
  * the index of the key frame at or before t milliseconds of the track, or 0
  **/
 int mp4_key_before(const mp4_track_t *t, int64_t ms);
+
+/**
+ * read the tracks of a progressive file from its moov box alone (moov, len
+ * bytes, header and all), the file being file_len bytes long: the samples'
+ * places are in the file, checked against that length, and their tracks'
+ * configurations point into moov. A fragmented file's moov has no samples:
+ * MP4_NO_TRACK
+ **/
+int mp4_parse_moov(mp4_t *m, const uint8_t *moov, size_t len, uint64_t file_len);

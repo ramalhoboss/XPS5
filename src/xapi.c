@@ -589,19 +589,20 @@ copy_image_url(char *dst, size_t size, const char *url) {
 
 
 /**
- * the game a user plays, when their profile's location says it: x.com's
- * new shape keeps it in location.location, the old one in legacy, and the
- * direct messages' users have it as it is
+ * the game a user plays, or that they are on XPS5, when their profile's
+ * location says it: x.com's new shape keeps it in location.location, the
+ * old one in legacy, and the direct messages' users have it as it is
  **/
 static void
-playing_of(const json_node_t *user, char *game, size_t size) {
+playing_of(const json_node_t *user, x_post_t *post) {
   const char *s;
 
   if(!(s=json_string(json_path(user, "location", "location", NULL))) &&
      !(s=json_string(json_path(user, "legacy", "location", NULL)))) {
     s = json_string(json_get(user, "location"));
   }
-  play_game_of(s, game, size);
+  play_game_of(s, post->playing, sizeof post->playing);
+  post->online = !post->playing[0] && play_online_of(s);
 }
 
 
@@ -832,7 +833,28 @@ add_quote(x_post_t *post, const json_node_t *tweet) {
 }
 
 
+/**
+ * the Community Note X shows under a post: what readers added, in
+ * birdwatch_pivot's subtitle (its title is always "Readers added context…")
+ **/
+static void
+add_note(x_post_t *post, const json_node_t *tweet) {
+  const char *note = json_string(json_path(tweet, "birdwatch_pivot", "subtitle", "text", NULL));
+  size_t n;
+
+  post->note[0] = 0;
+  if(!note || !note[0]) {
+    return;
+  }
+  copy_text(post->note, sizeof post->note, note);
+  for(n=strlen(post->note); n && (post->note[n - 1] == ' ' || post->note[n - 1] == '\n'); n--) {
+    post->note[n - 1] = 0;
+  }
+}
+
+
 static void add_poll(x_post_t *post, const json_node_t *tweet);
+static void add_space(x_post_t *post, const json_node_t *tweet);
 
 static void
 add_post(collect_t *c, const json_node_t *result) {
@@ -876,7 +898,7 @@ add_post(collect_t *c, const json_node_t *result) {
   }
   avatar(post->avatar, sizeof post->avatar, user_node);
   post->badge = badge(user_node);
-  playing_of(user_node, post->playing, sizeof post->playing);
+  playing_of(user_node, post);
   post->time = x_parse_time(json_string(json_path(tweet, "legacy", "created_at", NULL)));
   post->replies = count(json_path(tweet, "legacy", "reply_count", NULL));
   post->reposts = count(json_path(tweet, "legacy", "retweet_count", NULL));
@@ -898,6 +920,8 @@ add_post(collect_t *c, const json_node_t *result) {
   add_media(post, tweet);
   add_quote(post, tweet);
   add_poll(post, tweet);
+  add_space(post, tweet);
+  add_note(post, tweet);
 }
 
 
@@ -1128,6 +1152,214 @@ x_vote_request(char *url, size_t usize, char *body, size_t bsize, const char *ca
               "&twitter%%3Astring%%3Aselected_choice=%d", card + 7, id, name, choice) >= (int)bsize) {
     return -1;
   }
+  return 0;
+}
+
+
+/**
+ * Spaces: a post that shares one has a card called "audiospace" (or
+ * "<number>:audiospace") whose binding "id" is the Space's number, else a
+ * link to x.com/i/spaces/<number> in its text. AudioSpaceById says how it
+ * stands and the key of its sound; live_video_stream/status, given that
+ * key, says where the sound's HLS playlist is (2026-11-16, as yt-dlp and
+ * x.com ask them).
+ **/
+#define SPACE_QUERY "HPEisOmj1epUNLCWTYhUWw" // AudioSpaceById
+
+static const char space_features[] =
+  "{\"dont_mention_me_view_api_enabled\":true,\"interactive_text_enabled\":true,"
+  "\"responsive_web_edit_tweet_api_enabled\":true,\"responsive_web_enhance_cards_enabled\":true,"
+  "\"responsive_web_uc_gql_enabled\":true,\"spaces_2022_h2_clipping\":true,"
+  "\"spaces_2022_h2_spaces_communities\":false,\"standardized_nudges_misinfo\":true,"
+  "\"tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled\":false,"
+  "\"vibe_api_enabled\":true}";
+
+
+int
+x_space_id_ok(const char *id) {
+  size_t n = 0;
+
+  if(!id) {
+    return 0;
+  }
+  for(; id[n]; n++) {
+    if(!((id[n] >= '0' && id[n] <= '9') || (id[n] >= 'a' && id[n] <= 'z') || (id[n] >= 'A' && id[n] <= 'Z'))) {
+      return 0;
+    }
+  }
+  return n >= 8 && n <= 20 && n < X_SPACE_ID;
+}
+
+
+/**
+ * a media key as X writes them ("28_1857..."): letters, digits and "_"
+ **/
+static int
+space_key_ok(const char *key) {
+  size_t n = 0;
+
+  if(!key) {
+    return 0;
+  }
+  for(; key[n]; n++) {
+    if(!is_word(key[n])) {
+      return 0;
+    }
+  }
+  return n >= 3 && n < X_SPACE_KEY;
+}
+
+
+/**
+ * the Space a link names: ".../i/spaces/<number>" on x.com or twitter.com
+ **/
+static int
+space_of_link(const char *url, char *id, size_t size) {
+  static const char *const hosts[] = {"https://x.com/i/spaces/", "https://twitter.com/i/spaces/",
+                                      "https://mobile.x.com/i/spaces/", "https://mobile.twitter.com/i/spaces/"};
+  char got[X_SPACE_ID];
+  size_t n;
+
+  for(size_t i=0; url && i < sizeof hosts / sizeof hosts[0]; i++) {
+    if(strncmp(url, hosts[i], strlen(hosts[i]))) {
+      continue;
+    }
+    url += strlen(hosts[i]);
+    n = strcspn(url, "/?#");
+    if(n >= sizeof got || n >= size) {
+      return 0;
+    }
+    memcpy(got, url, n);
+    got[n] = 0;
+    if(!x_space_id_ok(got)) {
+      return 0;
+    }
+    strcpy(id, got);
+    return 1;
+  }
+  return 0;
+}
+
+
+static void
+add_space(x_post_t *post, const json_node_t *tweet) {
+  const json_node_t *card = json_get(tweet, "card"), *urls;
+  const char *name = json_string(json_path(card, "legacy", "name", NULL)), *s;
+
+  post->space[0] = 0;
+  if(name && strstr(name, "audiospace")) {
+    s = json_string(json_get(binding(json_path(card, "legacy", "binding_values", NULL), "id"), "string_value"));
+    if(x_space_id_ok(s)) {
+      strcpy(post->space, s);
+      return;
+    }
+  }
+  urls = json_path(tweet, "note_tweet", "note_tweet_results", "result", "entity_set", "urls", NULL);
+  if(!urls) {
+    urls = json_path(tweet, "legacy", "entities", "urls", NULL);
+  }
+  for(const json_node_t *u=urls ? urls->child : NULL; u; u=u->next) {
+    if(space_of_link(json_string(json_get(u, "expanded_url")), post->space, sizeof post->space)) {
+      return;
+    }
+  }
+}
+
+
+int
+x_space_url(char *buf, size_t size, const char *id) {
+  char variables[384];
+  size_t n = 0;
+
+  if(!x_space_id_ok(id) ||
+     snprintf(variables, sizeof variables, "{\"id\":\"%s\",\"isMetatagsQuery\":true,"
+              "\"withDownvotePerspective\":false,\"withReactionsMetadata\":false,"
+              "\"withReactionsPerspective\":false,\"withReplays\":true,\"withSuperFollowsUserFields\":true,"
+              "\"withSuperFollowsTweetFields\":true}", id) >= (int)sizeof variables) {
+    return -1;
+  }
+  return append(buf, size, &n, "https://x.com/i/api/graphql/" SPACE_QUERY "/AudioSpaceById?variables=", 0) ||
+    append(buf, size, &n, variables, 1) ||
+    append(buf, size, &n, "&features=", 0) ||
+    append(buf, size, &n, space_features, 1) ? -1 : 0;
+}
+
+
+int
+x_space_parse(const json_node_t *root, x_space_t *space) {
+  const json_node_t *meta = json_path(root, "data", "audioSpace", "metadata", NULL), *who, *list;
+  const char *s;
+  long long t;
+
+  memset(space, 0, sizeof *space);
+  space->listeners = -1;
+  s = json_string(json_get(meta, "media_key"));
+  if(!meta || !space_key_ok(s)) {
+    return -1;
+  }
+  strcpy(space->media_key, s);
+  if(x_space_id_ok(s=json_string(json_get(meta, "rest_id")))) {
+    strcpy(space->id, s);
+  }
+  if((s=json_string(json_get(meta, "title")))) {
+    copy_text(space->title, sizeof space->title, s);
+  }
+  s = json_string(json_get(meta, "state"));
+  space->state = !s ? X_SPACE_UNKNOWN : !strcmp(s, "Running") ? X_SPACE_LIVE :
+    !strcmp(s, "NotStarted") ? X_SPACE_SOON :
+    !strcmp(s, "Ended") || !strcmp(s, "TimedOut") || !strcmp(s, "Canceled") ? X_SPACE_ENDED : X_SPACE_UNKNOWN;
+  space->replay = is_true(json_get(meta, "is_space_available_for_replay"));
+  t = count(json_get(meta, "started_at"));
+  space->started = t > 0 ? t / 1000 : 0;
+  space->listeners = count(json_get(meta, space->state == X_SPACE_ENDED ? "total_replay_watched" :
+                                    "total_live_listeners"));
+  if(space->listeners < 0 && space->state == X_SPACE_ENDED) {
+    space->listeners = count(json_get(meta, "total_live_listeners"));
+  }
+  // who made it: its name under core now, under legacy before
+  who = json_path(meta, "creator_results", "result", NULL);
+  if(!(s=json_string(json_path(who, "core", "screen_name", NULL)))) {
+    s = json_string(json_path(who, "legacy", "screen_name", NULL));
+  }
+  if(s && strlen(s) < sizeof space->host) {
+    strcpy(space->host, s);
+  }
+  if(!(s=json_string(json_path(who, "core", "name", NULL)))) {
+    s = json_string(json_path(who, "legacy", "name", NULL));
+  }
+  if(s) {
+    copy_text(space->host_name, sizeof space->host_name, s);
+  }
+  list = json_path(root, "data", "audioSpace", "participants", "speakers", NULL);
+  for(const json_node_t *p=list ? list->child : NULL; p; p=p->next) {
+    space->speakers++;
+  }
+  return 0;
+}
+
+
+int
+x_space_stream_url(char *buf, size_t size, const char *media_key) {
+  if(!space_key_ok(media_key) ||
+     snprintf(buf, size, "https://x.com/i/api/1.1/live_video_stream/status/%s?client=web"
+              "&use_syndication_guest_id=false&cookie_set_host=x.com", media_key) >= (int)size) {
+    return -1;
+  }
+  return 0;
+}
+
+
+int
+x_space_stream_parse(const json_node_t *root, char *url, size_t size) {
+  const char *s = json_string(json_path(root, "source", "noRedirectPlaybackUrl", NULL));
+
+  if(!s || strncmp(s, "https://", 8)) {
+    s = json_string(json_path(root, "source", "location", NULL));
+  }
+  if(!s || strncmp(s, "https://", 8) || strlen(s) >= size || strpbrk(s, " \r\n\"")) {
+    return -1;
+  }
+  strcpy(url, s);
   return 0;
 }
 
@@ -1401,7 +1633,7 @@ add_user(collect_t *c, const json_node_t *item) {
   }
   avatar(post->avatar, sizeof post->avatar, r);
   post->badge = badge(r);
-  playing_of(r, post->playing, sizeof post->playing);
+  playing_of(r, post);
   if((s=json_string(json_path(r, "profile_bio", "description", NULL))) ||
      (s=json_string(json_path(r, "legacy", "description", NULL)))) {
     copy_text(post->text, sizeof post->text, s);
@@ -1784,6 +2016,39 @@ x_compose_request(char *url, size_t usize, char *body, size_t bsize, const x_com
 }
 
 
+/**
+ * the first media_url_https under node, depth members deep at most
+ **/
+static const char *
+first_media_url(const json_node_t *node, int depth) {
+  const char *s;
+
+  for(const json_node_t *n=node ? node->child : NULL; n && depth > 0; n=n->next) {
+    if(n->key && !strcmp(n->key, "media_url_https") && n->type == JSON_STRING) {
+      return n->str;
+    }
+    if((n->type == JSON_OBJECT || n->type == JSON_ARRAY) && (s=first_media_url(n, depth - 1))) {
+      return s;
+    }
+  }
+  return NULL;
+}
+
+
+int
+x_created_media_url(const json_node_t *root, char *url, size_t size) {
+  const char *s = first_media_url(root, 24), *dot;
+
+  // https://pbs.twimg.com/media/<name>.<format>, at its whole size
+  if(!s || strncmp(s, "https://pbs.twimg.com/media/", 28) || !(dot=strrchr(s, '.')) || dot < s + 29 ||
+     strchr(dot, '/') || strchr(dot, '?') || strlen(dot + 1) < 3 || strlen(dot + 1) > 4 ||
+     snprintf(url, size, "%.*s?format=%s&name=orig", (int)(dot - s), s, dot + 1) >= (int)size) {
+    return -1;
+  }
+  return 0;
+}
+
+
 int
 x_schedule_request(char *url, size_t usize, char *body, size_t bsize, const char *text,
                    const char *const *media, int media_count, long long at) {
@@ -2062,19 +2327,23 @@ dm_person(x_post_t *p, const json_node_t *u) {
   }
   copy_image_url(p->avatar, sizeof p->avatar, json_string(json_get(u, "profile_image_url_https")));
   p->badge = badge(u);
-  playing_of(u, p->playing, sizeof p->playing);
+  playing_of(u, p);
 }
 
 
 /**
- * what a message's text carries, an invite to play being one
+ * what a message's text carries, an invite to play or a request to join
+ * being one
  **/
 static int
 dm_kind(const x_post_t *p, int carries) {
   char game[PLAY_GAME], id[16];
 
-  return carries == X_DM_TEXT && play_invite_parse(p->text, game, sizeof game, id, sizeof id) ? X_DM_INVITE :
-    carries;
+  if(carries != X_DM_TEXT) {
+    return carries;
+  }
+  return play_invite_parse(p->text, game, sizeof game, id, sizeof id) ? X_DM_INVITE :
+    play_join_parse(p->text, game, sizeof game) ? X_DM_JOIN : carries;
 }
 
 
@@ -2226,6 +2495,7 @@ x_dm_inbox(const json_node_t *root, const char *me, x_post_t *posts, int max) {
       }
       p->badge = X_BADGE_NONE;
       p->playing[0] = 0;
+      p->online = 0;
     }
     p->unread = me && sort && later(sort, mine_read);
   }
@@ -2306,6 +2576,50 @@ x_dm_messages(const json_node_t *root, const char *conversation, x_post_t *posts
   }
   if(posts) {
     qsort(posts, n, sizeof *posts, oldest_first);
+  }
+  return n;
+}
+
+
+int
+x_dm_members(const json_node_t *root, const char *conversation, const char *me, x_post_t *people, int max) {
+  const json_node_t *data = json_get(root, "conversation_timeline"), *c = NULL, *list;
+  int n = 0;
+
+  if(!data) {
+    data = json_get(root, "inbox_initial_state");
+  }
+  if(!conversation || !conversation_number(conversation)) {
+    return 0;
+  }
+  // the conversation's own entry: its participants, in the order X keeps them
+  c = json_get(json_get(data, "conversations"), conversation);
+  list = json_get(c, "participants");
+  for(const json_node_t *u=list ? list->child : NULL; u && (!people || n < max); u=u->next) {
+    const char *uid = json_string(json_get(u, "user_id"));
+    const json_node_t *who = dm_user(data, uid);
+    x_post_t *p;
+    int seen = 0;
+
+    if(!uid || !uid[0] || (me && !strcmp(uid, me)) || !who) {
+      continue;
+    }
+    for(int i=0; people && i < n && !seen; i++) {
+      seen = !strcmp(people[i].user_id, uid);
+    }
+    if(seen) {
+      continue;
+    }
+    if(!people) {
+      n++;
+      continue;
+    }
+    p = &people[n++];
+    memset(p, 0, sizeof *p);
+    p->kind = X_KIND_USER;
+    p->replies = p->reposts = p->likes = p->views = -1;
+    dm_person(p, who);
+    snprintf(p->user_id, sizeof p->user_id, "%s", uid);
   }
   return n;
 }
@@ -2436,6 +2750,47 @@ x_grok_prompt(char *out, size_t size, const char *game, const char *question, co
                  "endings, characters' fates, or bosses, areas and items I have not mentioned.",
                  game && game[0] ? "\"" : "a game", game && game[0] ? game : "", game && game[0] ? "\"" : "",
                  question, language);
+  if(len < 0 || (size_t)len >= size) {
+    out[0] = 0;
+    return -1;
+  }
+  return 0;
+}
+
+
+int
+x_grok_translate_prompt(char *out, size_t size, const char *author, const char *text, const char *language) {
+  int len;
+
+  if(!size || !text || !text[0] || !language || !language[0]) {
+    return -1;
+  }
+  len = snprintf(out, size,
+                 "Translate this post on X%s%s into %s. Answer with the translation alone, as plain text, "
+                 "keeping its line breaks, @mentions, #hashtags, links and emoji as they are. If it is "
+                 "already in %s, answer with it as it is.\n\n%s",
+                 author && author[0] ? " by @" : "", author && author[0] ? author : "", language, language, text);
+  if(len < 0 || (size_t)len >= size) {
+    out[0] = 0;
+    return -1;
+  }
+  return 0;
+}
+
+
+int
+x_grok_catchup_prompt(char *out, size_t size, const char *lines, const char *language) {
+  int len;
+
+  if(!size || !lines || !lines[0] || !language || !language[0]) {
+    return -1;
+  }
+  len = snprintf(out, size,
+                 "These are the newest posts on my X timeline since I last looked, one a line as "
+                 "\"@author: words\". Sum up what happened in exactly three short lines in %s, as plain "
+                 "text: no title, no list marks, no markdown, no links. Say who said what where it matters, "
+                 "with their @names.\n\n%s",
+                 language, lines);
   if(len < 0 || (size_t)len >= size) {
     out[0] = 0;
     return -1;

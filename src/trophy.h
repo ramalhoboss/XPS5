@@ -77,3 +77,19 @@ int trophy_grade(char *conf, size_t len, int id);
  * place), with no control characters; 0, or -1 when it does not name it
  **/
 int trophy_names(char *meta, size_t len, int id, char *name, size_t size, char *game, size_t game_size);
+
+#define TROPHY_DETAIL 256 // bytes of a trophy's description kept
+
+// a trophy of a set, as trophy_list reads it
+typedef struct trophy_info {
+  int  id, grade, hidden;    // grade: TROPHY_*; hidden: its name says nothing until earned
+  char name[TROPHY_NAME];    // empty when the meta file has none
+  char detail[TROPHY_DETAIL];
+} trophy_info_t;
+
+/**
+ * the set's trophies in the order of its tropconf.json (conf), with their
+ * names and descriptions from a tropmeta file (meta, or NULL), both changed
+ * in place, into list (at most max); how many, or -1 when conf is not one
+ **/
+int trophy_list(char *conf, size_t conf_len, char *meta, size_t meta_len, trophy_info_t *list, int max);

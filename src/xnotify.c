@@ -7,6 +7,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "play.h"
 #include "xnotify.h"
 
 
@@ -125,7 +126,7 @@ xnotify_toast(const x_post_t *p, int lang, xnotify_toast_t *t) {
   // in the order of LANG_* (settings.h)
   static const char *const wrote[] = {
     "%s (@%s) wrote to you", "%s (@%s) escreveu-te", "%s (@%s) te escribi\xc3\xb3",
-    "%s (@%s) t'a \xc3\xa9" "crit", "%s (@%s) hat dir geschrieben", "%s (@%s) ti ha scritto",
+    ("%s (@%s) t'a \xc3\xa9" "crit"), "%s (@%s) hat dir geschrieben", "%s (@%s) ti ha scritto",
     "%s (@%s) schreef je",
   };
   char who[256];
@@ -152,6 +153,144 @@ xnotify_toast(const x_post_t *p, int lang, xnotify_toast_t *t) {
   line(t->title, sizeof t->title, who);
   line(t->body, sizeof t->body, p->text);
   bigger(t->avatar, sizeof t->avatar, p->avatar);
+  t->icon = "messages";
+}
+
+
+int
+xnotify_dm_fresh(xnotify_t *n, x_post_t *chats, int *count, int *fresh, int max) {
+  int kept = 0;
+
+  for(int i=0; i < *count; i++) {
+    if(chats[i].kind != X_KIND_CHAT || !chats[i].unread || chats[i].mine || chats[i].request) {
+      continue;
+    }
+    if(kept != i) {
+      chats[kept] = chats[i];
+    }
+    kept++;
+  }
+  *count = kept;
+  // a conversation's key changes with its last message (its time and text)
+  return xnotify_fresh(n, chats, kept, fresh, max);
+}
+
+
+int
+xnotify_newer(const x_post_t *posts, int count, long long since, long long *newest) {
+  int n = 0;
+
+  for(int i=0; i < count; i++) {
+    n += posts[i].time > since;
+    if(newest && posts[i].time > *newest) {
+      *newest = posts[i].time;
+    }
+  }
+  return n;
+}
+
+
+void
+xnotify_dm_toast(const x_post_t *p, int lang, xnotify_toast_t *t) {
+  // in the order of LANG_* (settings.h)
+  static const char *const message[] = {
+    "Message", "Mensagem", "Mensaje", "Message", "Nachricht", "Messaggio", "Bericht",
+  };
+  static const char *const photo[] = {
+    "Sent a photo", "Enviou uma foto", "Envi\303\263 una foto", "A envoy\303\251 une photo",
+    "Hat ein Foto gesendet", "Ha inviato una foto", "Heeft een foto gestuurd",
+  };
+  static const char *const video[] = {
+    "Sent a video", "Enviou um v\303\255" "deo", "Envi\303\263 un v\303\255" "deo", "A envoy\303\251 une vid\303\251o",
+    "Hat ein Video gesendet", "Ha inviato un video", "Heeft een video gestuurd",
+  };
+  static const char *const gif[] = {
+    "Sent a GIF", "Enviou um GIF", "Envi\303\263 un GIF", "A envoy\303\251 un GIF",
+    "Hat ein GIF gesendet", "Ha inviato una GIF", "Heeft een GIF gestuurd",
+  };
+  static const char *const post[] = {
+    "Shared a post", "Partilhou um post", "Comparti\303\263 un post", "A partag\303\251 un post",
+    "Hat einen Post geteilt", "Ha condiviso un post", "Heeft een post gedeeld",
+  };
+  static const char *const invite[] = {
+    "Invites you to play %s", "Convida-te para jogar %s", "Te invita a jugar a %s",
+    "T'invite \303\240 jouer \303\240 %s", ("L\303\244" "dt dich zu %s ein"), "Ti invita a giocare a %s",
+    "Nodigt je uit voor %s",
+  };
+  static const char *const voice[] = {
+    "Sent a voice message", "Enviou uma mensagem de voz", "Envi\303\263 un mensaje de voz",
+    "A envoy\303\251 un message vocal", "Hat eine Sprachnachricht gesendet", "Ha inviato un messaggio vocale",
+    "Heeft een spraakbericht gestuurd",
+  };
+  static const char *const file[] = {
+    "Sent a file", "Enviou um ficheiro", "Envi\303\263 un archivo", "A envoy\303\251 un fichier",
+    "Hat eine Datei gesendet", "Ha inviato un file", "Heeft een bestand gestuurd",
+  };
+  static const char *const missed[] = {
+    "Missed call", "Chamada perdida", "Llamada perdida", "Appel manqu\303\251", "Verpasster Anruf",
+    "Chiamata persa", "Gemiste oproep",
+  };
+  static const char *const calling[] = {
+    "Is calling you", "Est\303\241 a ligar-te", "Te est\303\241 llamando", "T'appelle", "Ruft dich an",
+    "Ti sta chiamando", "Belt je",
+  };
+  static const char *const called[] = {
+    "Called you", "Ligou-te", "Te llam\303\263", "T'a appel\303\251", "Hat dich angerufen", "Ti ha chiamato",
+    "Heeft je gebeld",
+  };
+  static const char *const sealed[] = {
+    "Sent you an encrypted message", "Enviou-te uma mensagem cifrada", "Te envi\303\263 un mensaje cifrado",
+    "T'a envoy\303\251 un message chiffr\303\251", "Hat dir eine verschl\303\274sselte Nachricht gesendet",
+    "Ti ha inviato un messaggio cifrato", "Heeft je een versleuteld bericht gestuurd",
+  };
+  static const char *const sealed_short[] = {
+    "Encrypted message", "Mensagem cifrada", "Mensaje cifrado", "Message chiffr\303\251",
+    "Verschl\303\274sselte Nachricht", "Messaggio cifrato", "Versleuteld bericht",
+  };
+  static const char *const join[] = {
+    "Asks to join your game of %s", "Pede para entrar no teu jogo de %s", "Pide unirse a tu partida de %s",
+    "Demande \303\240 rejoindre ta partie de %s", ("M\303\266" "chte bei %s mitspielen"),
+    "Chiede di unirsi alla tua partita di %s", "Vraagt om mee te doen met %s",
+  };
+  char who[256], what[XNOTIFY_TEXT * 2], said[XNOTIFY_TEXT * 3], game[PLAY_GAME], id[32];
+
+  lang = lang >= 0 && lang < (int)(sizeof message / sizeof *message) ? lang : 0;
+  memset(t, 0, sizeof *t);
+  // who wrote: the person, or the group
+  if(!p->group && p->user[0]) {
+    snprintf(who, sizeof who, "%s (@%s)", p->name[0] ? p->name : p->user, p->user);
+  } else {
+    snprintf(who, sizeof who, "%s", p->name[0] ? p->name : message[lang]);
+  }
+  line(t->title, sizeof t->title, who);
+
+  // what: the words, or what came without them
+  if(p->icon == X_DM_INVITE && play_invite_parse(p->text, game, sizeof game, id, sizeof id) && game[0]) {
+    snprintf(what, sizeof what, invite[lang], game);
+  } else if(p->icon == X_DM_JOIN && play_join_parse(p->text, game, sizeof game) && game[0]) {
+    snprintf(what, sizeof what, join[lang], game);
+  } else if(p->text[0]) {
+    snprintf(what, sizeof what, "%.*s", XNOTIFY_TEXT, p->text);
+  } else if(p->xchat && p->sealed) {
+    // X Chat's words are encrypted, and no key opened them: only who wrote
+    snprintf(what, sizeof what, "%s", p->group ? sealed_short[lang] : sealed[lang]);
+  } else if(p->icon == X_DM_CALL) {
+    snprintf(what, sizeof what, "%s", p->event == X_EV_CALL_STARTED ? calling[lang] :
+             p->event == X_EV_CALL_ENDED ? called[lang] : missed[lang]);
+  } else {
+    snprintf(what, sizeof what, "%s", p->icon == X_DM_PHOTO ? photo[lang] : p->icon == X_DM_VIDEO ? video[lang] :
+             p->icon == X_DM_GIF ? gif[lang] : p->icon == X_DM_POST ? post[lang] :
+             p->icon == X_DM_VOICE ? voice[lang] : p->icon == X_DM_FILE ? file[lang] : message[lang]);
+  }
+  // a group's says who of them wrote
+  if(p->group && p->quote_name[0]) {
+    snprintf(said, sizeof said, "%.*s: %s", 120, p->quote_name, what);
+  } else {
+    snprintf(said, sizeof said, "%s", what);
+  }
+  line(t->body, sizeof t->body, said);
+  snprintf(t->extra, sizeof t->extra, "%s \302\267 XPS5", p->xchat ? "X Chat" : message[lang]);
+  bigger(t->avatar, sizeof t->avatar, p->avatar[0] ? p->avatar : p->face_count ? p->faces[0] : "");
   t->icon = "messages";
 }
 

@@ -32,6 +32,18 @@ void images_frame(void);
 const uint32_t *images_get(const char *url, int w, int h);
 
 /**
+ * the same for a picture whose bytes are encrypted (X Chat's): the loader
+ * fetches them and opens them with key (xcrypt_media_open) before decoding
+ **/
+const uint32_t *images_get_enc(const char *url, const uint8_t key[32], int w, int h);
+
+/**
+ * for the loader, after images_next: whether the picture url (w x h) is
+ * encrypted and, when it is, its key into key (32 bytes)
+ **/
+int images_key(const char *url, int w, int h, uint8_t key[32]);
+
+/**
  * for the loader: the next picture wanted, the most recently asked first;
  * returns 0 when there is none
  **/
@@ -64,6 +76,12 @@ int images_arrived(void);
  * around its middle; malloc'd, or NULL
  **/
 uint32_t *image_fit(const void *data, size_t len, int w, int h);
+
+/**
+ * the same from iw x ih pixels already decoded (0xAABBGGRR); mem_alloc'd,
+ * or NULL
+ **/
+uint32_t *image_fit_pixels(const uint32_t *pixels, int iw, int ih, int w, int h);
 
 /**
  * the size of a JPEG, PNG or GIF that can be decoded; returns 0, or -1 when

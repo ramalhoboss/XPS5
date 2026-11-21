@@ -648,3 +648,34 @@ mp4_key_before(const mp4_track_t *t, int64_t ms) {
   }
   return best;
 }
+
+
+int
+mp4_parse_moov(mp4_t *m, const uint8_t *moov, size_t len, uint64_t file_len) {
+  parse_t ps;
+  span_t body;
+  uint32_t type;
+  size_t off = 0;
+  int ret = MP4_NO_MOOV, a, v;
+
+  memset(m, 0, sizeof *m);
+  memset(&ps, 0, sizeof ps);
+  ps.file = moov;
+  ps.len = file_len > (uint64_t)SIZE_MAX ? SIZE_MAX : (size_t)file_len; // what the samples' places are checked with
+  if(next_box(moov, len, &off, &type, &body) && type == FOURCC('m', 'o', 'o', 'v')) {
+    ret = parse_moov(m, &ps, body);
+  }
+  if(!ret && (!m->video.found || !m->video.count) && (!m->audio.found || !m->audio.count)) {
+    ret = MP4_NO_TRACK; // none, or a fragmented file's, whose samples are not in it
+  }
+  if(ret) {
+    mp4_free(m);
+    return ret;
+  }
+  m->video.found = m->video.found && m->video.count;
+  m->audio.found = m->audio.found && m->audio.count;
+  v = duration_ms(&m->video);
+  a = duration_ms(&m->audio);
+  m->duration_ms = v > a ? v : a;
+  return MP4_OK;
+}

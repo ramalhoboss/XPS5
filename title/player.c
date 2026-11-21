@@ -47,10 +47,19 @@ int sceAudioOutInit(void);
 int sceAudioOutOpen(int user, int type, int index, unsigned len, unsigned freq, unsigned param);
 int sceAudioOutOutput(int handle, const void *ptr);
 int sceAudioOutClose(int handle);
+int sceUserServiceGetInitialUser(int *user);
+
+#define AUDIO_MAIN    0 // SCE_AUDIO_OUT_PORT_TYPE_MAIN: the TV's
+#define AUDIO_PADSPK  4 // SCE_AUDIO_OUT_PORT_TYPE_PADSPK: the controller's speaker, of a user, mono
+#define AUDIO_MONO    0 // SCE_AUDIO_OUT_PARAM_FORMAT_S16_MONO
+#define AUDIO_STEREO  1 // SCE_AUDIO_OUT_PARAM_FORMAT_S16_STEREO
+
+static int g_next_speaker; // the next player_open's sound goes to the controller (player_speaker)
 
 typedef struct session {
   char      url[URL_MAX];
   int       w, h;
+  int       speaker;    // its sound on the controller's speaker, when that opens
   int       want_w, want_h; // a new size the screen asked for, 0 for none
   volatile int stop;
 
@@ -120,6 +129,8 @@ typedef struct scale {
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static session_t      *g_cur;
+static char            g_cut_url[URL_MAX]; // a video whose file stopped coming partway,
+static int             g_cut_ms;           // and where: opened again, it goes on from there
 static int             g_changed;
 static void          (*g_log)(const char *fmt, ...);
 
@@ -583,13 +594,13 @@ audio_main(void *arg) {
   session_t *s = arg;
   const mp4_track_t *t = &s->mp4.audio;
   AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
-  int16_t block[GRAIN * 2];
+  int16_t block[GRAIN * 2], mono[GRAIN];
   int16_t *out = NULL;
   AVCodecContext *ctx = NULL;
   SwrContext *swr = NULL;
   AVPacket *pkt = av_packet_alloc();
   AVFrame *f = av_frame_alloc();
-  int port = -1, epoch = -1, i = 0, filled = 0, room = 0, n, ret = -1, sound, paused, ms;
+  int port = -1, epoch = -1, i = 0, filled = 0, room = 0, n, ret = -1, sound, paused, ms, user, pad = 0;
   mp4_sample_t sample;
   int64_t clock;
 
@@ -603,7 +614,16 @@ audio_main(void *arg) {
     goto out;
   }
   sceAudioOutInit();
-  if((port=sceAudioOutOpen(0xff, 0, 0, GRAIN, RATE, 1)) < 0) {
+  // a voice note on the controller's speaker, when asked and it opens; the TV's otherwise
+  if(s->speaker && !sceUserServiceGetInitialUser(&user)) {
+    if((port=sceAudioOutOpen(user, AUDIO_PADSPK, 0, GRAIN, RATE, AUDIO_MONO)) >= 0) {
+      pad = 1;
+      say("player: on the controller's speaker");
+    } else {
+      say("player: the controller's speaker 0x%08x, on the TV", (unsigned)port);
+    }
+  }
+  if(!pad && (port=sceAudioOutOpen(0xff, AUDIO_MAIN, 0, GRAIN, RATE, AUDIO_STEREO)) < 0) {
     say("player: audio port 0x%08x", (unsigned)port);
     goto out;
   }
@@ -668,7 +688,14 @@ audio_main(void *arg) {
         memcpy(block + filled * 2, out + k * 2, (size_t)take * 4);
         filled += take;
         k += take;
-        if(filled == GRAIN) {
+        if(filled == GRAIN && pad) {
+          // the controller's speaker takes one channel: the two, halved
+          for(int j=0; j < GRAIN; j++) {
+            mono[j] = (int16_t)(((int)block[2 * j] + block[2 * j + 1]) / 2);
+          }
+          sceAudioOutOutput(port, mono);
+          filled = 0;
+        } else if(filled == GRAIN) {
           sceAudioOutOutput(port, block);
           filled = 0;
         }
@@ -722,11 +749,82 @@ idle(session_t *s) {
 }
 
 
+// the reader of the PS5's captures (main.c's, through the payload)
+static long long (*g_read_file)(const char *path, long long off, void *buf, size_t len, long long *total);
+
+#define FILE_PART (2 << 20) // bytes of a capture read at a time
+
+
+void
+player_files(long long (*read)(const char *path, long long off, void *buf, size_t len, long long *total)) {
+  g_read_file = read;
+}
+
+
+static void
+file_end(https_stream_t *st, long long ret) {
+  st->error = ret < 0 && ret > -100000 ? (int)ret : -1;
+  __atomic_store_n(&st->state, HTTPS_STREAM_FAILED, __ATOMIC_RELEASE);
+}
+
+
+/**
+ * a capture of the PS5's (file://<path>) into the stream, a part at a
+ * time, as https_get_stream fills it from the network
+ **/
+static void
+fetch_file(session_t *s, const char *path) {
+  https_stream_t *st = &s->net;
+  long long total = 0, n = -1;
+  size_t got, part;
+  char *first, *body;
+
+  if(!g_read_file || !(first=malloc(FILE_PART))) {
+    file_end(st, -1);
+    return;
+  }
+  if((n=g_read_file(path, 0, first, FILE_PART, &total)) < 0 || total <= 0 || total > VIDEO_MAX ||
+     n > total || !(body=mem_alloc((size_t)total + 1))) {
+    free(first);
+    file_end(st, n < 0 ? n : -1);
+    return;
+  }
+  memcpy(body, first, (size_t)n);
+  free(first);
+  body[total] = 0;
+  st->status = 200;
+  st->body = body;
+  st->len = (size_t)total;
+  got = (size_t)n;
+  __atomic_store_n(&st->got, got, __ATOMIC_RELEASE);
+  __atomic_store_n(&st->state, HTTPS_STREAM_READING, __ATOMIC_RELEASE);
+  while(got < st->len) {
+    if(s->stop) {
+      file_end(st, -1);
+      return;
+    }
+    part = st->len - got < FILE_PART ? st->len - got : FILE_PART;
+    if((n=g_read_file(path, (long long)got, body + got, part, NULL)) <= 0) {
+      file_end(st, n);
+      return;
+    }
+    got += (size_t)n;
+    __atomic_store_n(&st->got, got, __ATOMIC_RELEASE);
+  }
+  st->error = 0;
+  __atomic_store_n(&st->state, HTTPS_STREAM_DONE, __ATOMIC_RELEASE);
+}
+
+
 static void *
 fetch_main(void *arg) {
   session_t *s = arg;
 
-  https_get_stream(s->url, VIDEO_MAX, &s->net);
+  if(!strncmp(s->url, "file://", 7)) {
+    fetch_file(s, s->url + 7);
+  } else {
+    https_get_stream(s->url, VIDEO_MAX, &s->net);
+  }
   return NULL;
 }
 
@@ -771,6 +869,37 @@ complete(const session_t *s) {
 
 
 /**
+ * whether that was all of the file, not what came before it stopped coming
+ **/
+static int
+whole(const session_t *s) {
+  return complete(s) && __atomic_load_n(&s->net.state, __ATOMIC_ACQUIRE) == HTTPS_STREAM_DONE;
+}
+
+
+/**
+ * the end of what came of a file that stopped coming partway (the network
+ * failed for good): the picture stays, paused at ms, and the error says so;
+ * opened again, it goes on from there. Going back to the start, as at the
+ * real end, made a long video start over and over
+ **/
+static void
+cut_short(session_t *s, int ms) {
+  say("player: the file stopped coming at %zu of %zu KiB (%d), at %d s", s->net.got >> 10, s->net.len >> 10,
+      s->net.error, ms / 1000);
+  pthread_mutex_lock(&g_lock);
+  s->base_ms = ms;
+  s->paused = 1;
+  s->epoch++;
+  s->pos_ms = ms;
+  snprintf(g_cut_url, sizeof g_cut_url, "%s", s->url);
+  g_cut_ms = ms;
+  pthread_mutex_unlock(&g_lock);
+  set_state(s, PLAYER_FAILED, PLAYER_ERR_CUT, s->net.error);
+}
+
+
+/**
  * ms of the track from its sample i to the last that came
  **/
 static int
@@ -793,6 +922,60 @@ set_buffering(session_t *s, int on) {
 }
 
 
+/**
+ * an MP4 with sound only (a voice note of X Chat), all of it come: its
+ * sound plays by the clock, which this thread moves on, seeks and stops at
+ * the end, back at the start and paused (a voice note plays once)
+ **/
+static void
+play_sound_only(session_t *s) {
+  pthread_attr_t attr;
+  int seek, paused, len;
+  int64_t clock;
+
+  pthread_mutex_lock(&g_lock);
+  s->len_ms = (int)s->mp4.duration_ms;
+  s->has_audio = 1;
+  len = s->len_ms;
+  pthread_mutex_unlock(&g_lock);
+  set_clock(s, 0);
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, AUDIO_STACK);
+  s->audio_started = !pthread_create(&s->audio, &attr, audio_main, s);
+  pthread_attr_destroy(&attr);
+  if(!s->audio_started) {
+    set_state(s, PLAYER_FAILED, PLAYER_ERR_MEMORY, 0);
+    return;
+  }
+  set_state(s, PLAYER_PLAYING, 0, 0);
+  while(!s->stop) {
+    pthread_mutex_lock(&g_lock);
+    seek = s->seek_ms;
+    s->seek_ms = -1;
+    paused = s->paused;
+    clock = clock_ms(s);
+    if(!paused && len > 0 && clock >= len) {
+      // the end: back at the start, paused
+      s->paused = 1;
+      s->base_ms = 0;
+      s->base_us = now_us();
+      s->epoch++;
+      clock = 0;
+    }
+    if(s->pos_ms != (int)clock) {
+      s->pos_ms = (int)(clock < 0 ? 0 : clock);
+      g_changed = 1;
+    }
+    pthread_mutex_unlock(&g_lock);
+    if(seek >= 0) {
+      set_clock(s, seek);
+      continue;
+    }
+    sceKernelUsleep(paused ? 30000 : 15000);
+  }
+}
+
+
 static void *
 video_main(void *arg) {
   session_t *s = arg;
@@ -803,7 +986,7 @@ video_main(void *arg) {
   scale_t *sc = NULL;
   pthread_attr_t attr;
   int i = 0, ret, have = 0, draining = 0, ms = 0, last_ms = 0, seek = -1, paused, resized, pictures = 0,
-      dropped = 0, waits = 0, stalled = 0, state;
+      dropped = 0, waits = 0, stalled = 0, state, sound_only = 0, cut = 0;
   int64_t clock;
 
   // the file comes on a thread of its own
@@ -827,6 +1010,11 @@ video_main(void *arg) {
     if(t->found && t->count && (complete(s) || ahead_ms(t, 0) >= START_MS)) {
       break;
     }
+    // sound alone (a voice note): once all of it came
+    if(!t->found && s->mp4.audio.found && s->mp4.audio.count && complete(s)) {
+      sound_only = 1;
+      break;
+    }
     if(state == HTTPS_STREAM_FAILED && (!s->net.body || !t->count)) {
       if(s->net.status && s->net.status != 200) {
         say("player: video HTTP %d", s->net.status);
@@ -844,6 +1032,12 @@ video_main(void *arg) {
     }
     sceKernelUsleep(20000);
   }
+  if(sound_only) {
+    say("player: sound only, %d blocks at %d Hz, %lld ms, %zu KiB", s->mp4.audio.count, s->mp4.audio.rate,
+        (long long)s->mp4.duration_ms, s->net.len >> 10);
+    play_sound_only(s);
+    goto out;
+  }
   say("player: %dx%d, %d pictures, %d sound blocks, %lld ms, %zu of %zu KiB", t->width, t->height, t->count,
       s->mp4.audio.count, (long long)s->mp4.duration_ms, s->tried >> 10, s->net.len >> 10);
   if((ret=open_decoder(&ctx, AV_CODEC_ID_H264, t, DECODERS)) || !(pkt=av_packet_alloc()) ||
@@ -859,7 +1053,7 @@ video_main(void *arg) {
   memset(sc, 0, sizeof *sc);
   pthread_mutex_lock(&g_lock);
   // X's length, until all of the file came
-  if(!s->len_ms || complete(s)) {
+  if(!s->len_ms || whole(s)) {
     s->len_ms = (int)s->mp4.duration_ms;
   }
   s->has_audio = s->mp4.audio.found;
@@ -890,7 +1084,7 @@ video_main(void *arg) {
     }
 
     // more of the file
-    if(!read_tables(s) && complete(s) && s->mp4.duration_ms > 0) {
+    if(!read_tables(s) && whole(s) && s->mp4.duration_ms > 0) {
       pthread_mutex_lock(&g_lock);
       s->len_ms = (int)s->mp4.duration_ms;
       pthread_mutex_unlock(&g_lock);
@@ -934,6 +1128,11 @@ video_main(void *arg) {
                    1000 / t->timescale);
         break;
       }
+      if(ret == AVERROR_EOF && !whole(s)) {
+        // not the end: the file stopped coming there
+        cut = 1;
+        break;
+      }
       if(ret == AVERROR_EOF) {
         // the end: from the start again, like x.com
         avcodec_flush_buffers(ctx);
@@ -954,6 +1153,10 @@ video_main(void *arg) {
         avcodec_send_packet(ctx, NULL);
         draining = 1;
       }
+    }
+    if(cut) {
+      cut_short(s, last_ms);
+      break;
     }
     if(!have) {
       if(!stalled && i >= t->count && !complete(s)) {
@@ -1008,7 +1211,9 @@ player_open(const char *url, int w, int h, int sound, int len_ms) {
   pthread_attr_t attr;
   pthread_t thread;
   session_t *s;
+  int speaker = g_next_speaker;
 
+  g_next_speaker = 0; // for this one only
   player_close();
   w = w < 16 ? 16 : w > MAX_W ? MAX_W : w;
   h = h < 16 ? 16 : h > MAX_H ? MAX_H : h;
@@ -1027,8 +1232,15 @@ player_open(const char *url, int w, int h, int sound, int len_ms) {
   s->front = -1;
   s->seek_ms = -1;
   s->sound = sound;
+  s->speaker = speaker;
   s->len_ms = len_ms;
   s->state = PLAYER_LOADING;
+  pthread_mutex_lock(&g_lock);
+  if(g_cut_url[0] && !strcmp(g_cut_url, s->url)) {
+    s->seek_ms = g_cut_ms;
+  }
+  g_cut_url[0] = 0;
+  pthread_mutex_unlock(&g_lock);
 
   pthread_attr_init(&attr);
   pthread_attr_setstacksize(&attr, 512 << 10);
@@ -1109,6 +1321,12 @@ player_seek(int delta_ms) {
     g_changed = 1;
   }
   pthread_mutex_unlock(&g_lock);
+}
+
+
+void
+player_speaker(int on) {
+  g_next_speaker = on;
 }
 
 

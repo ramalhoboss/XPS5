@@ -66,9 +66,9 @@ jobs:
           mkdir site
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern XPS5.elf --dir site
           SIZE=$(stat -c %s site/XPS5.elf)
-          # XPS5 refuses an installer over 64 MiB (UPDATE_MAX)
-          if [ "$SIZE" -gt 67108864 ]; then
-            echo "::error::XPS5.elf is $SIZE bytes, over the 64 MiB XPS5 takes"
+          # XPS5 refuses an installer over 160 MiB (UPDATE_MAX; 64 MiB until 1.1.0)
+          if [ "$SIZE" -gt 167772160 ]; then
+            echo "::error::XPS5.elf is $SIZE bytes, over the 160 MiB XPS5 takes"
             exit 1
           fi
           SHA=$(sha256sum site/XPS5.elf | cut -d ' ' -f 1)

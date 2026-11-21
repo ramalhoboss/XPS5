@@ -3,13 +3,14 @@ breaking and drawing with the DejaVu font and Inter falling back to it, the
 shapes and icons, the pictures' decoding and cache, and the copy of the
 picture into the PS5's tiled buffers, checked pixel by pixel against
 PS5_Vulkan's tile formula; the JPEG writer, the settings file, the captures'
-lines and the languages. video.c and sound.c (the pointer's tick) are
-included whole, with the PS5 calls they make stubbed. Run with
-tests/host-test.sh. */
+lines, the HDR screenshots' light brought into SDR, and the languages.
+video.c and sound.c (the pointer's tick) are included whole, with the PS5
+calls they make stubbed. Run with tests/host-test.sh. */
 
 #define _DEFAULT_SOURCE
 
 #include <fcntl.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,13 +23,16 @@ tests/host-test.sh. */
 #include "draw.h"
 #include "images.h"
 #include "jpeg.h"
+#include "jxr.h"
 #include "lang.h"
 #include "mem.h"
 #include "game.h"
 #include "settings.h"
 #include "text.h"
+#include "ultrahdr.h"
 #include "../title/video.c"
 #include "../title/sound.c"
+#include "../title/mic.c"
 #include "workers.h"
 
 #pragma GCC diagnostic push
@@ -156,6 +160,57 @@ uint64_t sceKernelGetProcessTime(void) {
   pthread_mutex_unlock(&g_audio_lock);
   return us;
 }
+
+// the microphone (mic.c): only the general type opens, for user 1001, in
+// blocks of MIC_GRAIN mono samples at 16 kHz; it hears a 1 kHz sine
+#define MIC_REFUSED ((int)0x80260105)
+static int g_mic_opens, g_mic_reads, g_mic_closes, g_mic_refuse, g_mic_amp = 16384;
+
+int sceKernelLoadStartModule(const char *path, size_t args, const void *argp, uint32_t flags,
+                             void *opt, int *res) {
+  (void)path; (void)args; (void)argp; (void)flags; (void)opt; (void)res;
+  return (int)0x80020002; // no such file on the host
+}
+const char *sceKernelGetFsSandboxRandomWord(void) { return NULL; }
+int sceAudioInOpen(int user, uint32_t type, uint32_t index, uint32_t len, uint32_t freq, uint32_t param) {
+  int refuse;
+
+  pthread_mutex_lock(&g_audio_lock);
+  g_mic_opens++;
+  refuse = g_mic_refuse;
+  pthread_mutex_unlock(&g_audio_lock);
+  return !refuse && user == 1001 && type == 1 && !index && len == MIC_GRAIN && freq == 16000 && !param ? 9 :
+    MIC_REFUSED;
+}
+int sceAudioInHqOpen(int user, uint32_t type, uint32_t index, uint32_t len, uint32_t freq, uint32_t param) {
+  (void)user; (void)type; (void)index; (void)len; (void)freq; (void)param;
+  pthread_mutex_lock(&g_audio_lock);
+  g_mic_opens++;
+  pthread_mutex_unlock(&g_audio_lock);
+  return MIC_REFUSED;
+}
+int sceAudioInInput(int handle, void *dest) {
+  int16_t *s = dest;
+  int amp;
+
+  pthread_mutex_lock(&g_audio_lock);
+  amp = g_mic_amp;
+  pthread_mutex_unlock(&g_audio_lock);
+  for(int i=0; i < MIC_GRAIN; i++) {
+    s[i] = (int16_t)lrintf(amp * sinf(2 * (float)M_PI * i / 16));
+  }
+  pthread_mutex_lock(&g_audio_lock);
+  g_mic_reads++;
+  pthread_mutex_unlock(&g_audio_lock);
+  return handle == 9 ? 0 : -1;
+}
+int sceAudioInClose(int handle) {
+  pthread_mutex_lock(&g_audio_lock);
+  g_mic_closes += handle == 9;
+  pthread_mutex_unlock(&g_audio_lock);
+  return 0;
+}
+int sceAudioInGetSilentState(int handle) { return handle == 9 ? 0 : -1; }
 
 
 static unsigned char *
@@ -622,6 +677,14 @@ test_images(void) {
   }
   CHECK(!image_fit(png.buf, 10, 2, 2) && !image_fit("not a picture", 13, 2, 2));
   CHECK(!image_fit(png.buf, png.len, 0, 2) && !image_fit(NULL, 0, 2, 2));
+  // the same from pixels already decoded (the HDR screenshots')
+  if((fit=image_fit_pixels(source, 4, 2, 2, 2))) {
+    CHECK(fit[0] == red && fit[1] == blue && fit[2] == red && fit[3] == blue);
+    mem_free(fit);
+  } else {
+    CHECK(fit != NULL);
+  }
+  CHECK(!image_fit_pixels(source, 4, 2, 0, 2) && !image_fit_pixels(NULL, 4, 2, 2, 2));
 
   // asked, fetched, then there; 32 bytes of budget is two 2 x 2 pictures
   images_init(32);
@@ -777,6 +840,14 @@ test_game(void) {
   CHECK(!game_hashtag("Marvel's Spider-Man 2\xe2\x84\xa2", tag, sizeof tag) && !strcmp(tag, "#MarvelsSpiderMan2"));
   CHECK(!game_hashtag("Pok\xc3\xa9mon \xc3\x97 2", tag, sizeof tag) && !strcmp(tag, "#Pok\xc3\xa9mon2"));
   CHECK(game_hashtag("2077", tag, sizeof tag) == -1 && game_hashtag("\xe2\x84\xa2", tag, sizeof tag) == -1);
+  // the games where the payload keeps quiet: played against others
+  CHECK(game_competitive("Call of Duty\xc2\xae: Black Ops 6") && game_competitive("Fortnite") &&
+        game_competitive("Tom Clancy's Rainbow Six\xc2\xae Siege") && game_competitive("EA SPORTS FC\xe2\x84\xa2 25") &&
+        game_competitive("Marvel Rivals") && game_competitive("NBA 2K25") && game_competitive("TEKKEN 8") &&
+        game_competitive("Hunt: Showdown 1896"));
+  CHECK(!game_competitive("ASTRO BOT") && !game_competitive("Marvel's Spider-Man 2") &&
+        !game_competitive("Gran Turismo\xe2\x84\xa2 7") && !game_competitive("Overcooked! 2") &&
+        !game_competitive("Tekkenstein") && !game_competitive("") && !game_competitive(NULL));
   CHECK(!game_hashtag("Pok\xc3\xa9mon", tag, 5) && !strcmp(tag, "#Pok"));
   CHECK(!strcmp(game_locale(LANG_PT), "pt-PT") && !strcmp(game_locale(LANG_SYSTEM), "en-US"));
 
@@ -923,12 +994,40 @@ test_settings(void) {
   int n;
 
   settings_default(&s);
-  CHECK(s.lang == LANG_SYSTEM && s.notify && s.every == 60 && s.sound && s.autoplay && !s.saver &&
-        s.hover && s.theme == SETTINGS_DAY && s.screen == 0 && s.spoilers && s.light && !s.pause && s.rising);
-  // the extras: covered spoilers, the light bar, the break and the posts rising
-  line = "spoilers=off\nlight=off\nbreak=60\nrising=off\nid2=1234567890\nid1=12a\nid3=1,2\n";
+  CHECK(s.lang == LANG_SYSTEM && s.notify && s.every == 20 && s.sound && s.autoplay && !s.saver &&
+        s.hover && s.theme == SETTINGS_DAY && s.screen == 0 && s.spoilers && s.light && !s.pause && s.rising &&
+        s.friends && !s.playing && !s.online);
+  // what the profile says: both only once the user turns them on
+  line = "playing=on\nonline=on\n";
   settings_parse(&s, line, strlen(line));
-  CHECK(!s.spoilers && !s.light && s.pause == 60 && !s.rising && !strcmp(s.ids[1], "1234567890") &&
+  CHECK(s.playing && s.online);
+  CHECK((n=settings_format(&s, buf, sizeof buf)) > 0 && strstr(buf, "playing=on\n") && strstr(buf, "online=on\n"));
+  line = "online=maybe\n";
+  settings_parse(&s, line, strlen(line));
+  CHECK(s.online);
+  line = "online=off\n";
+  settings_parse(&s, line, strlen(line));
+  CHECK(!s.online && s.playing);
+  // the controller: it vibrates from the start; voice notes on its speaker once the user says
+  CHECK(s.rumble && !s.speaker);
+  line = "rumble=off\nspeaker=on\n";
+  settings_parse(&s, line, strlen(line));
+  CHECK(!s.rumble && s.speaker);
+  CHECK((n=settings_format(&s, buf, sizeof buf)) > 0 && strstr(buf, "rumble=off\n") && strstr(buf, "speaker=on\n"));
+  // Grok's catch-up when XPS5 opens: on until the user turns it off
+  CHECK(s.catchup && strstr(buf, "catchup=on\n"));
+  line = "catchup=off\n";
+  settings_parse(&s, line, strlen(line));
+  CHECK(!s.catchup && settings_format(&s, buf, sizeof buf) > 0 && strstr(buf, "catchup=off\n"));
+  // quiet in competitive games: on until the user turns it off
+  CHECK(s.quiet && strstr(buf, "quiet=on\n"));
+  line = "quiet=off\n";
+  settings_parse(&s, line, strlen(line));
+  CHECK(!s.quiet && settings_format(&s, buf, sizeof buf) > 0 && strstr(buf, "quiet=off\n"));
+  // the extras: covered spoilers, the light bar, the break and the posts rising
+  line = "spoilers=off\nlight=off\nbreak=60\nrising=off\nfriends=off\nid2=1234567890\nid1=12a\nid3=1,2\n";
+  settings_parse(&s, line, strlen(line));
+  CHECK(!s.spoilers && !s.light && s.pause == 60 && !s.rising && !s.friends && !strcmp(s.ids[1], "1234567890") &&
         !s.ids[0][0] && !s.ids[2][0]);
   line = "break=45\n";
   settings_parse(&s, line, strlen(line));
@@ -1003,6 +1102,8 @@ test_captures(void) {
   CHECK(captures_kind("/user/av_contents/a/b/clip.mp4") == CAPTURE_MP4);
   CHECK(captures_kind("/user/av_contents/clip.webm") == CAPTURE_WEBM);
   CHECK(captures_kind("/user/av_contents/shot.png") == CAPTURE_PNG);
+  CHECK(captures_kind("/user/av_contents/photo/NPXS40087/PPSA01234/001/hdr.jxr") == CAPTURE_JXR);
+  CHECK(captures_kind("/user/av_contents/photo/hdr.JXR") == CAPTURE_JXR);
   CHECK(captures_kind("/user/av_contents/../home/secret.jpg") == -1);
   CHECK(captures_kind("/user/av_contents/./x.jpg") == -1);
   CHECK(captures_kind("/user/av_contentsX/x.jpg") == -1);
@@ -1060,6 +1161,14 @@ put_file(const char *root, const char *rel, long long when) {
 }
 
 
+static void
+each_count_one(void *ctx, const capture_t *c) {
+  int *seen = *(int **)ctx;
+
+  seen[c->kind < 0]++;
+}
+
+
 /**
  * the walk finds the PS5's layout (photo/NPXS40087/<title>/<n>/), five
  * folders deep, leaves the thumbnails and other files out, and keeps the
@@ -1102,6 +1211,26 @@ test_captures_walk(const char *root) {
   put_file(root, "photo/NPXS40087/PPSA01234/037/Astro Bot_20261107120000.jpg", 9000);
   CHECK(captures_newest_of(root, "PPSA01234", &list[0]) == 1 && list[0].time == 9000 &&
         list[0].kind == CAPTURE_JPEG);
+  // a game without folders there: none opened, which sends the payload to
+  // the newest of all of them (not the thumbnails, not too deep)
+  CHECK(captures_newest_of(root, "CUSA03280", &list[0]) == 0 && !captures_stats.folders &&
+        captures_stats.unreadable == 2);
+  CHECK(captures_newest_any(root, &list[0]) == 1 && list[0].time == 9000 && !captures_stats.error);
+  put_file(root, "photo/Some Game/Some Game_20261108120000.jpg", 9500);
+  CHECK(captures_newest_any(root, &list[0]) == 1 && list[0].time == 9500 &&
+        strstr(list[0].path, "/photo/Some Game/"));
+  snprintf(path, sizeof path, "%s/thumbnail", root);
+  CHECK(captures_newest_any(path, &list[0]) == 0 && !list[0].path[0]);
+
+  // every file, of any kind, for the payload to tell a new one by its path
+  {
+    int seen[2] = {0, 0}; // pictures and videos, other kinds
+    struct each_count { int *seen; } ctx = {seen};
+    CHECK(captures_each(root, each_count_one, &ctx) == 7 && seen[0] == 6 && seen[1] == 1 &&
+          captures_stats.kept == 6);
+    snprintf(path, sizeof path, "%s/none", root);
+    CHECK(captures_each(path, each_count_one, &ctx) == -1);
+  }
 
   // a folder's names, as the payload finds the users under /user/home
   {
@@ -1119,6 +1248,271 @@ test_captures_walk(const char *root) {
     snprintf(path, sizeof path, "%s/none", root);
     CHECK(captures_folder_names(path, names, sizeof names) == -1);
   }
+}
+
+
+/*
+ * jxrlib's calls of jxr.c (tools/jxrlib/xps5_jxr.c): the tests have no
+ * jxrlib, so every file is one it cannot read, and the light is checked on
+ * pixels made here.
+ */
+
+int xps5_jxr_info(const void *data, size_t len, int *w, int *h, int *format, int *bits);
+int xps5_jxr_decode(const void *data, size_t len, int shrink, void *out, size_t room,
+                    int *w, int *h, int *stride);
+
+int
+xps5_jxr_info(const void *data, size_t len, int *w, int *h, int *format, int *bits) {
+  (void)data; (void)len;
+  *w = *h = *format = *bits = 0;
+  return -100;
+}
+
+int
+xps5_jxr_decode(const void *data, size_t len, int shrink, void *out, size_t room, int *w, int *h,
+                int *stride) {
+  (void)data; (void)len; (void)shrink; (void)out; (void)room; (void)w; (void)h; (void)stride;
+  return -100;
+}
+
+
+static uint16_t
+to_half(float f) {
+  uint32_t b;
+
+  if(!(f > 0)) {
+    return 0;
+  }
+  memcpy(&b, &f, sizeof b);
+  return (uint16_t)(((int)((b >> 23) & 0xff) - 112) << 10 | ((b >> 13) & 0x3ff));
+}
+
+
+// the 10-bit PQ code of a light in nits (SMPTE ST 2084)
+static uint32_t
+pq_code(float nits) {
+  const float m1 = 0.1593017578125f, m2 = 78.84375f, c1 = 0.8359375f, c2 = 18.8515625f, c3 = 18.6875f;
+  float y = powf(nits / 10000.0f, m1);
+
+  return (uint32_t)(powf((c1 + c2 * y) / (1 + c3 * y), m2) * 1023 + 0.5f);
+}
+
+
+static void
+put_half(uint16_t *px, float r, float g, float b) {
+  px[0] = to_half(r);
+  px[1] = to_half(g);
+  px[2] = to_half(b);
+  px[3] = to_half(1);
+}
+
+
+#define SC_WHITE (203.0f / 80.0f) // HDR's reference white in scRGB
+
+
+/**
+ * an HDR screenshot's light in SDR: its reference white is white, what is
+ * under the knee stays, highlights over white come down into it, brighter
+ * than the white of the same picture; PQ's 10 bits read; SDR's bytes kept
+ **/
+static void
+test_jxr(void) {
+  static uint16_t half[64 * 32 * 4];
+  static const unsigned char not_jxr[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+  uint32_t pq[4], *out;
+  unsigned char bgr[6] = {10, 20, 30, 200, 100, 0};
+  int w, h, format, error;
+
+  CHECK(jxr_is("II\xbc\x01\x08\0\0\0", 8) && !jxr_is(not_jxr, 8) && !jxr_is("II\xbc", 3));
+  CHECK(!jxr_decode(not_jxr, 8, 0, 0, &w, &h, &format, &error) && error == -1);
+  CHECK(!jxr_decode("II\xbc\x01\x08\0\0\0", 8, 0, 0, &w, &h, &format, &error) && error == -100);
+  CHECK(jxr_size("II\xbc\x01\x08\0\0\0", 8, &w, &h, &format) == -1);
+
+  CHECK(jxr_format_hdr(0x3a) && jxr_format_hdr(0x14) && !jxr_format_hdr(0x0f) && !jxr_format_hdr(0x99));
+
+  // half floats (scRGB): white, half of it, black and red at the reference
+  put_half(half, SC_WHITE, SC_WHITE, SC_WHITE);
+  put_half(half + 4, SC_WHITE / 2, SC_WHITE / 2, SC_WHITE / 2);
+  put_half(half + 8, 0, 0, 0);
+  put_half(half + 12, SC_WHITE, 0, 0);
+  if((out=jxr_to_sdr(half, 4, 1, 4 * 8, 0x3a, &error))) {
+    CHECK((out[0] & 0xFF) >= 252 && (out[0] >> 8 & 0xFF) >= 252 && (out[0] >> 16 & 0xFF) >= 252);
+    CHECK(out[0] >> 24 == 0xFF);
+    CHECK(abs((int)(out[1] & 0xFF) - 188) <= 2 && (out[1] & 0xFF) == (out[1] >> 16 & 0xFF));
+    CHECK(out[2] == 0xFF000000u);
+    CHECK((out[3] & 0xFF) >= 252 && !(out[3] >> 8 & 0xFFFF));
+    mem_free(out);
+  } else {
+    CHECK(out != NULL);
+  }
+  // nothing over the white: no gain map
+  {
+    uint8_t *gain = (uint8_t *)1;
+    int gw = 1, gh = 1;
+    float most = 1;
+    if((out=jxr_to_sdr_gain(half, 4, 1, 4 * 8, 0x3a, &gain, &gw, &gh, &most, &error))) {
+      CHECK(!gain && !gw && !gh && !most);
+      mem_free(out);
+    }
+  }
+
+  // a highlight ten times the white over an eighth of the picture: it is
+  // white now, the reference white a little under it, the shadows as they were
+  for(int y=0; y < 32; y++) {
+    for(int x=0; x < 64; x++) {
+      float v = x < 8 ? 10 * SC_WHITE : x < 16 ? SC_WHITE / 8 : SC_WHITE;
+      put_half(half + (y * 64 + x) * 4, v, v, v);
+    }
+  }
+  if((out=jxr_to_sdr(half, 64, 32, 64 * 8, 0x3a, &error))) {
+    int top = out[5 * 64] & 0xFF, white = out[5 * 64 + 40] & 0xFF, shadow = out[5 * 64 + 10] & 0xFF;
+    CHECK(top >= 252);
+    CHECK(white < top - 4 && white > 215);
+    CHECK(abs(shadow - 99) <= 2); // 1/8 in sRGB
+    mem_free(out);
+  } else {
+    CHECK(out != NULL);
+  }
+
+  // its gain map, a pixel for 4 x 4: the highlight back to ten times the
+  // white (the most), the white a little up, the shadows as they are
+  {
+    uint8_t *gain = NULL;
+    int gw = 0, gh = 0;
+    float most = 0;
+    if((out=jxr_to_sdr_gain(half, 64, 32, 64 * 8, 0x3a, &gain, &gw, &gh, &most, &error))) {
+      CHECK(gain && gw == 16 && gh == 8);
+      CHECK(most > 3.1f && most < 3.4f); // log2 of about 10
+      if(gain) {
+        CHECK(gain[16 + 0] >= 250 && gain[16 + 1] >= 250);    // x 0 to 7
+        CHECK(gain[16 + 2] <= 2 && gain[16 + 3] <= 2);        // x 8 to 15
+        CHECK(gain[16 + 10] > 8 && gain[16 + 10] < 24);       // x 40: log2(1/0.875) of the most
+        CHECK(gain[7 * 16 + 10] == gain[16 + 10]);
+      }
+      mem_free(gain);
+      mem_free(out);
+    } else {
+      CHECK(out != NULL);
+    }
+  }
+
+  // the PS5's own 10 bits: PQ, BT.2020 (a grey stays grey)
+  pq[0] = pq_code(203) * 0x100401u; // the same code in R, G and B
+  pq[1] = pq_code(100) * 0x100401u;
+  pq[2] = 0;
+  pq[3] = pq_code(203) << 20;
+  if((out=jxr_to_sdr(pq, 4, 1, 16, 0x14, &error))) {
+    CHECK((out[0] & 0xFF) >= 252 && abs((int)(out[0] & 0xFF) - (int)(out[0] >> 16 & 0xFF)) <= 1);
+    CHECK((out[1] & 0xFF) > 178 && (out[1] & 0xFF) < 194);
+    CHECK(out[2] == 0xFF000000u);
+    CHECK((out[3] & 0xFF) >= 252 && (out[3] >> 8 & 0xFF) < 8 && (out[3] >> 16 & 0xFF) < 8);
+    mem_free(out);
+  } else {
+    CHECK(out != NULL);
+  }
+
+  // SDR's bytes as they are, BGR to RGB
+  if((out=jxr_to_sdr(bgr, 2, 1, 6, 0x0c, &error))) {
+    CHECK(out[0] == 0xFF0A141Eu && out[1] == 0xFFC86400u);
+    mem_free(out);
+  } else {
+    CHECK(out != NULL);
+  }
+  CHECK(!jxr_to_sdr(bgr, 2, 1, 6, 0x99, &error) && error == -1);
+  CHECK(!jxr_to_sdr(bgr, 0, 1, 6, 0x0c, &error) && error == -2);
+}
+
+
+static uint32_t
+be32(const uint8_t *p) {
+  return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+
+
+static int
+find_bytes(const uint8_t *s, size_t len, const char *what) {
+  size_t n = strlen(what);
+
+  for(size_t i=0; i + n <= len; i++) {
+    if(!memcmp(s + i, what, n)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+
+/**
+ * a greyscale JPEG reads back about the same; an Ultra HDR file is the SDR
+ * JPEG with the gain map's behind it, MPF's offsets and the XMP's length
+ * pointing at it, and any JPEG reader sees the SDR picture
+ **/
+static void
+test_ultrahdr(void) {
+  enum { W = 32, H = 16, GW = 8, GH = 4 };
+  static uint32_t pixels[W * H];
+  static uint8_t gray[GW * GH];
+  uint8_t *sdr = NULL, *gain = NULL, *joined = NULL;
+  size_t sdr_len = 0, gain_len = 0, len = 0, mpf = 0, tiff, primary, second, offset;
+  uint32_t *back;
+  ultrahdr_info_t info;
+  char want[64];
+  int w, h, worst = 0;
+
+  for(int i=0; i < W * H; i++) {
+    pixels[i] = 0xFF000000u | (uint32_t)(i * 7 & 0xFF) << 8 | 0x40;
+  }
+  for(int i=0; i < GW * GH; i++) {
+    gray[i] = (uint8_t)(i < GW * GH / 2 ? 255 : 30);
+  }
+  CHECK(!jpeg_encode(pixels, W, H, 90, &sdr, &sdr_len));
+  CHECK(!jpeg_encode_gray(gray, GW, GH, 90, &gain, &gain_len) && gain_len > 100);
+  CHECK(!image_size(gain, gain_len, &w, &h) && w == GW && h == GH);
+  if((back=image_fit(gain, gain_len, GW, GH))) {
+    for(int i=0; i < GW * GH; i++) {
+      int d = abs((int)(back[i] & 0xFF) - gray[i]);
+      worst = d > worst ? d : worst;
+      CHECK((back[i] & 0xFF) == (back[i] >> 16 & 0xFF)); // grey
+    }
+    CHECK(worst < 24);
+    mem_free(back);
+  } else {
+    CHECK(back != NULL);
+  }
+  CHECK(jpeg_encode_gray(gray, 0, GH, 90, &joined, &len) && !joined);
+
+  ultrahdr_inspect(sdr, sdr_len, &info);
+  CHECK(info.pictures == 1 && !info.xmp && !info.mpf && !info.gain && !info.iso);
+  CHECK(ultrahdr_join(sdr, sdr_len, gain, gain_len, 3.25f, &joined, &len) == 0 && joined);
+  if(joined) {
+    ultrahdr_inspect(joined, len, &info);
+    CHECK(info.pictures == 2 && info.xmp && info.mpf && info.gain && !info.iso);
+    // MPF: the two pictures' sizes, the second at its offset from the TIFF header
+    for(size_t i=0; i + 4 < len && !mpf; i++) {
+      mpf = !memcmp(joined + i, "MPF", 4) ? i : 0;
+    }
+    CHECK(mpf > 0);
+    tiff = mpf + 4;
+    CHECK(!memcmp(joined + tiff, "MM\0\x2a", 4) && be32(joined + tiff + 4) == 8);
+    primary = be32(joined + tiff + 50 + 4);
+    second = be32(joined + tiff + 50 + 16 + 4);
+    offset = be32(joined + tiff + 50 + 16 + 8);
+    CHECK(primary + second == len && tiff + offset == primary);
+    CHECK(joined[primary] == 0xFF && joined[primary + 1] == 0xD8 && joined[primary - 2] == 0xFF &&
+          joined[primary - 1] == 0xD9);
+    snprintf(want, sizeof want, "Item:Length=\"%zu\"", second);
+    CHECK(find_bytes(joined, primary, want));
+    CHECK(find_bytes(joined + primary, second, "hdrgm:GainMapMax=\"3.250000\""));
+    CHECK(find_bytes(joined + primary, second, "hdrgm:HDRCapacityMax=\"3.250000\""));
+    // what a JPEG reader sees: the SDR picture; the gain map reads on its own
+    CHECK(!image_size(joined, len, &w, &h) && w == W && h == H);
+    CHECK(!image_size(joined + primary, second, &w, &h) && w == GW && h == GH);
+    mem_free(joined);
+  }
+  CHECK(ultrahdr_join(sdr, sdr_len, gain, gain_len, 0, &joined, &len) == -1 && !joined);
+  CHECK(ultrahdr_join((const uint8_t *)"nope", 4, gain, gain_len, 2, &joined, &len) == -1);
+  mem_free(sdr);
+  mem_free(gain);
 }
 
 
@@ -1422,6 +1816,95 @@ test_sound(void) {
 }
 
 
+/**
+ * the microphone's state reached within two seconds
+ **/
+static int
+mic_wait(int state) {
+  const struct timespec step = {0, 5 * 1000000};
+  mic_status_t status;
+
+  for(int i=0; i < 400; i++) {
+    mic_get(&status);
+    if(status.state == state) {
+      return 1;
+    }
+    nanosleep(&step, NULL);
+  }
+  return 0;
+}
+
+
+static void
+test_mic(void) {
+  int16_t block[MIC_GRAIN];
+  mic_status_t status;
+  float rms, peak;
+  int reads;
+
+  // full scale, a quarter of it (-12 dBFS), and silence on the meter
+  for(int i=0; i < MIC_GRAIN; i++) {
+    block[i] = i & 1 ? 32767 : -32768;
+  }
+  mic_measure(block, MIC_GRAIN, &rms, &peak);
+  CHECK(fabsf(rms - 1) < 0.001f && peak == 1);
+  CHECK(fabsf(mic_meter(rms) - 1) < 0.001f);
+  CHECK(fabsf(mic_meter(0.25f) - (1 - 12.0412f / 60)) < 0.001f);
+  CHECK(mic_meter(0) == 0 && mic_meter(0.0005f) == 0 && mic_meter(2) == 1 && mic_meter(NAN) == 0);
+  memset(block, 0, sizeof block);
+  mic_measure(block, MIC_GRAIN, &rms, &peak);
+  CHECK(rms == 0 && peak == 0);
+  mic_measure(block, 0, &rms, &peak);
+  CHECK(rms == 0 && peak == 0);
+
+  // voice chat does not open, the general type does, one test at a time;
+  // a sine at half scale: -9 dBFS of RMS, a peak at -6
+  mic_get(&status);
+  CHECK(status.state == MIC_OFF);
+  CHECK(!mic_start(1001, NULL));
+  CHECK(mic_start(1001, NULL) == -1);
+  CHECK(mic_wait(MIC_ON));
+  CHECK(audio_wait(&g_mic_reads, 30) >= 30);
+  mic_get(&status);
+  CHECK(status.rate == 16000 && status.blocks >= 29 && !status.silent && !status.code);
+  CHECK(fabsf(status.level - mic_meter(0.353553f)) < 0.01f);
+  CHECK(fabsf(status.peak - mic_meter(0.5f)) < 0.01f);
+  pthread_mutex_lock(&g_audio_lock);
+  CHECK(g_mic_opens == 2);
+  reads = g_mic_reads;
+  g_mic_amp = 0;
+  pthread_mutex_unlock(&g_audio_lock);
+
+  // quiet: the level falls at once, the peak holds a second
+  CHECK(audio_wait(&g_mic_reads, reads + 40) >= reads + 40);
+  mic_get(&status);
+  CHECK(status.state == MIC_ON && status.level < 0.05f && status.peak > 0.8f);
+
+  // stopped: closed, and the meter at rest
+  mic_stop();
+  CHECK(mic_wait(MIC_OFF));
+  mic_get(&status);
+  CHECK(status.level == 0 && status.peak == 0 && !status.code);
+  pthread_mutex_lock(&g_audio_lock);
+  CHECK(g_mic_closes == 1);
+  g_mic_refuse = 1;
+  g_mic_opens = 0;
+  pthread_mutex_unlock(&g_audio_lock);
+
+  // no way opens: failed with the last way's error, after all six; stopping clears it
+  CHECK(!mic_start(1001, NULL));
+  CHECK(mic_wait(MIC_FAILED));
+  mic_get(&status);
+  CHECK(status.code == MIC_REFUSED);
+  pthread_mutex_lock(&g_audio_lock);
+  CHECK(g_mic_opens == 6 && g_mic_closes == 1);
+  pthread_mutex_unlock(&g_audio_lock);
+  mic_stop();
+  mic_get(&status);
+  CHECK(status.state == MIC_OFF);
+}
+
+
 int
 main(int argc, char **argv) {
   unsigned char *ttf, *inter;
@@ -1452,9 +1935,12 @@ main(int argc, char **argv) {
   test_settings();
   test_settings_files();
   test_sound();
+  test_mic();
   test_game();
   test_captures();
   test_captures_walk(argv[3]);
+  test_jxr();
+  test_ultrahdr();
   test_lang();
   test_tiles();
 

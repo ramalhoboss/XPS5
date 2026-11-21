@@ -93,3 +93,10 @@ int game_spoils(const char *text, const game_keys_t *k);
  * the language of LANG_* (settings.h) as param.json names it ("pt-PT")
  **/
 const char *game_locale(int lang);
+
+/**
+ * whether the game named name is played against others (shooters,
+ * fighting games, the sports and the battle royales of esports), where
+ * the payload keeps its toasts until the game closes (settings' quiet)
+ **/
+int game_competitive(const char *name);

@@ -44,6 +44,8 @@ typedef struct entry {
   int       state;
   unsigned  used; // the frame that last asked for it
   uint32_t *pixels;
+  int       enc;       // of X Chat: its bytes are encrypted, opened with key before decoding
+  uint8_t   key[32];
 } entry_t;
 
 static pthread_mutex_t g_lock;
@@ -124,8 +126,8 @@ find(const char *url, int w, int h) {
 }
 
 
-const uint32_t *
-images_get(const char *url, int w, int h) {
+static const uint32_t *
+request(const char *url, int w, int h, const uint8_t *key, int enc) {
   const uint32_t *pixels = NULL;
   entry_t *e;
 
@@ -150,10 +152,41 @@ images_get(const char *url, int w, int h) {
       e->h = h;
       e->state = WANTED;
       e->used = g_frame;
+      e->enc = enc;
+      if(enc && key) {
+        memcpy(e->key, key, 32);
+      }
     }
   }
   pthread_mutex_unlock(&g_lock);
   return pixels;
+}
+
+
+const uint32_t *
+images_get(const char *url, int w, int h) {
+  return request(url, w, h, NULL, 0);
+}
+
+
+const uint32_t *
+images_get_enc(const char *url, const uint8_t key[32], int w, int h) {
+  return request(url, w, h, key, 1);
+}
+
+
+int
+images_key(const char *url, int w, int h, uint8_t key[32]) {
+  entry_t *e;
+  int enc = 0;
+
+  pthread_mutex_lock(&g_lock);
+  if((e=find(url, w, h)) && e->enc) {
+    memcpy(key, e->key, 32);
+    enc = 1;
+  }
+  pthread_mutex_unlock(&g_lock);
+  return enc;
 }
 
 
@@ -328,11 +361,13 @@ image_scaled(const void *data, size_t len, int max_side, int *w, int *h) {
 }
 
 
+static uint32_t *fit_rgba(const unsigned char *src, int iw, int ih, int w, int h);
+
+
 uint32_t *
 image_fit(const void *data, size_t len, int w, int h) {
   unsigned char *src;
   uint32_t *out;
-  float step, ox, oy, fx, fy;
   int iw, ih, n;
 
   if(w <= 0 || h <= 0 || w > MAX_SIDE || h > MAX_SIDE || image_size(data, len, &iw, &ih)) {
@@ -341,8 +376,28 @@ image_fit(const void *data, size_t len, int w, int h) {
   if(!(src=stbi_load_from_memory(data, (int)len, &iw, &ih, &n, 4))) {
     return NULL;
   }
+  out = fit_rgba(src, iw, ih, w, h);
+  stbi_image_free(src);
+  return out;
+}
+
+
+uint32_t *
+image_fit_pixels(const uint32_t *pixels, int iw, int ih, int w, int h) {
+  if(!pixels || iw <= 0 || ih <= 0 || w <= 0 || h <= 0 || w > MAX_SIDE || h > MAX_SIDE) {
+    return NULL;
+  }
+  // 0xAABBGGRR in memory is R, G, B, A, as stb_image gives them
+  return fit_rgba((const unsigned char *)pixels, iw, ih, w, h);
+}
+
+
+static uint32_t *
+fit_rgba(const unsigned char *src, int iw, int ih, int w, int h) {
+  uint32_t *out;
+  float step, ox, oy, fx, fy;
+
   if(!(out=mem_alloc((size_t)w * h * sizeof *out))) {
-    stbi_image_free(src);
     return NULL;
   }
 
@@ -360,6 +415,5 @@ image_fit(const void *data, size_t len, int w, int h) {
         mean(src, iw, ih, fx, fx + step, fy, fy + step);
     }
   }
-  stbi_image_free(src);
   return out;
 }

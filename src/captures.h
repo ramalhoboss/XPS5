@@ -17,13 +17,15 @@ picture's or a video's extension are ever listed or read. */
 #define CAPTURE_PHOTO_MAX (40LL << 20)   // bytes of a picture read
 #define CAPTURE_VIDEO_MAX (512LL << 20)  // X takes up to 512 MB
 
-enum { CAPTURE_JPEG, CAPTURE_PNG, CAPTURE_MP4, CAPTURE_WEBM };
+enum { CAPTURE_JPEG, CAPTURE_PNG, CAPTURE_MP4, CAPTURE_WEBM,
+       CAPTURE_JXR }; // a screenshot of a game in HDR (JPEG XR), which XPS5 turns into a JPEG
 
 typedef struct capture {
   char      path[CAPTURE_PATH];
   long long time; // Unix time it was written
   long long size;
   int       kind; // CAPTURE_*
+  int       clip; // the part of a video a post carries (CLIP_* of clip.h), 0 for all of it
 } capture_t;
 
 /**
@@ -67,6 +69,23 @@ int captures_scan(const char *root, capture_t *list, int max);
  * lacks
  **/
 int captures_newest_of(const char *root, const char *game, capture_t *out);
+
+/**
+ * the newest capture of all, under root's photo/ and video/ (for a game
+ * whose folders are not where captures_newest_of looks): returns 1 with it
+ * in out, 0 when there is none, -1 when memory lacks
+ **/
+int captures_newest_any(const char *root, capture_t *out);
+
+/**
+ * every file under root's photo/ and video/ (root itself without its
+ * thumbnails when neither is there), of any kind: each gets it with ctx,
+ * kind -1 for a file that is not a picture or a video that may be read.
+ * The payload tells a new capture by its path, as the PS5's screenshots'
+ * dates did not say it (2026-11-14). Returns how many files, or -1 when
+ * root cannot be read or memory lacks
+ **/
+int captures_each(const char *root, void (*each)(void *ctx, const capture_t *c), void *ctx);
 
 /**
  * the names in the folder dir (not "." and ".."), each with its NUL, into

@@ -18,7 +18,7 @@ Sectigo's, which XPS5 does not carry. */
 
 #include <stddef.h>
 
-#define XPS5_VERSION "1.0.1"
+#define XPS5_VERSION "1.1.0"
 
 // update.json's address (https); empty, this build does not look for updates.
 // A fork points it at its own Pages
@@ -28,7 +28,7 @@ Sectigo's, which XPS5 does not carry. */
 
 #define UPDATE_VERSION 24          // "1.10.3", with room
 #define UPDATE_FILE    64          // the file's name
-#define UPDATE_MAX     (64 << 20)  // bytes of the install ELF, at most
+#define UPDATE_MAX     (160 << 20) // bytes of the install ELF, at most (64 MiB until 1.1.0, whose is 100 MiB)
 
 typedef struct update {
   char          version[UPDATE_VERSION];

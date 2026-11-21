@@ -67,7 +67,10 @@ typedef struct https_stream {
  * GET url into st as above, for an answer of up to max bytes with its
  * length in its head, asked for as stored (Accept-Encoding: identity; an
  * encoded answer is refused); returns once all of it came (0), or it
- * failed or was stopped
+ * failed or was stopped. A connection that breaks off is made again, going
+ * on from the byte it broke at (a Range request; a server that ignores it
+ * sends the bytes already there again, and they are read past), until a
+ * few tries in a row bring nothing
  **/
 int https_get_stream(const char *url, size_t max, https_stream_t *st);
 

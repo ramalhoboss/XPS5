@@ -6,6 +6,7 @@ of their PS5 toasts. */
 #include <string.h>
 
 #include "json.h"
+#include "play.h"
 #include "xnotify.h"
 
 static int g_failed;
@@ -257,12 +258,129 @@ test_rising(void) {
 }
 
 
+static void
+chat(x_post_t *p, const char *conversation, const char *text, long long time, int unread, int mine) {
+  memset(p, 0, sizeof *p);
+  p->kind = X_KIND_CHAT;
+  snprintf(p->id, sizeof p->id, "%s", conversation);
+  snprintf(p->user, sizeof p->user, "joao");
+  snprintf(p->name, sizeof p->name, "Jo\303\243o Reis");
+  snprintf(p->avatar, sizeof p->avatar, "https://pbs.twimg.com/profile_images/3/joao_normal.jpg");
+  snprintf(p->text, sizeof p->text, "%s", text);
+  p->time = time;
+  p->unread = unread;
+  p->mine = mine;
+}
+
+
+static void
+test_dm(void) {
+  static xnotify_t n;
+  static x_post_t chats[6];
+  xnotify_toast_t t;
+  int fresh[3], count;
+
+  // the first look only remembers
+  chat(&chats[0], "1-77", "bora?", T0 - 60, 1, 0);
+  chat(&chats[1], "1-88", "ok", T0 - 600, 0, 1);
+  count = 2;
+  CHECK(xnotify_dm_fresh(&n, chats, &count, fresh, 3) == 0 && count == 1 && n.primed);
+
+  // a new message; not one the user wrote last, one read, or a request
+  chat(&chats[0], "1-88", "j\303\241 vou", T0 - 5, 0, 1);
+  chat(&chats[1], "1-77", "est\303\241s?", T0, 1, 0);
+  chat(&chats[2], "1-99", "ol\303\241", T0 - 20, 1, 0);
+  chats[2].request = 1;
+  chat(&chats[3], "1-55", "lido", T0 - 30, 0, 0);
+  count = 4;
+  CHECK(xnotify_dm_fresh(&n, chats, &count, fresh, 3) == 1 && count == 1 && fresh[0] == 0);
+  CHECK(!strcmp(chats[0].id, "1-77"));
+  // the same one again is not new
+  CHECK(xnotify_dm_fresh(&n, chats, &count, fresh, 3) == 0);
+
+  // its toast: who wrote, what, and that it is a message
+  xnotify_dm_toast(&chats[0], 1, &t);
+  CHECK(!strcmp(t.title, "Jo\303\243o Reis (@joao)"));
+  CHECK(!strcmp(t.body, "est\303\241s?"));
+  CHECK(!strcmp(t.extra, "Mensagem \302\267 XPS5"));
+  CHECK(!strcmp(t.avatar, "https://pbs.twimg.com/profile_images/3/joao_200x200.jpg"));
+  CHECK(t.icon && !strcmp(t.icon, "messages"));
+
+  // a photo with no words
+  chat(&chats[0], "1-77", "", T0, 1, 0);
+  chats[0].icon = X_DM_PHOTO;
+  xnotify_dm_toast(&chats[0], 0, &t);
+  CHECK(!strcmp(t.body, "Sent a photo") && !strcmp(t.extra, "Message \302\267 XPS5"));
+
+  // a voice note, a file and calls of X Chat's, opened with the key
+  chat(&chats[0], "1-77", "", T0, 1, 0);
+  chats[0].xchat = chats[0].encrypted = 1;
+  chats[0].icon = X_DM_VOICE;
+  xnotify_dm_toast(&chats[0], 1, &t);
+  CHECK(!strcmp(t.body, "Enviou uma mensagem de voz") && !strcmp(t.extra, "X Chat \302\267 XPS5"));
+  chats[0].icon = X_DM_FILE;
+  xnotify_dm_toast(&chats[0], 0, &t);
+  CHECK(!strcmp(t.body, "Sent a file"));
+  chats[0].icon = X_DM_CALL;
+  chats[0].event = X_EV_CALL_MISSED;
+  xnotify_dm_toast(&chats[0], 1, &t);
+  CHECK(!strcmp(t.body, "Chamada perdida"));
+  chats[0].event = X_EV_CALL_STARTED;
+  xnotify_dm_toast(&chats[0], 1, &t);
+  CHECK(!strcmp(t.body, "Est\303\241 a ligar-te"));
+  chats[0].event = X_EV_CALL_ENDED;
+  xnotify_dm_toast(&chats[0], 0, &t);
+  CHECK(!strcmp(t.body, "Called you"));
+  // its words, once the key opened them; without it, that it is encrypted
+  chat(&chats[0], "1-77", "chegaste?", T0, 1, 0);
+  chats[0].xchat = chats[0].encrypted = 1;
+  xnotify_dm_toast(&chats[0], 1, &t);
+  CHECK(!strcmp(t.body, "chegaste?"));
+  chat(&chats[0], "1-77", "", T0, 1, 0);
+  chats[0].sealed = 1;
+  chats[0].xchat = chats[0].encrypted = 1;
+  xnotify_dm_toast(&chats[0], 1, &t);
+  CHECK(!strcmp(t.body, "Enviou-te uma mensagem cifrada"));
+
+  // a group's: its name, and who of them wrote
+  chat(&chats[0], "900", "bora", T0, 1, 0);
+  chats[0].group = 1;
+  chats[0].user[0] = 0;
+  chats[0].avatar[0] = 0;
+  snprintf(chats[0].name, sizeof chats[0].name, "Noite de GT7");
+  snprintf(chats[0].quote_name, sizeof chats[0].quote_name, "Ana");
+  chats[0].face_count = 1;
+  snprintf(chats[0].faces[0], sizeof chats[0].faces[0], "https://pbs.twimg.com/profile_images/1/ana_normal.jpg");
+  xnotify_dm_toast(&chats[0], 1, &t);
+  CHECK(!strcmp(t.title, "Noite de GT7") && !strcmp(t.body, "Ana: bora"));
+  CHECK(!strcmp(t.avatar, "https://pbs.twimg.com/profile_images/1/ana_200x200.jpg"));
+
+  // an invite to play, and a request to join, by their game
+  chat(&chats[0], "1-77", "", T0, 1, 0);
+  CHECK(!play_invite("ASTRO BOT", "PPSA01316", "bora jogar?", chats[0].text, sizeof chats[0].text));
+  chats[0].icon = X_DM_INVITE;
+  xnotify_dm_toast(&chats[0], 1, &t);
+  CHECK(!strcmp(t.body, "Convida-te para jogar ASTRO BOT"));
+  CHECK(!play_join("ASTRO BOT", "can I join?", chats[0].text, sizeof chats[0].text));
+  chats[0].icon = X_DM_JOIN;
+  xnotify_dm_toast(&chats[0], 0, &t);
+  CHECK(!strcmp(t.body, "Asks to join your game of ASTRO BOT"));
+
+  // its JSON fits
+  {
+    static char json[XNOTIFY_JSON];
+    CHECK(!xnotify_json(json, sizeof json, &t, "Open", "psgm:play?id=TWPS00001", T0, 7));
+  }
+}
+
+
 int
 main(void) {
   test_fresh();
   test_toast();
   test_json();
   test_rising();
+  test_dm();
   if(g_failed) {
     printf("%d notification checks failed\n", g_failed);
     return 1;

@@ -10,6 +10,7 @@ has a stand-in without FFmpeg. */
 
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 enum {
@@ -27,6 +28,8 @@ enum {
   PLAYER_ERR_FORMAT,  // code: MP4_* of mp4.h
   PLAYER_ERR_DECODER, // code: FFmpeg's error
   PLAYER_ERR_MEMORY,
+  PLAYER_ERR_CUT,     // code: the SCE error; the file stopped coming partway, and
+                      // opened again it goes on from where it stopped
 };
 
 typedef struct player_status {
@@ -51,6 +54,19 @@ void player_init(void (*log)(const char *fmt, ...));
  * already open stops
  **/
 void player_open(const char *url, int w, int h, int sound, int len_ms);
+
+/**
+ * the next player_open plays its sound on the controller's speaker (a voice
+ * note), when that opens, and on the TV when it does not; for that one only
+ **/
+void player_speaker(int on);
+
+/**
+ * how a url "file://<path>" (a capture of the PS5's, in the composer) is
+ * read: up to len bytes at off into buf, the file's size into *total
+ * unless it is NULL; the count, or a negative error
+ **/
+void player_files(long long (*read)(const char *path, long long off, void *buf, size_t len, long long *total));
 
 /**
  * stop the video open, if any

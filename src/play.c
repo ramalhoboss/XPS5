@@ -117,6 +117,53 @@ play_status(const char *game, char *out, size_t size) {
 
 
 int
+play_online_status(const char *words, char *out, size_t size) {
+  char name[PLAY_STATUS];
+  int room = PLAY_LOCATION - play_units(PLAY_ONLINE) - play_units(PLAY_TAIL), units = 0;
+  size_t n = 0, c;
+
+  if(!size) {
+    return -1;
+  }
+  out[0] = 0;
+  if(!words) {
+    return -1;
+  }
+  one_line(words, strlen(words), name, sizeof name);
+  // as much of it as fits, on a whole character
+  while(name[n]) {
+    c = (size_t)char_len((unsigned char)name[n]);
+    if(units + (c == 4 ? 2 : 1) > room) {
+      break;
+    }
+    units += c == 4 ? 2 : 1;
+    n += c;
+  }
+  while(n && name[n - 1] == ' ') {
+    n--;
+  }
+  name[n] = 0;
+  if(!name[0] || snprintf(out, size, PLAY_ONLINE "%s" PLAY_TAIL, name) >= (int)size) {
+    out[0] = 0;
+    return -1;
+  }
+  return 0;
+}
+
+
+int
+play_online_of(const char *location) {
+  size_t len, mark = strlen(PLAY_ONLINE), tail = strlen(PLAY_TAIL);
+
+  if(!location) {
+    return 0;
+  }
+  len = strlen(location);
+  return len > mark + tail && !strncmp(location, PLAY_ONLINE, mark) && !strcmp(location + len - tail, PLAY_TAIL);
+}
+
+
+int
 play_game_of(const char *location, char *game, size_t size) {
   size_t len, mark = strlen(PLAY_MARK), tail = strlen(PLAY_TAIL);
 
@@ -224,6 +271,56 @@ play_invite_parse(const char *text, char *game, size_t gsize, char *id, size_t i
     return 0;
   }
   return 1;
+}
+
+
+int
+play_join(const char *game, const char *phrase, char *out, size_t size) {
+  char name[PLAY_GAME * 2];
+  int n;
+
+  if(!size) {
+    return -1;
+  }
+  out[0] = 0;
+  if(!game || !phrase || !phrase[0]) {
+    return -1;
+  }
+  one_line(game, strlen(game), name, sizeof name);
+  if(!name[0] || strstr(name, " \xc2\xb7 ")) {
+    return -1;
+  }
+  n = snprintf(out, size, PLAY_JOIN "%s \xc2\xb7 %s (XPS5)", name, phrase);
+  if(n < 0 || n >= (int)size) {
+    out[0] = 0;
+    return -1;
+  }
+  return 0;
+}
+
+
+int
+play_join_parse(const char *text, char *game, size_t gsize) {
+  static const char tag[] = " (XPS5)";
+  size_t len, mark = strlen(PLAY_JOIN), t = sizeof tag - 1;
+  const char *dot;
+
+  if(gsize) {
+    game[0] = 0;
+  }
+  if(!text || !gsize) {
+    return 0;
+  }
+  len = strlen(text);
+  while(len && (text[len - 1] == ' ' || text[len - 1] == '\n' || text[len - 1] == '\r')) {
+    len--;
+  }
+  if(len < mark + t + 4 || strncmp(text, PLAY_JOIN, mark) || strncmp(text + len - t, tag, t) ||
+     !(dot=strstr(text + mark, " \xc2\xb7 ")) || dot >= text + len - t) {
+    return 0;
+  }
+  one_line(text + mark, (size_t)(dot - text) - mark, game, gsize);
+  return game[0] != 0;
 }
 
 

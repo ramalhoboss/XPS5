@@ -59,6 +59,8 @@ int sceHttpsLoadCert(int ctx, int count, const ssl_data_t **ca_list,
                      const ssl_data_t *cert, const ssl_data_t *key);
 int sceHttpsSetSslCallback(int id, ssl_callback_t cb, void *arg);
 int sceHttpsGetSslError(int id, int *err, unsigned *detail);
+int sceHttpSetRecvTimeOut(int id, uint32_t usec);
+int sceKernelUsleep(unsigned int usec);
 
 
 static int g_net  = -1;
@@ -420,86 +422,301 @@ stream_end(https_stream_t *st, int ret) {
 }
 
 
-int
-https_get_stream(const char *url, size_t max, https_stream_t *st) {
-  int conn, req = -1, ret, n, err = 0;
-  unsigned detail = 0;
-  size_t len, got = 0;
-  char *body;
+/*
+ * A stream that breaks off goes on from where it broke, with a Range request
+ * of the bytes left: a long video's connection to video.twimg.com dropped
+ * partway, and the player then took what came for all of the video.
+ */
 
-  if((conn=ret=sceHttpCreateConnectionWithURL(g_tmpl, url, 1)) < 0) {
-    log_line("https: connection 0x%08x", (unsigned)ret);
-    return stream_end(st, ret);
+#define STREAM_PART    (256 << 10) // bytes read at a time
+#define STREAM_TRIES   6           // reconnections in a row that bring nothing
+#define STREAM_WAIT_US 250000      // before the first; it doubles, up to 4 s
+#define STREAM_RECV_US 30000000u   // of silence before a connection counts as broken
+#define STREAM_STOPPED 1           // told to stop
+#define STREAM_OTHER   2           // the server answers with another file
+
+
+static int
+stopped(const https_stream_t *st) {
+  return st->stop && *st->stop;
+}
+
+
+static void
+stream_close(int conn, int req) {
+  if(req >= 0) {
+    sceHttpDeleteRequest(req);
   }
-  if((req=ret=sceHttpCreateRequestWithURL(conn, HTTP_METHOD_GET, url, 0)) < 0) {
+  if(conn >= 0) {
+    sceHttpDeleteConnection(conn);
+  }
+}
+
+
+/**
+ * a GET of url as stored (not gzipped), from byte from on when from is not
+ * 0: 0 with its connection, request and status, or the error
+ **/
+static int
+stream_open(const char *url, size_t from, int *conn, int *req, int *status) {
+  char range[48];
+  unsigned detail = 0;
+  int ret, err = 0;
+
+  *req = -1;
+  if((*conn=ret=sceHttpCreateConnectionWithURL(g_tmpl, url, 1)) < 0) {
+    log_line("https: connection 0x%08x", (unsigned)ret);
+    return ret;
+  }
+  if((*req=ret=sceHttpCreateRequestWithURL(*conn, HTTP_METHOD_GET, url, 0)) < 0) {
     log_line("https: request 0x%08x", (unsigned)ret);
-    goto out;
+    goto fail;
   }
   // the bytes as stored: a gzipped answer's Content-Length is not the length
   // of what comes once inflated, and GitHub Pages gzips an .elf when asked
-  if((ret=sceHttpSetInflateGZIPEnabled(req, 0))) {
+  if((ret=sceHttpSetInflateGZIPEnabled(*req, 0))) {
     log_line("https: gzip off 0x%08x (going on)", (unsigned)ret);
   }
-  if((ret=sceHttpAddRequestHeader(req, "Accept-Encoding", "identity", HEADER_OVERWRITE))) {
-    log_line("https: header Accept-Encoding 0x%08x", (unsigned)ret);
-    goto out;
+  if((ret=sceHttpSetRecvTimeOut(*req, STREAM_RECV_US))) {
+    log_line("https: receive time-out 0x%08x (going on)", (unsigned)ret);
   }
-  if((ret=sceHttpSendRequest(req, NULL, 0))) {
-    if(!sceHttpsGetSslError(req, &err, &detail) && err) {
+  if((ret=sceHttpAddRequestHeader(*req, "Accept-Encoding", "identity", HEADER_OVERWRITE))) {
+    log_line("https: header Accept-Encoding 0x%08x", (unsigned)ret);
+    goto fail;
+  }
+  snprintf(range, sizeof range, "bytes=%zu-", from);
+  if(from && (ret=sceHttpAddRequestHeader(*req, "Range", range, HEADER_OVERWRITE))) {
+    log_line("https: header Range 0x%08x", (unsigned)ret);
+    goto fail;
+  }
+  if((ret=sceHttpSendRequest(*req, NULL, 0))) {
+    if(!sceHttpsGetSslError(*req, &err, &detail) && err) {
       log_line("https: send 0x%08x, SSL error 0x%08x, detail 0x%x",
                (unsigned)ret, (unsigned)err, detail);
     } else {
       log_line("https: send 0x%08x", (unsigned)ret);
     }
-    goto out;
+    goto fail;
   }
-  if((ret=sceHttpGetStatusCode(req, &st->status))) {
+  if((ret=sceHttpGetStatusCode(*req, status))) {
     log_line("https: status 0x%08x", (unsigned)ret);
-    goto out;
+    goto fail;
   }
-  log_headers(req, st->status);
+  log_headers(*req, *status);
+  return 0;
+
+ fail:
+  stream_close(*conn, *req);
+  *conn = *req = -1;
+  return ret < 0 ? ret : -1;
+}
+
+
+/**
+ * a decimal number of s, up to stop: its end, or NULL when there is none
+ **/
+static const char *
+number(const char *s, const char *stop, size_t *n) {
+  const char *start = s;
+
+  for(*n=0; s < stop && *s >= '0' && *s <= '9'; s++) {
+    if(*n > ((size_t)-1 - 9) / 10) {
+      return NULL;
+    }
+    *n = *n * 10 + (size_t)(*s - '0');
+  }
+  return s > start ? s : NULL;
+}
+
+
+/**
+ * whether the answer's Content-Range is "bytes <from>-<len - 1>/<len>"
+ **/
+static int
+range_is(int req, size_t from, size_t len) {
+  char *block, *line, *end, *eol, *colon;
+  const char *p, *stop;
+  size_t size, first, last, total;
+
+  if(sceHttpGetAllResponseHeaders(req, &block, &size) || !block) {
+    return 0;
+  }
+  for(line=block, end=block + size; line < end; line = eol ? eol + 1 : end) {
+    eol = memchr(line, '\n', end - line);
+    stop = eol ? eol : end;
+    if(!(colon=memchr(line, ':', stop - line)) ||
+       !is_name(line, (size_t)(colon - line), "content-range")) {
+      continue;
+    }
+    for(p=colon + 1; p < stop && (*p == ' ' || *p == '\t'); p++) {
+    }
+    while(stop > p && (stop[-1] == '\r' || stop[-1] == ' ' || stop[-1] == '\t')) {
+      stop--;
+    }
+    if(stop - p < 6 || !is_name(p, 5, "bytes") || p[5] != ' ' ||
+       !(p=number(p + 6, stop, &first)) || p >= stop || *p++ != '-' ||
+       !(p=number(p, stop, &last)) || p >= stop || *p++ != '/' ||
+       !(p=number(p, stop, &total)) || p != stop) {
+      return 0;
+    }
+    return first == from && last + 1 == len && total == len;
+  }
+  return 0;
+}
+
+
+/**
+ * the answer's body into st->body from *got on, up to st->len: 0 once all
+ * of it came, STREAM_STOPPED, or the error when it broke off
+ **/
+static int
+stream_read(int req, https_stream_t *st, size_t *got) {
+  size_t want;
+  int n;
+
+  while(*got < st->len) {
+    if(stopped(st)) {
+      return STREAM_STOPPED;
+    }
+    want = st->len - *got > STREAM_PART ? STREAM_PART : st->len - *got;
+    if((n=sceHttpReadData(req, st->body + *got, want)) < 0) {
+      log_line("https: read 0x%08x after %zu of %zu bytes", (unsigned)n, *got, st->len);
+      return n;
+    }
+    if(!n) {
+      log_line("https: the answer ended after %zu of %zu bytes", *got, st->len);
+      return -1;
+    }
+    *got += (size_t)n;
+    __atomic_store_n(&st->got, *got, __ATOMIC_RELEASE);
+  }
+  return 0;
+}
+
+
+/**
+ * the try'th wait before connecting again: 1 when told to stop meanwhile
+ **/
+static int
+stream_wait(const https_stream_t *st, int try) {
+  unsigned long long us = (unsigned long long)STREAM_WAIT_US << (try > 5 ? 4 : try - 1);
+
+  for(us = us > 4000000 ? 4000000 : us; us; us -= us > 20000 ? 20000 : us) {
+    if(stopped(st)) {
+      return 1;
+    }
+    sceKernelUsleep(us > 20000 ? 20000 : (unsigned)us);
+  }
+  return stopped(st);
+}
+
+
+/**
+ * a connection that goes on with the file from byte got: 0 with it, the
+ * error (another try may do), STREAM_OTHER or STREAM_STOPPED. A server that
+ * ignores the Range sends all of the file again, and the bytes already
+ * there are read past
+ **/
+static int
+stream_resume(const char *url, https_stream_t *st, size_t got, int *conn, int *req) {
+  int ret, status = 0, n = 0;
+  size_t skip = 0;
+  char *scratch;
+
+  if((ret=stream_open(url, got, conn, req, &status))) {
+    return ret;
+  }
+  if(status == 206 && !encoded(*req) && range_is(*req, got, st->len)) {
+    return 0;
+  }
+  if(status == 200 && !encoded(*req) && content_length(*req) == st->len) {
+    if(!(scratch=malloc(STREAM_PART))) {
+      ret = -1;
+      goto fail;
+    }
+    while(skip < got && !stopped(st)) {
+      if((n=sceHttpReadData(*req, scratch, got - skip > STREAM_PART ? STREAM_PART : got - skip)) <= 0) {
+        break;
+      }
+      skip += (size_t)n;
+    }
+    free(scratch);
+    if(skip == got) {
+      log_line("https: no Range from the server: read past %zu bytes again", got);
+      return 0;
+    }
+    ret = stopped(st) ? STREAM_STOPPED : n < 0 ? n : -1;
+    goto fail;
+  }
+  if(status / 100 == 2) {
+    log_line("https: going on from byte %zu, HTTP %d answered with another file", got, status);
+    ret = STREAM_OTHER;
+  } else {
+    ret = -1; // logged with its headers; another try may do
+  }
+
+ fail:
+  stream_close(*conn, *req);
+  *conn = *req = -1;
+  return ret;
+}
+
+
+int
+https_get_stream(const char *url, size_t max, https_stream_t *st) {
+  int conn, req, ret, tries = 0;
+  size_t len, got = 0, before = 0;
+  char *body;
+
+  if((ret=stream_open(url, 0, &conn, &req, &st->status))) {
+    return stream_end(st, ret);
+  }
   if(st->status == 200 && encoded(req)) {
     log_line("https: a stream came encoded, not as stored: not read");
-    ret = -1;
-    goto out;
+    stream_close(conn, req);
+    return stream_end(st, -1);
   }
   len = st->status == 200 ? content_length(req) : 0;
   if(!len || len > max || !(body=mem_alloc(len + 1))) {
     if(st->status == 200) {
       log_line("https: a stream of %zu bytes is not read", len);
     }
-    ret = -1;
-    goto out;
+    stream_close(conn, req);
+    return stream_end(st, -1);
   }
   body[len] = 0;
   st->body = body;
   st->len = len;
   __atomic_store_n(&st->state, HTTPS_STREAM_READING, __ATOMIC_RELEASE);
-  while(got < len) {
-    if(st->stop && *st->stop) {
-      ret = -1;
-      goto out;
+  for(;;) {
+    if(req < 0) {
+      // it broke off: again from there, waiting longer while nothing comes
+      tries = got > before ? 1 : tries + 1;
+      if(tries > STREAM_TRIES) {
+        log_line("https: gave up after %d tries in a row at %zu of %zu bytes", STREAM_TRIES, got, len);
+        break;
+      }
+      if(stream_wait(st, tries)) {
+        ret = STREAM_STOPPED;
+        break;
+      }
+      log_line("https: going on from byte %zu of %zu, try %d", got, len, tries);
+      before = got;
+      if((ret=stream_resume(url, st, got, &conn, &req))) {
+        if(ret == STREAM_OTHER || ret == STREAM_STOPPED) {
+          break;
+        }
+        continue;
+      }
     }
-    if((n=sceHttpReadData(req, body + got, len - got > (256 << 10) ? 256 << 10 : len - got)) < 0) {
-      log_line("https: read 0x%08x after %zu bytes", (unsigned)n, got);
-      ret = n;
-      goto out;
+    before = got;
+    ret = stream_read(req, st, &got);
+    stream_close(conn, req);
+    conn = req = -1;
+    if(!ret || ret == STREAM_STOPPED) {
+      break;
     }
-    if(!n) {
-      log_line("https: the answer ended after %zu of %zu bytes", got, len);
-      ret = -1;
-      goto out;
-    }
-    got += (size_t)n;
-    __atomic_store_n(&st->got, got, __ATOMIC_RELEASE);
   }
-  ret = 0;
-
- out:
-  if(req >= 0) {
-    sceHttpDeleteRequest(req);
-  }
-  sceHttpDeleteConnection(conn);
   return stream_end(st, ret < 0 ? ret : ret ? -1 : 0);
 }
 

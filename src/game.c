@@ -685,6 +685,51 @@ game_spoils(const char *text, const game_keys_t *k) {
 }
 
 
+int
+game_competitive(const char *name) {
+  // played against others, where a toast over the game costs a round
+  static const char *const games[] = {
+    "call of duty", "warzone", "fortnite", "apex legends", "valorant", "overwatch", "rocket league",
+    "rainbow six", "ea sports fc", "fifa", "efootball", "street fighter", "tekken", "mortal kombat", "guilty gear",
+    "the finals", "xdefiant", "marvel rivals", "battlefield", "destiny 2", "pubg", "nba 2k", "dead by daylight",
+    "brawlhalla", "multiversus", "dragon ball fighterz", "fatal fury", "splitgate", "for honor", "chivalry 2",
+    "hunt showdown", "arena breakout", "delta force", "2xko", "rematch",
+  };
+  char low[GAME_NAME + 2];
+  size_t n = 1;
+
+  if(!name) {
+    return 0;
+  }
+  // small letters and digits, anything else one space; a space first, so
+  // each name is found as words of their own
+  low[0] = ' ';
+  for(const char *s=name; *s && n + 1 < sizeof low; s++) {
+    char c = *s >= 'A' && *s <= 'Z' ? (char)(*s - 'A' + 'a') : *s;
+    if((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+      low[n++] = c;
+    } else if(low[n - 1] != ' ' && c != '\'' && !((unsigned char)c & 0x80)) {
+      low[n++] = ' ';
+    }
+  }
+  low[n] = 0;
+  for(size_t i=0; i < sizeof games / sizeof games[0]; i++) {
+    char word[48];
+    const char *at = low;
+    size_t len = (size_t)snprintf(word, sizeof word, " %s", games[i]);
+    // then the name's end, a space or a number ("NBA 2K25"), not more letters ("Tekkenstein")
+    while((at=strstr(at, word))) {
+      char after = at[len];
+      if(!after || after == ' ' || (after >= '0' && after <= '9')) {
+        return 1;
+      }
+      at++;
+    }
+  }
+  return 0;
+}
+
+
 const char *
 game_locale(int lang) {
   static const char *const codes[LANGS] = {"en-US", "pt-PT", "es-ES", "fr-FR", "de-DE", "it-IT", "nl-NL"};

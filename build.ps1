@@ -90,19 +90,93 @@ Write-Host "OK: $xtest ($((Get-Item $xtest).Length) bytes)"
     "link_page_js=$(Join-Path $PSScriptRoot 'src\linkpage\link.js')" `
     "link_page_css=$(Join-Path $PSScriptRoot 'src\linkpage\link.css')"
 if ($LASTEXITCODE -ne 0) { throw "o embed da pagina de ligacao falhou" }
+# e a pagina de escrever no telemovel (src\phone.h)
+& python (Join-Path $PSScriptRoot "tools\embed.py") (Join-Path $build "phonepage.h") `
+    "phone_page_html=$(Join-Path $PSScriptRoot 'src\phonepage\index.html')" `
+    "phone_page_js=$(Join-Path $PSScriptRoot 'src\phonepage\phone.js')" `
+    "phone_page_css=$(Join-Path $PSScriptRoot 'src\phonepage\phone.css')"
+if ($LASTEXITCODE -ne 0) { throw "o embed da pagina do telemovel falhou" }
+# A criptografia do X Chat (libsodium e BearSSL, como tools\build-crypto.sh)
+# para o notify, para os avisos dizerem o que as mensagens cifradas dizem com
+# a chave que o titulo guardou: um arquivo, refeito so quando uma fonte muda.
+$sodium = Join-Path $PSScriptRoot "third_party\libsodium\src"
+$bearssl = Join-Path $PSScriptRoot "third_party\bearssl"
+$cryptoLib = Join-Path $build "libxps5crypto-payload.a"
+$cryptoObj = Join-Path $build "crypto-payload"
+$sodiumSources = @(Get-ChildItem -Recurse -Filter *.c $sodium | Sort-Object FullName)
+$bearsslSources = @(Get-ChildItem -Recurse -Filter *.c (Join-Path $bearssl "src") | Sort-Object FullName)
+$newest = ($sodiumSources + $bearsslSources | Measure-Object -Property LastWriteTime -Maximum).Maximum
+if (-not (Test-Path $cryptoLib) -or (Get-Item $cryptoLib).LastWriteTime -lt $newest) {
+    if (Test-Path $cryptoObj) { Remove-Item -Recurse -Force $cryptoObj }
+    New-Item -ItemType Directory -Force $cryptoObj | Out-Null
+    $objects = @()
+    $n = 0
+    foreach ($source in $sodiumSources) {
+        $n++
+        $o = Join-Path $cryptoObj "sodium$n.o"
+        & $cc -w -O2 -DNDEBUG -DCONFIGURED=1 -DNATIVE_LITTLE_ENDIAN=1 -DHAVE_TI_MODE=1 -DHAVE_INTTYPES_H=1 `
+            -DHAVE_STDINT_H=1 -DSODIUM_STATIC=1 -I (Join-Path $sodium "include") `
+            -I (Join-Path $sodium "include\sodium") -c $source.FullName -o $o
+        if ($LASTEXITCODE -ne 0) { throw "a libsodium nao compilou: $($source.Name)" }
+        $objects += $o
+    }
+    foreach ($source in $bearsslSources) {
+        $n++
+        $o = Join-Path $cryptoObj "bearssl$n.o"
+        & $cc -w -O2 -DNDEBUG -I (Join-Path $bearssl "inc") -I (Join-Path $bearssl "src") -c $source.FullName -o $o
+        if ($LASTEXITCODE -ne 0) { throw "a BearSSL nao compilou: $($source.Name)" }
+        $objects += $o
+    }
+    if (Test-Path $cryptoLib) { Remove-Item -Force $cryptoLib }
+    & (Join-Path $Llvm "llvm-ar.exe") rcs $cryptoLib $objects
+    if ($LASTEXITCODE -ne 0) { throw "o arquivo da criptografia falhou" }
+    Remove-Item -Recurse -Force $cryptoObj
+    Write-Host "OK: $cryptoLib ($n ficheiros)"
+}
+# O som dos Spaces por cima do jogo: o radio do notify descodifica o AAC com
+# um FFmpeg so com esse descodificador (tools\ffmpeg-payload.sh, no WSL), que
+# fica em build\ffmpeg-payload; sem -Wsl usa o que ja la esta.
+$ffPayload = Join-Path $build "ffmpeg-payload"
+if ($Wsl) {
+    $wslPath = { param($p) "/mnt/" + $p.Substring(0, 1).ToLower() + ($p.Substring(2) -replace '\\', '/') }
+    & wsl.exe -d $Wsl -- sh (& $wslPath (Join-Path $PSScriptRoot "tools\ffmpeg-payload.sh")) (& $wslPath $ffPayload)
+    if ($LASTEXITCODE -ne 0) { throw "o FFmpeg do payload falhou" }
+}
+$ffLib = Join-Path $ffPayload "lib"
+if (-not (Test-Path (Join-Path $ffLib "libavcodec.a"))) { throw "falta $ffPayload; corre com -Wsl Ubuntu-24.04" }
 $notify = Join-Path $build "TwitterPS5-notify.elf"
-& $cc -Wall -Werror -O2 -I $build -o $notify (Join-Path $PSScriptRoot "src\notify.c") `
+& $cc -Wall -Werror -O2 -DCAPTURES_READDIR -I $build -I (Join-Path $sodium "include") `
+    -I (Join-Path $bearssl "inc") -I (Join-Path $ffPayload "include") `
+    -o $notify (Join-Path $PSScriptRoot "src\notify.c") `
+    (Join-Path $PSScriptRoot "src\radio.c") (Join-Path $PSScriptRoot "src\spacecmd.c") `
+    (Join-Path $PSScriptRoot "src\hls.c") `
     (Join-Path $PSScriptRoot "src\xnotify.c") (Join-Path $PSScriptRoot "src\xapi.c") `
+    (Join-Path $PSScriptRoot "src\xchat.c") `
+    (Join-Path $PSScriptRoot "src\xchatopen.c") (Join-Path $PSScriptRoot "src\xcrypt.c") $cryptoLib `
     (Join-Path $PSScriptRoot "src\play.c") (Join-Path $PSScriptRoot "src\xsign.c") `
     (Join-Path $PSScriptRoot "src\xtid.c") `
     (Join-Path $PSScriptRoot "src\captures.c") (Join-Path $PSScriptRoot "src\settings.c") `
     (Join-Path $PSScriptRoot "src\game.c") (Join-Path $PSScriptRoot "src\trophy.c") `
+    (Join-Path $PSScriptRoot "src\sessions.c") (Join-Path $PSScriptRoot "src\seen.c") `
     (Join-Path $PSScriptRoot "src\link.c") (Join-Path $PSScriptRoot "src\linkserve.c") `
+    (Join-Path $PSScriptRoot "src\phone.c") (Join-Path $PSScriptRoot "src\phoneserve.c") `
     (Join-Path $PSScriptRoot "src\json.c") (Join-Path $PSScriptRoot "src\tls.c") `
     (Join-Path $PSScriptRoot "src\https.c") (Join-Path $PSScriptRoot "src\mem.c") `
-    -lSceNet -lSceSsl -lSceHttp -lSceNotification -lSceSystemService -lSceUserService
+    (Join-Path $ffLib "libavcodec.a") (Join-Path $ffLib "libswresample.a") (Join-Path $ffLib "libavutil.a") `
+    -lSceNet -lSceSsl -lSceHttp -lSceNotification -lSceSystemService -lSceUserService -lSceAudioOut
 if ($LASTEXITCODE -ne 0) { throw "a compilacao do notify falhou" }
 Write-Host "OK: $notify ($((Get-Item $notify).Length) bytes)"
+
+# O payload do ditado (src\dictated.c), com o whisper.cpp: C++ com excecoes,
+# que o SDK do WSL liga (tools\dictate-payload.sh); sem -Wsl usa o que ja
+# esta em build. O titulo arranca-o como ao notify.
+$dictate = Join-Path $build "XPS5-dictate.elf"
+if ($Wsl) {
+    & wsl.exe -d $Wsl -- sh (& $wslPath (Join-Path $PSScriptRoot "tools\dictate-payload.sh")) (& $wslPath $build)
+    if ($LASTEXITCODE -ne 0) { throw "a compilacao do payload do ditado falhou" }
+}
+if (-not (Test-Path $dictate)) { throw "falta $dictate; corre com -Wsl Ubuntu-24.04" }
+Write-Host "OK: $dictate ($((Get-Item $dictate).Length) bytes)"
 
 # Titulo TWPS00001 (categoria media) com a timeline do X, e o payload que o
 # instala. O eboot e o libc.prx saem das ferramentas do PS5_Vulkan, no WSL
@@ -127,7 +201,7 @@ foreach ($f in @($ebootBin, $libcPrx, $iconPng, $picPng, $picDds)) {
 
 # Os ficheiros do titulo vao embebidos no payload como arrays C.
 & python (Join-Path $PSScriptRoot "tools\embed.py") (Join-Path $build "title_files.h") `
-    "eboot_bin=$ebootBin" "libc_prx=$libcPrx" "icon0_png=$iconPng" "pic0_png=$picPng" "pic_dds=$picDds" "notify_elf=$notify" `
+    "eboot_bin=$ebootBin" "libc_prx=$libcPrx" "icon0_png=$iconPng" "pic0_png=$picPng" "pic_dds=$picDds" "notify_elf=$notify" "dictate_elf=$dictate" `
     "param_json=$(Join-Path $PSScriptRoot 'title\param.json')"
 if ($LASTEXITCODE -ne 0) { throw "o embed do titulo falhou" }
 
@@ -154,9 +228,32 @@ if (Test-Path $pack) {
     Write-Host "AVISO: sem $pack, o instalador nao leva o motor de login"
 }
 
+# O modelo do ditado (models\whisper\ggml-tiny-q8_0.bin, o Whisper tiny em 8
+# bits, que tools\whisper-q8.sh faz a partir do ggml-tiny.bin): o instalador
+# leva-o e escreve-o em /data/TwitterPS5/whisper quando muda. Sem ele, o XPS5
+# funciona e o ditado diz que falta o modelo.
+$model = Join-Path $PSScriptRoot "models\whisper\ggml-tiny-q8_0.bin"
+$model16 = Join-Path $PSScriptRoot "models\whisper\ggml-tiny.bin"
+if ($Wsl -and -not (Test-Path $model) -and (Test-Path $model16)) {
+    & wsl.exe -d $Wsl -- sh (& $wslPath (Join-Path $PSScriptRoot "tools\whisper-q8.sh")) `
+        (& $wslPath (Join-Path $build "whisper-host"))
+    if ($LASTEXITCODE -ne 0) { throw "a conversao do modelo do ditado para 8 bits falhou" }
+}
+$modelArgs = @()
+if (Test-Path $model) {
+    $modelSha = (Get-FileHash -Algorithm SHA256 $model).Hash.ToLower()
+    $modelPath = $model -replace '\\', '/'
+    Set-Content -Encoding ascii (Join-Path $build "dictate_model.h") `
+        "#define DICTATE_MODEL_PATH `"$modelPath`"`n#define DICTATE_MODEL_SHA256 `"$modelSha`""
+    $modelArgs = @("-DXPS5_DICTATE_MODEL")
+    Write-Host "o instalador leva o modelo do ditado ($((Get-Item $model).Length) bytes)"
+} else {
+    Write-Host "AVISO: sem $model, o instalador nao leva o modelo do ditado"
+}
+
 $install = Join-Path $build "XPS5.elf"
 & $cc -Wall -Werror -O2 -I $build -o $install (Join-Path $PSScriptRoot "src\install.c") @engineArgs `
-    -lSceSystemService
+    @modelArgs -lSceSystemService
 if ($LASTEXITCODE -ne 0) { throw "a compilacao do instalador falhou" }
 Write-Host "OK: $install ($((Get-Item $install).Length) bytes) com o eboot de $((Get-Item $ebootBin).Length) bytes"
 

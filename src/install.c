@@ -3,7 +3,7 @@
 home screen; its param.json makes it a media app, in the Media tab. The
 title's files are embedded at build time (build/title_files.h); param.json
 is written last. notify.elf, the X notifications payload, goes beside the
-eboot; the title starts it (src/notify.c).
+eboot; the title starts it (src/notify.c), as it does dictate.elf.
 
 The installer does not add the title to the home screen itself: on FW 12
 and later the system's sceAppInstUtilAppInstallTitleDir is gone (FW 13.60:
@@ -29,7 +29,14 @@ login engine too (tools/login-engine, packed with xz by pack-engine.sh) and
 writes it to /data/TwitterPS5/engine, where the title's login window finds
 it. The engine (142 MiB) is written again only when it differs from the one
 there (engine.sha256, the tar's SHA-256, written last); XPS5 still installs
-and works without it, with the linking from a phone or a PC. */
+and works without it, with the linking from a phone or a PC.
+
+dictate.elf, the dictation payload (src/dictated.c), goes beside the eboot
+too. Built with XPS5_DICTATE_MODEL (build.ps1, when models/whisper has the
+model), it carries the Whisper model the payload reads and writes it to
+DICT_MODEL (src/dictproto.h), again only when it differs from the one there
+(model.sha256, written last); without it, XPS5 works and dictation says the
+model is missing. */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -68,6 +75,27 @@ __asm__(".section .rodata\n"
         ".previous\n");
 extern const unsigned char engine_pack[] __asm__("engine_pack");
 extern const unsigned char engine_pack_end[] __asm__("engine_pack_end");
+#endif
+
+#ifdef XPS5_DICTATE_MODEL
+#include "dictate_model.h" // DICTATE_MODEL_PATH, DICTATE_MODEL_SHA256 (build.ps1)
+#include "dictproto.h"     // DICT_MODEL_DIR, DICT_MODEL
+
+#define DICT_STAMP DICT_MODEL_DIR "/model.sha256"
+
+// the Whisper model, as the file build.ps1 names
+__asm__(".section .rodata\n"
+        ".p2align 4\n"
+        ".globl dictate_model\n"
+        ".hidden dictate_model\n"
+        "dictate_model:\n"
+        ".incbin \"" DICTATE_MODEL_PATH "\"\n"
+        ".globl dictate_model_end\n"
+        ".hidden dictate_model_end\n"
+        "dictate_model_end:\n"
+        ".previous\n");
+extern const unsigned char dictate_model[] __asm__("dictate_model");
+extern const unsigned char dictate_model_end[] __asm__("dictate_model_end");
 #endif
 
 #define TITLE_ID     "TWPS00001"
@@ -265,6 +293,43 @@ install_engine(void) {
 #endif
 
 
+#ifdef XPS5_DICTATE_MODEL
+/**
+ * the Whisper model into DICT_MODEL, unless the same one is there: 1 when
+ * written, 0 when it was there, -1 when it could not be (said)
+ **/
+static int
+install_model(void) {
+  const size_t len = (size_t)(dictate_model_end - dictate_model);
+  char stamp[80] = "";
+  struct stat st;
+  ssize_t n;
+  int fd;
+
+  if((fd=open(DICT_STAMP, O_RDONLY)) >= 0) {
+    n = read(fd, stamp, sizeof stamp - 1);
+    close(fd);
+    stamp[n > 0 ? n : 0] = 0;
+    stamp[strcspn(stamp, "\r\n")] = 0;
+  }
+  if(!strcmp(stamp, DICTATE_MODEL_SHA256) && !stat(DICT_MODEL, &st) && (size_t)st.st_size == len) {
+    return 0;
+  }
+  if(make_dir("/data/TwitterPS5") || make_dir(DICT_MODEL_DIR)) {
+    return -1;
+  }
+  unlink(DICT_STAMP); // until the whole model is written
+  say("XPS5: writing its dictation model (%zu MiB)", len >> 20);
+  if(write_file(DICT_MODEL, dictate_model, len, 0644) ||
+     write_file(DICT_STAMP, (const unsigned char *)DICTATE_MODEL_SHA256, strlen(DICTATE_MODEL_SHA256), 0644)) {
+    unlink(DICT_MODEL);
+    return -1;
+  }
+  return 1;
+}
+#endif
+
+
 /**
  * XPS5 closed when it is open: 1 when it was, 0 when it was not, -1 when it
  * stays open
@@ -292,7 +357,7 @@ close_title(void) {
 
 int
 main(void) {
-  const char *engine = "";
+  const char *engine = "", *dictation = "";
   int closed, art;
 
   if((closed=close_title()) < 0) {
@@ -310,6 +375,7 @@ main(void) {
      write_file(TITLE_DIR "/sce_sys/pic1.dds", pic_dds, sizeof pic_dds, 0644) ||
      write_file(TITLE_DIR "/sce_sys/pic2.dds", pic_dds, sizeof pic_dds, 0644) ||
      write_file(TITLE_DIR "/notify.elf", notify_elf, sizeof notify_elf, 0644) ||
+     write_file(TITLE_DIR "/dictate.elf", dictate_elf, sizeof dictate_elf, 0644) ||
      write_file(TITLE_DIR "/sce_sys/param.json", param_json, sizeof param_json, 0644)) {
     return EXIT_FAILURE;
   }
@@ -329,17 +395,31 @@ main(void) {
   }
 #endif
 
+#ifdef XPS5_DICTATE_MODEL
+  // and the dictation's model, which it works without too
+  switch(install_model()) {
+  case 1:
+    dictation = ", with its dictation model";
+    break;
+  case 0:
+    break;
+  default:
+    dictation = ", without its dictation model";
+    break;
+  }
+#endif
+
   // the home screen's copies of its pictures, when it is on it already
   if((art=refresh_art()) < 0) {
     return EXIT_FAILURE;
   }
   klog_printf("[TwitterPS5 install] home screen pictures: %d\n", art);
   if(art) {
-    say("XPS5 %swritten to " TITLE_DIR "%s. Open it from Media on the home screen.",
-        closed ? "closed and " : "", engine);
+    say("XPS5 %swritten to " TITLE_DIR "%s%s. Open it from Media on the home screen.",
+        closed ? "closed and " : "", engine, dictation);
   } else {
-    say("XPS5 %swritten to " TITLE_DIR "%s. ShadowMountPlus adds it to Media on the home screen in "
-        "about 15 s.", closed ? "closed and " : "", engine);
+    say("XPS5 %swritten to " TITLE_DIR "%s%s. ShadowMountPlus adds it to Media on the home screen in "
+        "about 15 s.", closed ? "closed and " : "", engine, dictation);
   }
   return EXIT_SUCCESS;
 }

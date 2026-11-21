@@ -867,6 +867,46 @@ make_icons(void) {
   POINTS(add_shape(icon, LINE), 8, 6.5f, 8.8f, 4.8f, 8, 3);
   POINTS(add_shape(icon, LINE), 12.4f, 6.5f, 13.2f, 4.8f, 12.4f, 3);
 
+  // a trophy: a cup with its two handles, on a stem and a foot
+  icon = icon_with(ICON_TROPHY, 1.9f);
+  s = add_shape(icon, LOOP);
+  POINTS(s, 6.5f, 3.5f, 17.5f, 3.5f);
+  add_arc(s, 12, 8.5f, 5.5f, 0, 180, 14);
+  add_arc(add_shape(icon, LINE), 6.5f, 7.4f, 2.6f, 270, 100, 10);
+  add_arc(add_shape(icon, LINE), 17.5f, 7.4f, 2.6f, -90, 80, 10);
+  POINTS(add_shape(icon, LINE), 12, 14, 12, 18.4f);
+  POINTS(add_shape(icon, LINE), 8, 20.4f, 16, 20.4f);
+
+  // a microphone: its head, the holder round it, its stem and foot
+  icon = icon_with(ICON_MIC, 1.9f);
+  s = add_shape(icon, LOOP);
+  add_arc(s, 12, 6.2f, 3.4f, 180, 360, 12);
+  add_arc(s, 12, 10.8f, 3.4f, 0, 180, 12);
+  add_arc(add_shape(icon, LINE), 12, 10.8f, 6.4f, 0, 180, 16);
+  POINTS(add_shape(icon, LINE), 12, 17.2f, 12, 21);
+  POINTS(add_shape(icon, LINE), 8.5f, 21, 15.5f, 21);
+
+  // a phone: its body with round corners, and the bar at its foot
+  icon = icon_with(ICON_PHONE, 1.9f);
+  s = add_shape(icon, LOOP);
+  add_arc(s, 9.4f, 4.8f, 2.4f, 180, 270, 6);
+  add_arc(s, 14.6f, 4.8f, 2.4f, 270, 360, 6);
+  add_arc(s, 14.6f, 19.2f, 2.4f, 0, 90, 6);
+  add_arc(s, 9.4f, 19.2f, 2.4f, 90, 180, 6);
+  POINTS(add_shape(icon, LINE), 10.6f, 18.4f, 13.4f, 18.4f);
+
+  // dictation: a small microphone on the left, and the lines of text it
+  // writes on the right
+  icon = icon_with(ICON_DICTATE, 1.9f);
+  s = add_shape(icon, LOOP);
+  add_arc(s, 7, 6.4f, 2.6f, 180, 360, 10);
+  add_arc(s, 7, 10.2f, 2.6f, 0, 180, 10);
+  add_arc(add_shape(icon, LINE), 7, 10.2f, 4.8f, 0, 180, 12);
+  POINTS(add_shape(icon, LINE), 7, 15, 7, 18, 4.6f, 18, 9.4f, 18); // its stem, then its foot (MAX_SHAPES)
+  POINTS(add_shape(icon, LINE), 14, 6, 21, 6);
+  POINTS(add_shape(icon, LINE), 14, 11, 21, 11);
+  POINTS(add_shape(icon, LINE), 14, 16, 19, 16);
+
   g_icons_made = 1;
 }
 
@@ -1275,4 +1315,258 @@ draw_icon(const text_surface_t *dst, int icon, int x, int y, int size, uint32_t 
   const text_surface_t p = text_pixels(dst);
 
   icon_px(&p, icon, text_px(dst, x), text_py(dst, y), text_size(dst, size), color);
+}
+
+
+/*
+ * Pictures zoomed and frames mixed, in the pixels' two pairs of channels at
+ * once (red and blue, green and alpha), each 0..255 in 16 bits.
+ */
+
+#define LANES 0x00FF00FFu
+
+
+/**
+ * a and b mixed: b weighs f, 0..256
+ **/
+static uint32_t
+lerp_px(uint32_t a, uint32_t b, unsigned f) {
+  const unsigned g = 256 - f;
+  uint32_t rb = ((a & LANES) * g + (b & LANES) * f) >> 8;
+  uint32_t ag = ((a >> 8 & LANES) * g + (b >> 8 & LANES) * f) >> 8;
+
+  return (rb & LANES) | (ag & LANES) << 8;
+}
+
+
+void
+draw_premultiply(uint32_t *pixels, int w, int h) {
+  for(size_t i=0, n=(size_t)w * h; i < n; i++) {
+    const uint32_t p = pixels[i], a = p >> 24;
+    const uint32_t rb = ((p & LANES) * a + 0x00800080u) >> 8 & LANES;
+    const uint32_t g = ((p & 0xFF00u) * a + 0x8000u) >> 8 & 0xFF00u;
+    pixels[i] = a << 24 | rb | g;
+  }
+}
+
+
+uint32_t *
+draw_half(const uint32_t *pixels, int w, int h) {
+  const int hw = (w + 1) / 2, hh = (h + 1) / 2;
+  uint32_t *out;
+
+  if(w <= 0 || h <= 0 || !(out=malloc((size_t)hw * hh * sizeof *out))) {
+    return NULL;
+  }
+  for(int y=0; y < hh; y++) {
+    const uint32_t *r0 = pixels + (size_t)(2 * y) * w;
+    const uint32_t *r1 = pixels + (size_t)(2 * y + 1 < h ? 2 * y + 1 : 2 * y) * w;
+    for(int x=0; x < hw; x++) {
+      const int x0 = 2 * x, x1 = 2 * x + 1 < w ? 2 * x + 1 : 2 * x;
+      const uint32_t rb = (r0[x0] & LANES) + (r0[x1] & LANES) + (r1[x0] & LANES) + (r1[x1] & LANES);
+      const uint32_t ag = (r0[x0] >> 8 & LANES) + (r0[x1] >> 8 & LANES) + (r1[x0] >> 8 & LANES) +
+                          (r1[x1] >> 8 & LANES);
+      out[(size_t)y * hw + x] = ((rb + 0x00020002u) >> 2 & LANES) | ((ag + 0x00020002u) >> 2 & LANES) << 8;
+    }
+  }
+  return out;
+}
+
+
+#define ZOOM_COLS 4096 // the screen's pixels across, at most
+
+typedef struct zoom {
+  text_surface_t  p; // the screen, in pixels
+  const uint32_t *pixels;
+  int             pw, ph;
+  float           y, h; // the box's top and height, in pixels
+  unsigned        alpha;
+  int             x0, x1, y0, y1;
+  int             col[ZOOM_COLS], wx[ZOOM_COLS]; // per column: the picture's left one, the right one's weight
+} zoom_t;
+
+
+/**
+ * the picture's pixel at x, y; outside it, nothing
+ **/
+static uint32_t
+texel(const zoom_t *z, int x, int y) {
+  return x < 0 || y < 0 || x >= z->pw || y >= z->ph ? 0 : z->pixels[(size_t)y * z->pw + x];
+}
+
+
+static void
+zoom_part(void *arg, int part, int parts) {
+  const zoom_t *z = arg;
+  int from, to;
+
+  workers_rows(z->y1 - z->y0, part, parts, &from, &to);
+  for(int row=z->y0 + from; row < z->y0 + to; row++) {
+    const float sy = (row + 0.5f - z->y) * z->ph / z->h - 0.5f;
+    const int ty = (int)floorf(sy);
+    const unsigned wy = (unsigned)((sy - ty) * 256 + 0.5f);
+    uint32_t *line = pixel(&z->p, 0, row);
+    if(ty < -1 || ty >= z->ph) {
+      continue;
+    }
+    for(int col=z->x0; col < z->x1; col++) {
+      const int tx = z->col[col - z->x0];
+      const unsigned wx = (unsigned)z->wx[col - z->x0];
+      const uint32_t a = texel(z, tx, ty), b = texel(z, tx + 1, ty);
+      const uint32_t c = texel(z, tx, ty + 1), d = texel(z, tx + 1, ty + 1);
+      uint32_t s, k, na, under;
+      if(!(a | b | c | d)) {
+        continue;
+      }
+      s = lerp_px(lerp_px(a, b, wx), lerp_px(c, d, wx), wy);
+      if(z->alpha < 256) {
+        s = lerp_px(0, s, z->alpha);
+      }
+      if(!(k=s >> 24)) {
+        continue;
+      }
+      // over what is there: the picture's colour is already times its alpha
+      na = 256 - k - (k >> 7);
+      under = line[col];
+      under = ((under & LANES) * na >> 8 & LANES) | ((under >> 8 & LANES) * na >> 8 & LANES) << 8;
+      line[col] = 0xFF000000u | (((under & LANES) + (s & LANES)) & LANES) |
+                  ((under + (s & 0xFF00u)) & 0xFF00u);
+    }
+  }
+}
+
+
+void
+draw_picture_zoom(const text_surface_t *dst, float cx, float cy, float w, float h,
+                  const uint32_t *pixels, int pw, int ph, unsigned alpha) {
+  static zoom_t z;
+  const float x = cx - w / 2;
+
+  if(!pixels || pw <= 0 || ph <= 0 || w < 1 || h < 1 || !alpha) {
+    return;
+  }
+  z.p = text_pixels(dst);
+  z.pixels = pixels;
+  z.pw = pw;
+  z.ph = ph;
+  z.y = cy - h / 2;
+  z.h = h;
+  z.alpha = alpha > 256 ? 256 : alpha;
+  z.x0 = x < 0 ? 0 : (int)x;
+  z.x1 = x + w > z.p.width ? z.p.width : (int)ceilf(x + w);
+  z.y0 = z.y < 0 ? 0 : (int)z.y;
+  z.y1 = z.y + h > z.p.height ? z.p.height : (int)ceilf(z.y + h);
+  if(z.x1 <= z.x0 || z.y1 <= z.y0 || z.x1 - z.x0 > ZOOM_COLS) {
+    return;
+  }
+  for(int col=z.x0; col < z.x1; col++) {
+    const float sx = (col + 0.5f - x) * pw / w - 0.5f;
+    const int tx = (int)floorf(sx);
+    z.col[col - z.x0] = tx;
+    z.wx[col - z.x0] = (int)((sx - tx) * 256 + 0.5f);
+  }
+  if((long long)(z.y1 - z.y0) * (z.x1 - z.x0) >= SHARED_MIN) {
+    workers_run(zoom_part, &z);
+  } else {
+    zoom_part(&z, 0, 1);
+  }
+}
+
+
+typedef struct mix {
+  uint32_t       *pixels; // the screen
+  int             stride; // its pixels across
+  int             x, y, w, h, dx, dy; // the box and the shift, in pixels
+  const uint32_t *old, *back;
+  uint32_t       *scratch;
+  unsigned        a;
+} mix_t;
+
+
+/**
+ * the new frame's box into scratch, as it is
+ **/
+static void
+mix_keep(void *arg, int part, int parts) {
+  const mix_t *m = arg;
+  int from, to;
+
+  workers_rows(m->h, part, parts, &from, &to);
+  for(int row=m->y + from; row < m->y + to; row++) {
+    const size_t at = (size_t)row * m->stride + m->x;
+    memcpy(m->scratch + at, m->pixels + at, (size_t)m->w * sizeof *m->pixels);
+  }
+}
+
+
+static void
+mix_part(void *arg, int part, int parts) {
+  const mix_t *m = arg;
+  const uint32_t *fresh = m->scratch ? m->scratch : m->pixels;
+  int from, to;
+
+  workers_rows(m->h, part, parts, &from, &to);
+  for(int row=m->y + from; row < m->y + to; row++) {
+    const int sy = row - m->dy;
+    uint32_t *line = m->pixels + (size_t)row * m->stride;
+    const uint32_t *old = m->old + (size_t)row * m->stride;
+    for(int col=m->x; col < m->x + m->w; col++) {
+      const int sx = col - m->dx;
+      uint32_t n;
+      if(sx >= m->x && sx < m->x + m->w && sy >= m->y && sy < m->y + m->h) {
+        const size_t at = (size_t)sy * m->stride + sx;
+        n = fresh[at];
+        // what the new frame has there only from what it was drawn on stays
+        if(m->back && (m->dx || m->dy) && n == m->back[at]) {
+          n = m->back[(size_t)row * m->stride + col];
+        }
+      } else {
+        n = m->back ? m->back[(size_t)row * m->stride + col] : line[col];
+      }
+      line[col] = 0xFF000000u | lerp_px(old[col], n, m->a);
+    }
+  }
+}
+
+
+void
+draw_mix(const text_surface_t *dst, int x, int y, int w, int h, const uint32_t *old,
+         const uint32_t *back, uint32_t *scratch, int dx, int dy, unsigned a) {
+  const text_surface_t p = text_pixels(dst);
+  mix_t m;
+
+  memset(&m, 0, sizeof m);
+  m.pixels = p.pixels;
+  m.stride = p.width;
+  m.x = text_px(dst, x);
+  m.y = text_py(dst, y);
+  m.w = text_px(dst, x + w) - m.x;
+  m.h = text_py(dst, y + h) - m.y;
+  if(m.x < 0) {
+    m.w += m.x;
+    m.x = 0;
+  }
+  if(m.y < 0) {
+    m.h += m.y;
+    m.y = 0;
+  }
+  m.w = m.x + m.w > p.width ? p.width - m.x : m.w;
+  m.h = m.y + m.h > p.height ? p.height - m.y : m.h;
+  m.dx = dx;
+  m.dy = dy;
+  m.old = old;
+  m.back = back;
+  m.a = a > 256 ? 256 : a;
+  if(!old || m.w <= 0 || m.h <= 0) {
+    return;
+  }
+  if(m.dx || m.dy) {
+    if(scratch) {
+      m.scratch = scratch;
+      workers_run(mix_keep, &m);
+    } else {
+      m.dx = m.dy = 0;
+    }
+  }
+  workers_run(mix_part, &m);
 }

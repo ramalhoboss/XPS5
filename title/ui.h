@@ -22,10 +22,12 @@ tests/preview.c draws it on a computer. */
 // Subscription are pages that say where X has them; History is kept by the
 // screen; Articles are the user's own (UserArticlesTweets); Lists, from More,
 // the lists the user made or follows; Game, Home's third tab while a game
-// runs, the latest posts about it (X's search, game_query)
+// runs, the latest posts about it (X's search, game_query); Friends, Chat's
+// second tab, the people the user follows as a PS5's friends are listed:
+// who plays and who is on XPS5 first, then the ones seen last (Following)
 enum {
   UI_FOR_YOU, UI_FOLLOWING, UI_SEARCH, UI_NOTIFICATIONS, UI_BOOKMARKS, UI_ME, // sections
-  UI_CHAT, UI_CALLS, UI_GROK, UI_PREMIUM, UI_HISTORY, UI_ARTICLES, UI_LISTS, UI_GAME,
+  UI_CHAT, UI_CALLS, UI_GROK, UI_PREMIUM, UI_HISTORY, UI_ARTICLES, UI_LISTS, UI_GAME, UI_FRIENDS,
   UI_USER,  // a profile
   UI_POST,  // a post and its replies
   UI_DM,    // a conversation of Chat
@@ -33,8 +35,9 @@ enum {
   UI_FEEDS
 };
 
-// the posts History keeps, newest first
+// the posts History keeps, newest first, and Read later
 #define UI_HISTORY_MAX 40
+#define UI_LATER_MAX   60
 
 // the controller's buttons, as the pad reports them
 #define UI_R3       0x0004 // the right stick pressed: the small video closes
@@ -73,6 +76,13 @@ enum {
   ERR_NO_GAME,    // the game of an invite is not installed
   ERR_GAME_OPEN,  // another game is open, which the invite's waits for
   ERR_LAUNCH,     // code: why the PS5 did not open the game
+  ERR_XCHAT_PIN,      // the X Chat PIN was wrong; x_code: the guesses left
+  ERR_XCHAT_LOCKED,   // no guesses left: only a reset in X's own apps opens it
+  ERR_XCHAT_NONE,     // this account has no X Chat keys to recover
+  ERR_XCHAT_IDENTITY, // a key came back, but not this account's
+  ERR_XCHAT_NET,      // a realm did not answer or refused; code: a JB_* code
+  ERR_CLIP,           // the part of a video asked for could not be cut out of it; code: a CLIP_* or MP4_* code
+  ERR_SPACE_OFF,      // the Space is not on the air and has no recording; code: X_SPACE_* of xapi.h
 };
 
 // what the buttons ask main.c to do: to a post, a post of the user's own
@@ -98,8 +108,15 @@ enum {
   UI_ACT_GROK,      // the question to Grok (ui_grok_get); its answer comes with ui_grok_answer
   UI_ACT_INVITE,    // an invite to play (ui_invite_get) to the conversation id, with user
   UI_ACT_LAUNCH,    // the game of an invite opened (ui_launch_get)
-  UI_ACT_SHARE_DM   // the composer's text and first capture, a message to the conversation id
+  UI_ACT_SHARE_DM,  // the composer's text and first capture, a message to the conversation id
+  UI_ACT_VOICE_DM,  // a voice note (ui_voice_dm_get), a message to the conversation id, with user
+  UI_ACT_XCHAT_PIN, // the keyboard for the X Chat PIN (masked), to unlock reading
+  UI_ACT_XCHAT_UNLOCK, // the PIN (ui_xchat_pin_get) recovers the X Chat keys and keeps them
+  UI_ACT_SPACE      // the Space id (of user's post) asked about; its sound plays (ui_space) when it can
 };
+
+// the people of a conversation ui_party hands over, at most (the user among them)
+#define UI_PARTY_MAX 9
 
 // the media of a post: up to four pictures, or one video
 #define UI_MEDIA_MAX 4
@@ -120,6 +137,10 @@ typedef struct ui_request {
   int      latest;               // its latest posts, not the top ones; Explore's news,
                                  // not its trends
   int      side;                 // UI_SIDE_*: for the side column, not a list
+  int      xchat;                // UI_DM of a conversation on X Chat: its page is read there,
+                                 // encrypted, and opened when the account is unlocked
+  char     xchat_id[X_ID_MAX];   // UI_DM of the inbox's that goes on on X Chat too: its
+                                 // number there, whose messages join the inbox's
 } ui_request_t;
 
 // what the side column reads: x.com's side column of trends (ExploreSidebar),
@@ -157,6 +178,13 @@ int ui_history_get(const x_post_t **posts, int *changed);
  * History as it was kept: count posts (X_KIND_POST), newest first
  **/
 void ui_history_set(const x_post_t *posts, int count);
+
+/**
+ * Read later (History's second tab), like ui_history_get and _set: the
+ * posts kept to read after playing, newest first
+ **/
+int ui_later_get(const x_post_t **posts, int *changed);
+void ui_later_set(const x_post_t *posts, int count);
 
 /**
  * a text of the screen in its language, from its Portuguese and English
@@ -393,16 +421,37 @@ int ui_dm_get(char *text, size_t size);
  **/
 void ui_grok_text(const char *text);
 
+// what UI_ACT_GROK asks of Grok
+enum {
+  UI_GROK_HINT,      // the question on Grok's page, about the game
+  UI_GROK_TRANSLATE, // a post into the app's language: question its words, author who wrote it
+  UI_GROK_CATCHUP,   // what the user missed: question the posts' lines ("@author: words" each)
+};
+
 /**
  * the question UI_ACT_GROK sends, about the game named in game (or empty),
- * and *fresh 1 when it starts a new conversation; returns its length
+ * *fresh 1 when it starts a new conversation, *what UI_GROK_* and the
+ * screen name of a post to translate in author; returns its length
  **/
-int ui_grok_get(char *question, size_t qsize, char *game, size_t gsize, int *fresh);
+int ui_grok_get(char *question, size_t qsize, char *game, size_t gsize, int *fresh, int *what,
+                char *author, size_t asize);
 
 /**
  * the words of the invite UI_ACT_INVITE sends; returns their length
  **/
 int ui_invite_get(char *text, size_t size);
+
+/**
+ * the voice note UI_ACT_VOICE_DM sends into c; 1, or 0 when there is none
+ **/
+int ui_voice_dm_get(capture_t *c);
+
+/**
+ * the people of the conversation (its number) just read, as its answer
+ * lists them, the user possibly among them (count up to UI_PARTY_MAX):
+ * a group's, for its side card; before ui_result hands its messages over
+ **/
+void ui_party(const char *conversation, const x_post_t *people, int count);
 
 /**
  * the game UI_ACT_LAUNCH opens: its title id (empty when the invite had
@@ -414,6 +463,29 @@ int ui_launch_get(char *id, size_t isize, char *name, size_t nsize);
  * Grok's answer to it, before ui_action_done says how it went
  **/
 void ui_grok_answer(const char *answer);
+
+/**
+ * the Space UI_ACT_SPACE asked about, when its sound starts playing
+ * (space.h), before ui_action_done says how it went
+ **/
+void ui_space(const x_space_t *space);
+
+// the controller's microphone, as the Calls page tests it (mic.h)
+enum { UI_MIC_OFF, UI_MIC_OPENING, UI_MIC_ON, UI_MIC_FAILED };
+#define UI_MIC_NO_DEVICE    0x01 // the flags of silent
+#define UI_MIC_PRIORITY_LOW 0x02
+
+/**
+ * whether the Calls page tests the microphone, shown and asked with ✕;
+ * *retry is 1 once when ✕ asks again after it failed
+ **/
+int ui_mic_wanted(int *retry);
+
+/**
+ * how the microphone is: a UI_MIC_* state, the SCE error when it failed,
+ * the silent flags, and the meter's level and peak, 0..1
+ **/
+void ui_mic(int state, int code, int silent, float level, float peak);
 
 // XPS5's updates, as Settings' row shows them (src/update.h)
 enum {
@@ -453,11 +525,44 @@ void ui_captures(const capture_t *list, int count, int error, int code);
 void ui_game(const char *id, const char *name);
 
 /**
+ * the counts of the bar: notices and messages that came since the user
+ * last looked at them, as the payload says; while the list of one shows,
+ * its new ones are read again, and so is the conversation open when news
+ * (it had new messages)
+ **/
+void ui_badges(int notices, int chats, int news);
+
+/**
+ * the lists of the counts the user looks at now: 1 the notifications, 2
+ * Chat's list of conversations (not a conversation: see ui_badges_open)
+ **/
+int ui_badges_seen(void);
+
+/**
+ * the conversation open, which counts as read: its id and its X Chat id
+ * into a and b (size each), "" when none
+ **/
+void ui_badges_open(char *a, char *b, size_t size);
+
+/**
+ * a toast's Open brought the app to the front: what it told of (1 the
+ * notifications, 2 Chat) is shown, unless a sheet is open
+ **/
+void ui_open_told(int what);
+
+/**
  * a new capture of the game that runs, which the payload offered in a
  * toast: the composer of a post of the user's own carries it, with the
  * game's hashtag, and opens unless another screen is up
  **/
 void ui_shot(const capture_t *c);
+
+/**
+ * for the pictures' loader (any thread): the .jxr capture at path turned
+ * out HDR when its picture was made, so the screen labels it so (it goes to
+ * X as Ultra HDR)
+ **/
+void ui_capture_hdr(const char *path);
 
 /**
  * a trophy of the game the user just earned, which the payload offered in
@@ -467,6 +572,138 @@ void ui_shot(const capture_t *c);
  * ui_shot
  **/
 void ui_trophy(int grade, const char *name);
+
+/*
+ * The game's own corner (Home's tab of the game): its trophies, a card of a
+ * session of play or of the week (title/cards.h) for a post, and posts
+ * looking for a group.
+ */
+
+#define UI_TROPHY_NAME   128
+#define UI_TROPHY_DETAIL 256
+#define UI_TROPHIES_MAX  512
+
+// a trophy of the game, as the payload lists them ("trophies")
+typedef struct ui_trophy_row {
+  int  id, grade, hidden, earned; // grade 0 bronze to 3 platinum
+  char name[UI_TROPHY_NAME];      // empty for a hidden one not earned
+  char detail[UI_TROPHY_DETAIL];
+} ui_trophy_row_t;
+
+/**
+ * the trophies of the game with the title id, count -1 when it has none
+ * the PS5 knows of
+ **/
+void ui_trophies(const char *id, const ui_trophy_row_t *rows, int count);
+
+/**
+ * whether the trophies of the game are wanted again (their sheet opened),
+ * once
+ **/
+int ui_trophies_wanted(void);
+
+/**
+ * a session of play that just ended (the payload's "session"), with its
+ * best trophy and screenshots: its card is made for the composer
+ **/
+struct session;
+void ui_session(const struct session *s);
+
+/**
+ * whether the week's card was asked for (once), and then the week's
+ * sessions (NULL when the payload could not say)
+ **/
+struct week;
+int  ui_week_wanted(void);
+void ui_week(const struct week *w);
+
+/**
+ * whether the week's sessions are wanted for the card on the user's own
+ * profile (once), and then the week (NULL when the payload could not say);
+ * it comes this way too whenever it was asked for the week's card
+ **/
+int  ui_week_info_wanted(void);
+void ui_week_info(const struct week *w);
+
+/*
+ * The people the user follows as XPS5 saw them around (src/seen.h), for
+ * Friends, their activity and the player cards: main.c reads the account's
+ * file, and keeps what the screen notes into it from its looks.
+ */
+struct seen;
+
+/**
+ * the account's file as main.c read it, or NULL for none
+ **/
+void ui_seen_set(const struct seen *s);
+
+/**
+ * 1 once after the screen noted a look into it (*s is then to be kept), or 0
+ **/
+int ui_seen_get(const struct seen **s);
+
+/**
+ * a card drawn and waiting to be a JPEG: its pixels (mem_alloc'd, now the
+ * caller's) and size; returns 0 when there is none, UI_CARD_PICTURE, or
+ * UI_CARD_VOICE for a voice note's picture, which becomes its MP4
+ **/
+enum { UI_CARD_NONE, UI_CARD_PICTURE, UI_CARD_VOICE };
+int ui_card_take(uint32_t **pixels, int *w, int *h);
+
+/**
+ * the card as a JPEG the composer can carry (the path main.c reads it by),
+ * or the voice note's MP4; c NULL when it could not be made
+ **/
+void ui_card_done(const capture_t *c);
+
+/*
+ * A voice note for a post (src/voice.h): the composer's sheet tapes the
+ * controller's microphone, at VOICE_RATE, until ✕ stops it.
+ */
+
+/**
+ * whether the voice note's sheet tapes the microphone; *retry is 1 once
+ * when ✕ asks for it again after it failed
+ **/
+int ui_voice_wanted(int *retry);
+
+/**
+ * how the microphone is while it tapes: a UI_MIC_* state, the SCE error
+ * when it failed (0 for no memory), the silent flags, the meter's level,
+ * 0..1, and the samples taped
+ **/
+void ui_voice_heard(int state, int code, int silent, float level, size_t samples);
+
+/**
+ * 1 once the note was stopped to be made: the tape ends, and its loudness
+ * goes to ui_voice_card
+ **/
+int ui_voice_take(void);
+
+/**
+ * the note's card, from count bars of its loudness (0..1) over seconds of
+ * sound: its picture comes by ui_card_take as UI_CARD_VOICE. Returns 0 when
+ * it is not made (let go of, or bars NULL when the tape could not be read)
+ **/
+int ui_voice_card(const float *bars, int count, int seconds);
+
+/*
+ * Dictation: the same sheet, opened by the composer's dictation button,
+ * tapes at most DICT_MAX_S seconds (src/dictproto.h); once ui_voice_take,
+ * main.c has the words made on the console and hands them to ui_dictated.
+ */
+
+/**
+ * whether the sheet tapes (or was stopped) for a dictation, not a note
+ **/
+int ui_voice_dictating(void);
+
+/**
+ * the dictation's words (a DICT_* status, and the text when DICT_OK) added
+ * to the end of the post's text; the sheet goes back to the composer. Let
+ * go of when the sheet was cancelled meanwhile
+ **/
+void ui_dictated(int status, const char *text);
 
 /**
  * how far a post's upload got, in bytes of all its media, while it goes
@@ -509,6 +746,51 @@ void ui_pointer(int *x, int *y);
 int ui_light(unsigned char rgb[3]);
 
 /**
+ * what the controller should feel now, once: a tick for a like or a repost,
+ * two knocks for new notifications or messages, a rising run for a post
+ * that went out, a bump with the triggers at a list's end, a buzz on an
+ * error; UI_RUMBLE_NONE when nothing, or when Settings turned it off
+ **/
+enum { UI_RUMBLE_NONE, UI_RUMBLE_TICK, UI_RUMBLE_NEWS, UI_RUMBLE_SENT, UI_RUMBLE_EDGE, UI_RUMBLE_ERROR };
+int ui_rumble(void);
+
+/**
+ * 1 when voice notes play on the controller's speaker (Settings)
+ **/
+int ui_pad_speaker(void);
+
+/*
+ * Writing on the phone (src/phone.h): the window with its QR, which main.c
+ * serves through the payload.
+ */
+enum { UI_PHONE_STARTING, UI_PHONE_WAITING, UI_PHONE_NO_NETWORK, UI_PHONE_NO_HELPER };
+
+typedef struct ui_phone {
+  int  state;     // UI_PHONE_*
+  int  seen;      // the page was opened
+  char ip[16];    // the console's address, once waiting
+  char token[17]; // what the QR carries after '#', once waiting
+} ui_phone_t;
+
+/**
+ * while the window is open: its number (one more for each window), and the
+ * draft it opened with, how many characters the text takes and what it is
+ * for ("post", "reply" or "dm"); 0 while it is closed
+ **/
+unsigned ui_phone_wanted(char *draft, size_t size, int *max, char *what, size_t wsize);
+
+/**
+ * where the payload's server is, for the window
+ **/
+void ui_phone_status(const ui_phone_t *st);
+
+/**
+ * all of what the phone wrote, each time it changed; done when its Send was
+ * pressed, which uses it at once
+ **/
+void ui_phone_text(const char *text, int done);
+
+/**
  * how long the last frame took, in microseconds: the pointer and the right
  * stick go as far in a long frame as in the frames it took the time of
  **/
@@ -525,6 +807,13 @@ void ui_pictures_arrived(void);
  * looks different
  **/
 int ui_animate(void);
+
+/**
+ * the way in (XPS5's letters, growing until they go through the screen)
+ * and the pages' transitions, which the title turns on; the tests draw
+ * without them
+ **/
+void ui_motion(void);
 
 /**
  * draw a frame; now is the Unix time, frame counts up once a frame

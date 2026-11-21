@@ -6,6 +6,7 @@ likes, reposts and posts, and what their answers hold. */
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "https.h"
 #include "json.h"
@@ -60,6 +61,12 @@ typedef struct x_media {
   char video_url[X_VIDEO_URL];
   char video_small[X_VIDEO_URL];
   int  duration_ms;  // 0 for a GIF, or when unknown
+  // of X Chat: its bytes at url are encrypted (a secretstream), to open with
+  // xchat_key (xcrypt_media_open) once fetched
+  int     xchat;
+  uint8_t xchat_key[32];
+  // of X Chat: a voice note, its MP4 (sound only) at video_url
+  int     voice;
 } x_media_t;
 
 // what an x_post_t is: a post, a notice, a conversation of Chat (its
@@ -78,8 +85,25 @@ enum { X_KIND_POST, X_KIND_NOTICE, X_KIND_CHAT, X_KIND_DM, X_KIND_TREND, X_KIND_
        X_KIND_SCHEDULED };
 
 // what a direct message carries besides its text, in icon; X_DM_INVITE: its
-// text is an invite to play (play_invite_parse)
-enum { X_DM_TEXT, X_DM_PHOTO, X_DM_VIDEO, X_DM_GIF, X_DM_POST, X_DM_INVITE };
+// text is an invite to play (play_invite_parse); X_DM_JOIN: a request to
+// join the game the user plays (play_join_parse); X_DM_VOICE: a voice note
+// (of X Chat). Of X Chat too: X_DM_FILE, a file (file_name, file_size);
+// X_DM_DELETED, a message taken back; X_DM_CALL, a call (event, event_n
+// its seconds, event_video); X_DM_EVENT, a line of the conversation's own,
+// not a bubble: who did what to the group (event)
+enum { X_DM_TEXT, X_DM_PHOTO, X_DM_VIDEO, X_DM_GIF, X_DM_POST, X_DM_INVITE, X_DM_JOIN, X_DM_VOICE,
+       X_DM_FILE, X_DM_DELETED, X_DM_CALL, X_DM_EVENT };
+
+// what happened in an X Chat conversation, for X_DM_CALL and X_DM_EVENT:
+// a call started, ended (event_n seconds) or missed; the group made (its
+// title in text), its title changed (the new one in text), its picture or
+// description changed, event_n people added or removed, who sent it left,
+// event_n made admins, someone asking to join, messages that disappear
+// after event_n seconds (0: no more), a screenshot or (event_n 2) a
+// recording of the screen taken
+enum { X_EV_NONE, X_EV_CALL_STARTED, X_EV_CALL_ENDED, X_EV_CALL_MISSED, X_EV_GROUP_MADE, X_EV_TITLE,
+       X_EV_PICTURE, X_EV_DESCRIPTION, X_EV_ADDED, X_EV_REMOVED, X_EV_LEFT, X_EV_ADMINS, X_EV_JOIN_ASKED,
+       X_EV_DISAPPEAR, X_EV_SCREENSHOT };
 
 #define X_ID_MAX 64 // a post's number, or a conversation's ("123-456")
 
@@ -91,6 +115,26 @@ enum { X_ICON_OTHER, X_ICON_LIKE, X_ICON_REPOST, X_ICON_FOLLOW, X_ICON_REPLY };
 // a poll's choices, and the bytes of one's label (25 characters)
 #define X_POLL_MAX   4
 #define X_POLL_LABEL 104
+
+// a Space's number ("1YqKDqXqrNQGV"), and the key of its sound ("28_<digits>")
+#define X_SPACE_ID  24
+#define X_SPACE_KEY 48
+
+// how a Space stands: not started, on air, over (or ended by X), or unknown
+enum { X_SPACE_UNKNOWN, X_SPACE_SOON, X_SPACE_LIVE, X_SPACE_ENDED };
+
+typedef struct x_space {
+  char      id[X_SPACE_ID];
+  char      media_key[X_SPACE_KEY]; // to ask for its sound with, never put in a log
+  char      title[256];
+  char      host[64];               // screen name of who made it
+  char      host_name[128];
+  int       state;                  // X_SPACE_*
+  int       replay;                 // an ended one can be heard again
+  long long started;                // Unix time, or 0
+  long long listeners;              // listening now (or who heard it, when over), -1 unknown
+  int       speakers;
+} x_space_t;
 
 typedef struct x_post {
   int       kind;               // X_KIND_*
@@ -120,7 +164,8 @@ typedef struct x_post {
   char      quote_avatar[192];
   int       quote_badge;
   char      quote_text[320];
-  char      text[1024];         // links shown as X shows them, media links gone; of a
+  char      note[640];          // the Community Note under it (what readers added), or empty
+  char      text[4096];         // links shown as X shows them, media links gone; of a
                                 // notice, what it says
   int       icon;               // of a notice: X_ICON_*
   int       face_count;         // and the people in it, the first being user
@@ -129,6 +174,26 @@ typedef struct x_post {
   int       request;            // a conversation from someone the user does not follow yet
   int       mine;               // a message the user sent, or a conversation whose last one is
   int       group;              // a conversation of more than two
+  int       xchat;              // a conversation of X Chat (xchat.h), not of the direct messages
+  int       sealed;             // of X Chat: its last message's words are encrypted
+  int       encrypted;          // of X Chat: those words came encrypted (opened or not)
+  // of an X Chat message: the emoji people reacted with, each once, in the
+  // order they came, how many reactions in all and whether the user's is
+  // one; its words edited since; what happened (X_EV_*), with its number;
+  // a file's name and size. The message it replies to is in quote_name
+  // (who wrote it) and quote_text
+  char      reactions[48];
+  int       reaction_count;
+  int       reacted;
+  int       edited;
+  int       event;
+  int       signature;          // whether its signature held (XCHAT_SIG_* of xchat.h): it fills
+                                // what was padding, so the size and every other field's place
+                                // (the History and Read later files) stay as they were
+  long long event_n;
+  int       event_video;
+  char      file_name[128];
+  long long file_size;
   int       following;          // the user follows its author
   long long edit_until;         // until when its author may still edit it (Unix time), or 0
   // its poll: 2 to 4 choices, or 0 for none
@@ -140,9 +205,12 @@ typedef struct x_post {
   int       poll_voted;         // the signed-in user's choice, 1 to 4, or 0
   char      poll_card[48];      // its card ("card://<number>") to vote with, or empty
   char      poll_name[32];      // the card's name ("poll2choice_text_only")
+  char      space[X_SPACE_ID];  // the Space its card (or a link of its text) names, or empty
   // the game its author plays, when their profile's location says it
   // (play_game_of); of a conversation, of who it is with; else empty
   char      playing[PLAY_GAME];
+  int       online;             // or that they are on XPS5 with no game (play_online_of)
+  int       account;            // in the notifications of every account: whose (1 to 5), else 0
 } x_post_t;
 
 // a profile, as its page shows it on top
@@ -296,12 +364,47 @@ int x_vote_request(char *url, size_t usize, char *body, size_t bsize, const char
                    const char *name, int choice);
 
 /**
+ * a Space's number as X writes it: 8 to 20 letters and digits
+ **/
+int x_space_id_ok(const char *id);
+
+/**
+ * URL of the GET of the Space id (AudioSpaceById), as x.com asks; 0 or -1
+ **/
+int x_space_url(char *buf, size_t size, const char *id);
+
+/**
+ * the Space in an answer to x_space_url's request; 0, or -1 when there is
+ * none (or no key to hear it with)
+ **/
+int x_space_parse(const json_node_t *root, x_space_t *space);
+
+/**
+ * URL of the GET that says where a Space's sound is (live_video_stream),
+ * from its media_key; 0 or -1
+ **/
+int x_space_stream_url(char *buf, size_t size, const char *media_key);
+
+/**
+ * the address of the sound's HLS playlist in that answer, https only (it
+ * is fetched with no X session: no cookies, no tokens); 0 or -1
+ **/
+int x_space_stream_parse(const json_node_t *root, char *url, size_t size);
+
+/**
  * URL and JSON body of the POST of a post, as x.com's composer sends it:
  * CreateTweet, or CreateNoteTweet when the text is longer than X_POST_CHARS
  * (X Premium); a reply, a quote or an edit of the user's post by how; 0 or -1
  **/
 int x_compose_request(char *url, size_t usize, char *body, size_t bsize, const x_compose_t *how,
                       const char *text, const char *const *media, int media_count);
+
+/**
+ * from X's answer to a post, the address of its first picture at its whole
+ * size (pbs.twimg.com/media/<name>?format=<format>&name=orig), to look at
+ * what X kept of it; 0 or -1
+ **/
+int x_created_media_url(const json_node_t *root, char *url, size_t size);
 
 /**
  * a text's length as X counts it: most scripts' characters 1, the rest
@@ -444,6 +547,13 @@ int x_dm_inbox(const json_node_t *root, const char *me, x_post_t *posts, int max
 int x_dm_messages(const json_node_t *root, const char *conversation, x_post_t *posts, int max);
 
 /**
+ * the people of a conversation's answer but the user (me, their number),
+ * into people (X_KIND_USER, with their game or "on XPS5" as their profiles
+ * say), as its participants list them; with people NULL, how many there are
+ **/
+int x_dm_members(const json_node_t *root, const char *conversation, const char *me, x_post_t *people, int max);
+
+/**
  * URL and form body of the POST that marks a conversation read up to its
  * message last (a number), as x.com's Messages does when it is opened; 0 or -1
  **/
@@ -514,6 +624,25 @@ int x_grok_conversation(const json_node_t *root, char *id, size_t size);
  * when it does not fit
  **/
 int x_grok_prompt(char *out, size_t size, const char *game, const char *question, const char *language);
+
+#define X_GROK_INPUT   6000 // bytes of a post to translate, or of the posts to sum up
+#define X_GROK_PROMPT  (X_GROK_INPUT + 1024)
+#define X_CATCHUP_MOST 30   // posts summed up at most (the title makes their lines)
+#define X_CATCHUP_POST 240  // bytes of each of them, its "@author: " too
+
+/**
+ * what Grok is asked to translate the post text, by @author (or no one),
+ * into the language named language: the translation alone, its mentions,
+ * hashtags, links and emoji kept; 0, or -1 when it does not fit
+ **/
+int x_grok_translate_prompt(char *out, size_t size, const char *author, const char *text, const char *language);
+
+/**
+ * what Grok is asked to sum up the posts' lines in ("@author: words" each,
+ * at most X_CATCHUP_MOST): three short lines in the language named
+ * language, as plain text; 0, or -1 when it does not fit
+ **/
+int x_grok_catchup_prompt(char *out, size_t size, const char *lines, const char *language);
 
 /**
  * URL and JSON body of the POST that sends message to the conversation id,

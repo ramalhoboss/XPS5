@@ -351,3 +351,48 @@ trophy_names(char *meta, size_t len, int id, char *name, size_t size, char *game
   json_free(doc);
   return ret;
 }
+
+
+int
+trophy_list(char *conf, size_t conf_len, char *meta, size_t meta_len, trophy_info_t *list, int max) {
+  const json_node_t *items, *item, *names = NULL, *hidden, *one;
+  json_doc_t *doc, *meta_doc = NULL;
+  const char *grade;
+  size_t off;
+  int n = 0, id;
+
+  if(!(doc=json_parse(conf, conf_len, &off))) {
+    return -1;
+  }
+  if(!(items=json_get(json_root(doc), "trophies")) || items->type != JSON_ARRAY) {
+    json_free(doc);
+    return -1;
+  }
+  if(meta && (meta_doc=json_parse(meta, meta_len, &off))) {
+    names = json_path(json_root(meta_doc), "metadata", "trophyMetadata", NULL);
+    names = names && names->type == JSON_ARRAY ? names : NULL;
+  }
+  for(item=items->child; item && n < max; item=item->next) {
+    if(item->type != JSON_OBJECT || (id=number_of(json_get(item, "id"))) < 0 ||
+       !(grade=json_string(json_get(item, "grade")))) {
+      continue;
+    }
+    memset(&list[n], 0, sizeof list[n]);
+    list[n].id = id;
+    list[n].grade = grade[0] == 'P' || grade[0] == 'p' ? TROPHY_PLATINUM : grade[0] == 'G' || grade[0] == 'g' ?
+      TROPHY_GOLD : grade[0] == 'S' || grade[0] == 's' ? TROPHY_SILVER : TROPHY_BRONZE;
+    hidden = json_get(item, "hidden");
+    list[n].hidden = hidden && hidden->type == JSON_TRUE;
+    for(one=names ? names->child : NULL; one; one=one->next) {
+      if(one->type == JSON_OBJECT && number_of(json_get(one, "id")) == id) {
+        clean(json_string(json_get(one, "name")), list[n].name, sizeof list[n].name);
+        clean(json_string(json_get(one, "detail")), list[n].detail, sizeof list[n].detail);
+        break;
+      }
+    }
+    n++;
+  }
+  json_free(meta_doc);
+  json_free(doc);
+  return n;
+}

@@ -285,6 +285,45 @@ test_rich(const char *path) {
 }
 
 
+/**
+ * a long post of Premium: its note comes whole, past the 280 characters of
+ * full_text and the 1024 bytes the text once had
+ **/
+static void
+test_long_note(void) {
+  static char json[8192], note[3001];
+  static x_post_t posts[2];
+  json_doc_t *doc;
+  size_t off;
+  int total;
+
+  for(int i=0; i < 3000; i++) {
+    note[i] = i % 50 == 25 ? ' ' : (char)('a' + i % 26);  // no space at the end, which the app trims
+  }
+  note[3000] = 0;
+  snprintf(json, sizeof json,
+    "{\"data\":{\"home\":{\"home_timeline_urt\":{\"instructions\":[{\"type\":\"TimelineAddEntries\",\"entries\":["
+    "{\"entryId\":\"tweet-1\",\"sortIndex\":\"9\",\"content\":{\"entryType\":\"TimelineTimelineItem\","
+    "\"itemContent\":{\"itemType\":\"TimelineTweet\",\"tweet_results\":{\"result\":{\"rest_id\":\"1\","
+    "\"core\":{\"user_results\":{\"result\":{\"core\":{\"screen_name\":\"premium\"}}}},"
+    "\"legacy\":{\"full_text\":\"%.270s\xe2\x80\xa6\"},"
+    "\"note_tweet\":{\"note_tweet_results\":{\"result\":{\"text\":\"%s\"}}},"
+    "\"birdwatch_pivot\":{\"title\":\"Readers added context they thought people might want to know\","
+    "\"shorttitle\":\"Readers added context\",\"subtitle\":{\"text\":\"This clip is from 2019 &amp; edited. "
+    "https://t.co/abc \",\"entities\":[]},\"note\":{\"rest_id\":\"17\"}}}}}}}]}]}}}}",
+    note, note);
+  CHECK((doc=json_parse(json, strlen(json), &off)) != NULL);
+  if(!doc) {
+    return;
+  }
+  CHECK(x_timeline_posts(json_root(doc), posts, 2, &total) == 1);
+  CHECK(!strcmp(posts[0].user, "premium") && strlen(posts[0].text) == 3000 && !strcmp(posts[0].text, note));
+  // and its Community Note: what readers added, without the trailing space
+  CHECK(!strcmp(posts[0].note, "This clip is from 2019 & edited. https://t.co/abc"));
+  json_free(doc);
+}
+
+
 static void
 test_timeline(const char *path) {
   x_post_t posts[10];
@@ -547,6 +586,28 @@ test_actions(void) {
   json_free(doc);
   CHECK(x_reply_request(url, sizeof url, body, sizeof body, "", "ok") == 0 &&
         !strstr(body, "in_reply_to_tweet_id"));
+
+  // the post's picture as X keeps it, at its whole size
+  CHECK((doc=parse("{\"data\":{\"create_tweet\":{\"tweet_results\":{\"result\":{\"rest_id\":\"9\","
+                   "\"legacy\":{\"entities\":{\"media\":[{\"type\":\"photo\","
+                   "\"media_url_https\":\"https://pbs.twimg.com/media/GaB_x-9.jpg\"}]}}}}}}}", &off)) != NULL);
+  if(doc) {
+    CHECK(x_created_media_url(json_root(doc), url, sizeof url) == 0 &&
+          !strcmp(url, "https://pbs.twimg.com/media/GaB_x-9?format=jpg&name=orig"));
+    CHECK(x_created_media_url(json_root(doc), url, 30) == -1);
+    json_free(doc);
+  }
+  CHECK((doc=parse("{\"data\":{\"create_tweet\":{\"tweet_results\":{\"result\":{\"legacy\":{\"entities\":"
+                   "{\"media\":[{\"media_url_https\":\"https://example.com/media/a.jpg\"}]}}}}}}}", &off)) != NULL);
+  if(doc) {
+    CHECK(x_created_media_url(json_root(doc), url, sizeof url) == -1);
+    json_free(doc);
+  }
+  CHECK((doc=parse("{\"data\":{\"create_tweet\":{}}}", &off)) != NULL);
+  if(doc) {
+    CHECK(x_created_media_url(json_root(doc), url, sizeof url) == -1);
+    json_free(doc);
+  }
 
   // reposts
   CHECK(x_repost_request(url, sizeof url, body, sizeof body, "2001", 1) == 0);
@@ -1330,7 +1391,7 @@ test_explore(void) {
 static void
 test_playing(void) {
   static char url[8192], body[4096];
-  x_post_t posts[2];
+  x_post_t posts[3];
   json_doc_t *doc;
   size_t off;
   const char *conv =
@@ -1338,7 +1399,10 @@ test_playing(void) {
     "\"conversation_id\":\"2-3\",\"message_data\":{\"id\":\"100\",\"time\":\"1700000000000\",\"sender_id\":\"3\","
     "\"text\":\"\xf0\x9f\x8e\xae ASTRO BOT \xc2\xb7 bora jogar? (XPS5 PPSA01325)\"}}},"
     "{\"message\":{\"id\":\"101\",\"time\":\"1700000001000\",\"conversation_id\":\"2-3\",\"message_data\":"
-    "{\"id\":\"101\",\"time\":\"1700000001000\",\"sender_id\":\"2\",\"text\":\"ok\"}}}],"
+    "{\"id\":\"101\",\"time\":\"1700000001000\",\"sender_id\":\"2\",\"text\":\"ok\"}}},"
+    "{\"message\":{\"id\":\"102\",\"time\":\"1700000002000\",\"conversation_id\":\"2-3\",\"message_data\":"
+    "{\"id\":\"102\",\"time\":\"1700000002000\",\"sender_id\":\"3\","
+    "\"text\":\"\xf0\x9f\x99\x8b ASTRO BOT \xc2\xb7 posso entrar? (XPS5)\"}}}],"
     "\"users\":{\"3\":{\"id_str\":\"3\",\"screen_name\":\"ana\",\"name\":\"Ana\","
     "\"location\":\"\xf0\x9f\x8e\xae ASTRO BOT \xc2\xb7 PS5\"},"
     "\"2\":{\"id_str\":\"2\",\"screen_name\":\"me\",\"name\":\"Me\",\"location\":\"Porto\"}}}}";
@@ -1390,11 +1454,155 @@ test_playing(void) {
 
   CHECK((doc=parse(conv, &off)) != NULL);
   if(doc) {
-    CHECK(x_dm_messages(json_root(doc), "2-3", posts, 2) == 2);
+    CHECK(x_dm_messages(json_root(doc), "2-3", posts, 3) == 3);
     CHECK(posts[0].icon == X_DM_INVITE && !strcmp(posts[0].playing, "ASTRO BOT") && !strcmp(posts[0].user, "ana"));
     CHECK(posts[1].icon == X_DM_TEXT && !posts[1].playing[0]);
+    CHECK(posts[2].icon == X_DM_JOIN && !strcmp(posts[2].user, "ana"));
     json_free(doc);
   }
+
+  // a group's people, the user (1) left out: one plays, one is on XPS5, one is
+  // not around, one is not in the users' map and one is listed twice
+  {
+    static x_post_t people[8];
+    const char *group =
+      "{\"conversation_timeline\":{\"entries\":[],\"conversations\":{\"77\":{\"conversation_id\":\"77\","
+      "\"type\":\"GROUP_DM\",\"participants\":[{\"user_id\":\"1\"},{\"user_id\":\"2\"},{\"user_id\":\"3\"},"
+      "{\"user_id\":\"4\"},{\"user_id\":\"9\"},{\"user_id\":\"2\"}]}},"
+      "\"users\":{\"1\":{\"id_str\":\"1\",\"name\":\"Eu\",\"screen_name\":\"eu\",\"location\":\"Lisboa\"},"
+      "\"2\":{\"id_str\":\"2\",\"name\":\"Ana\",\"screen_name\":\"ana\","
+      "\"location\":\"\xf0\x9f\x8e\xae ASTRO BOT \xc2\xb7 PS5\"},"
+      "\"3\":{\"id_str\":\"3\",\"name\":\"Tiago\",\"screen_name\":\"tiago\","
+      "\"location\":\"\xf0\x9f\x9f\xa2 Online no XPS5 \xc2\xb7 PS5\","
+      "\"profile_image_url_https\":\"https://pbs.twimg.com/profile_images/3/t_normal.jpg\"},"
+      "\"4\":{\"id_str\":\"4\",\"name\":\"Rui\",\"screen_name\":\"rui\",\"location\":\"Porto\"}}}}";
+
+    CHECK((doc=parse(group, &off)) != NULL);
+    if(doc) {
+      CHECK(x_dm_members(json_root(doc), "77", "1", people, 8) == 3);
+      CHECK(!strcmp(people[0].user_id, "2") && !strcmp(people[0].playing, "ASTRO BOT") && !people[0].online &&
+            people[0].kind == X_KIND_USER);
+      CHECK(!strcmp(people[1].user, "tiago") && !people[1].playing[0] && people[1].online &&
+            !strcmp(people[1].avatar, "https://pbs.twimg.com/profile_images/3/t_normal.jpg"));
+      CHECK(!strcmp(people[2].name, "Rui") && !people[2].playing[0] && !people[2].online);
+      // without the user's number: everyone; at most max; another conversation has none
+      CHECK(x_dm_members(json_root(doc), "77", NULL, people, 8) == 4 && !strcmp(people[0].user, "eu"));
+      CHECK(x_dm_members(json_root(doc), "77", "1", people, 2) == 2);
+      CHECK(x_dm_members(json_root(doc), "78", "1", people, 8) == 0);
+      CHECK(x_dm_members(json_root(doc), "77/../x", "1", people, 8) == 0);
+      CHECK(x_dm_members(json_root(doc), NULL, "1", people, 8) == 0);
+      json_free(doc);
+    }
+  }
+}
+
+
+/**
+ * Spaces: found in a post's card or link, asked about, and where to hear one
+ **/
+static void
+test_space(void) {
+  static const char carded[] =
+    "{\"data\":{\"home\":{\"home_timeline_urt\":{\"instructions\":[{\"type\":\"TimelineAddEntries\",\"entries\":["
+    "{\"entryId\":\"tweet-3001\",\"content\":{\"itemContent\":{\"tweet_results\":{\"result\":{\"__typename\":\"Tweet\","
+    "\"rest_id\":\"3001\",\"core\":{\"user_results\":{\"result\":{\"rest_id\":\"7\",\"core\":{\"name\":\"Rui\","
+    "\"screen_name\":\"rui\"}}}},\"legacy\":{\"full_text\":\"Bora ouvir https://t.co/sp\",\"entities\":{\"urls\":["
+    "{\"url\":\"https://t.co/sp\",\"display_url\":\"x.com/i/spaces/1YqKDqXqrNQGV\","
+    "\"expanded_url\":\"https://x.com/i/spaces/1YqKDqXqrNQGV\"}]}},"
+    "\"card\":{\"rest_id\":\"card://1900000000000000011\",\"legacy\":{\"name\":\"3691233323:audiospace\","
+    "\"binding_values\":[{\"key\":\"id\",\"value\":{\"string_value\":\"1OdKrBnaEPXKX\",\"type\":\"STRING\"}}]}}}}}}},"
+    "{\"entryId\":\"tweet-3002\",\"content\":{\"itemContent\":{\"tweet_results\":{\"result\":{\"__typename\":\"Tweet\","
+    "\"rest_id\":\"3002\",\"core\":{\"user_results\":{\"result\":{\"rest_id\":\"7\",\"core\":{\"name\":\"Rui\","
+    "\"screen_name\":\"rui\"}}}},\"legacy\":{\"full_text\":\"Link https://t.co/sq\",\"entities\":{\"urls\":["
+    "{\"url\":\"https://t.co/sq\",\"display_url\":\"twitter.com/i/spaces/1MYxNgaVpBLKw\","
+    "\"expanded_url\":\"https://twitter.com/i/spaces/1MYxNgaVpBLKw?s=20\"}]}}}}}}},"
+    "{\"entryId\":\"tweet-3003\",\"content\":{\"itemContent\":{\"tweet_results\":{\"result\":{\"__typename\":\"Tweet\","
+    "\"rest_id\":\"3003\",\"core\":{\"user_results\":{\"result\":{\"rest_id\":\"7\",\"core\":{\"name\":\"Rui\","
+    "\"screen_name\":\"rui\"}}}},\"legacy\":{\"full_text\":\"Nada https://t.co/sr\",\"entities\":{\"urls\":["
+    "{\"url\":\"https://t.co/sr\",\"display_url\":\"x.com/i/spaces/a\\\"b\","
+    "\"expanded_url\":\"https://x.com/i/spaces/a%22b/peek\"}]}}}}}}}]}]}}}}";
+  static const char live[] =
+    "{\"data\":{\"audioSpace\":{\"metadata\":{\"rest_id\":\"1OdKrBnaEPXKX\",\"state\":\"Running\","
+    "\"title\":\"Noite de &amp; GT7\",\"media_key\":\"28_1857000000000000001\",\"created_at\":1794650000000,"
+    "\"started_at\":1794657600123,\"is_space_available_for_replay\":false,\"total_live_listeners\":321,"
+    "\"creator_results\":{\"result\":{\"__typename\":\"User\",\"rest_id\":\"7\",\"core\":{\"name\":\"Rui\","
+    "\"screen_name\":\"rui\"},\"legacy\":{\"name\":\"Old\",\"screen_name\":\"old\"}}}},"
+    "\"participants\":{\"total\":3,\"admins\":[{\"display_name\":\"Rui\"}],"
+    "\"speakers\":[{\"display_name\":\"Ana\"},{\"display_name\":\"Bea\"}],\"listeners\":[]}}}}";
+  static const char ended[] =
+    "{\"data\":{\"audioSpace\":{\"metadata\":{\"rest_id\":\"1MYxNgaVpBLKw\",\"state\":\"Ended\","
+    "\"media_key\":\"28_99\",\"is_space_available_for_replay\":true,\"total_replay_watched\":40,"
+    "\"total_live_listeners\":12,\"creator_results\":{\"result\":{\"legacy\":{\"name\":\"Ana\","
+    "\"screen_name\":\"ana\"}}}}}}}";
+  static const char keyless[] =
+    "{\"data\":{\"audioSpace\":{\"metadata\":{\"rest_id\":\"1MYxNgaVpBLKw\",\"state\":\"Running\","
+    "\"media_key\":\"28/../x\"}}}}";
+  static const char stream[] =
+    "{\"source\":{\"location\":\"https://prod-fastly-eu-west-3.video.pscp.tv/Transcoding/v1/hls/a/master_playlist.m3u8"
+    "?type=live\",\"noRedirectPlaybackUrl\":\"https://prod-fastly-eu-west-3.video.pscp.tv/Transcoding/v1/hls/a/"
+    "non_transcode/eu-west-3/playlist_16.m3u8?type=live\",\"status\":\"LIVE_PUBLIC\",\"streamType\":\"HLS\"},"
+    "\"sessionId\":\"s\",\"chatToken\":\"c\",\"lifecycleToken\":\"l\",\"shareUrl\":\"https://x.com/i/spaces/x\"}";
+  static const char located[] =
+    "{\"source\":{\"location\":\"https://v.example/master.m3u8\",\"noRedirectPlaybackUrl\":\"http://v.example/p\"}}";
+  static const char plain[] = "{\"source\":{\"location\":\"http://v.example/master.m3u8\"}}";
+  static const char want[] = "https://x.com/i/api/graphql/HPEisOmj1epUNLCWTYhUWw/AudioSpaceById?variables="
+    "%7B%22id%22%3A%221OdKrBnaEPXKX%22%2C%22isMetatagsQuery%22%3Atrue%2C";
+  static char url[1024];
+  x_post_t *p = calloc(3, sizeof *p);
+  x_space_t s;
+  json_doc_t *doc = NULL;
+  size_t off;
+  int total = 0;
+
+  CHECK(x_space_id_ok("1OdKrBnaEPXKX") && !x_space_id_ok("short") && !x_space_id_ok("1OdKrBna/EPXKX") &&
+        !x_space_id_ok(NULL) && !x_space_id_ok("123456789012345678901"));
+
+  // the card wins over a link; a link alone; a link that is no Space's
+  CHECK(p && (doc=parse(carded, &off)) != NULL);
+  CHECK(p && doc && x_timeline_posts(json_root(doc), p, 3, &total) == 3);
+  CHECK(p && !strcmp(p[0].space, "1OdKrBnaEPXKX"));
+  CHECK(p && !strcmp(p[1].space, "1MYxNgaVpBLKw"));
+  CHECK(p && !p[2].space[0]);
+  json_free(doc);
+  free(p);
+
+  CHECK(!x_space_url(url, sizeof url, "1OdKrBnaEPXKX") &&
+        !strncmp(url, want, strlen(want)) &&
+        strstr(url, "&features=%7B%22dont_mention_me_view_api_enabled%22%3Atrue") &&
+        strstr(url, "%22withReplays%22%3Atrue") && !strchr(url, '"') && !strchr(url, '{'));
+  CHECK(x_space_url(url, sizeof url, "1Od/KrBnaEPXKX") == -1);
+  CHECK(x_space_url(url, 100, "1OdKrBnaEPXKX") == -1);
+
+  CHECK((doc=parse(live, &off)) && !x_space_parse(json_root(doc), &s) && s.state == X_SPACE_LIVE &&
+        !strcmp(s.id, "1OdKrBnaEPXKX") && !strcmp(s.media_key, "28_1857000000000000001") &&
+        !strcmp(s.title, "Noite de & GT7") && !strcmp(s.host, "rui") && !strcmp(s.host_name, "Rui") &&
+        s.started == 1794657600LL && s.listeners == 321 && s.speakers == 2 && !s.replay);
+  json_free(doc);
+  CHECK((doc=parse(ended, &off)) && !x_space_parse(json_root(doc), &s) && s.state == X_SPACE_ENDED &&
+        s.replay && s.listeners == 40 && !strcmp(s.host, "ana") && !strcmp(s.host_name, "Ana") && !s.title[0] &&
+        !s.started && !s.speakers);
+  json_free(doc);
+  CHECK((doc=parse(keyless, &off)) && x_space_parse(json_root(doc), &s) == -1 && !s.media_key[0]);
+  json_free(doc);
+  CHECK((doc=parse("{\"data\":{\"audioSpace\":{}}}", &off)) && x_space_parse(json_root(doc), &s) == -1);
+  json_free(doc);
+
+  CHECK(!x_space_stream_url(url, sizeof url, "28_1857000000000000001") &&
+        !strcmp(url, "https://x.com/i/api/1.1/live_video_stream/status/28_1857000000000000001?client=web"
+                "&use_syndication_guest_id=false&cookie_set_host=x.com"));
+  CHECK(x_space_stream_url(url, sizeof url, "28_1?x=1") == -1);
+  CHECK(x_space_stream_url(url, 40, "28_1857000000000000001") == -1);
+
+  CHECK((doc=parse(stream, &off)) && !x_space_stream_parse(json_root(doc), url, sizeof url) &&
+        !strcmp(url, "https://prod-fastly-eu-west-3.video.pscp.tv/Transcoding/v1/hls/a/non_transcode/eu-west-3/"
+                "playlist_16.m3u8?type=live"));
+  CHECK(doc && x_space_stream_parse(json_root(doc), url, 40) == -1);
+  json_free(doc);
+  CHECK((doc=parse(located, &off)) && !x_space_stream_parse(json_root(doc), url, sizeof url) &&
+        !strcmp(url, "https://v.example/master.m3u8"));
+  json_free(doc);
+  CHECK((doc=parse(plain, &off)) && x_space_stream_parse(json_root(doc), url, sizeof url) == -1);
+  json_free(doc);
 }
 
 
@@ -1438,6 +1646,24 @@ test_grok(void) {
   CHECK(x_grok_prompt(prompt, sizeof prompt, "X", "", "English") == -1);
   CHECK(x_grok_prompt(prompt, 40, "X", "where?", "English") == -1 && !prompt[0]);
 
+  // a post translated: who wrote it, into which language, and its words last as they are
+  CHECK(!x_grok_translate_prompt(prompt, sizeof prompt, "ritasousa", "Bom dia!\n#PS5 \xf0\x9f\x8e\xae", "English") &&
+        !strncmp(prompt, "Translate this post on X by @ritasousa into English.", 52) &&
+        strstr(prompt, "@mentions, #hashtags, links and emoji") && strstr(prompt, "already in English") &&
+        strstr(prompt, "\n\nBom dia!\n#PS5 \xf0\x9f\x8e\xae") &&
+        !strcmp(prompt + strlen(prompt) - 20, "\n\nBom dia!\n#PS5 \xf0\x9f\x8e\xae"));
+  CHECK(!x_grok_translate_prompt(prompt, sizeof prompt, "", "Hi", "European Portuguese") &&
+        !strncmp(prompt, "Translate this post on X into European Portuguese.", 50));
+  CHECK(x_grok_translate_prompt(prompt, sizeof prompt, "a", "", "English") == -1);
+  CHECK(x_grok_translate_prompt(prompt, 60, "a", "Hi", "English") == -1 && !prompt[0]);
+
+  // what the user missed: three lines of the posts' lines
+  CHECK(!x_grok_catchup_prompt(prompt, sizeof prompt, "@a: um\n@b: dois\n@c: tr\xc3\xaas", "German") &&
+        strstr(prompt, "exactly three short lines in German, as plain text") &&
+        strstr(prompt, "\n\n@a: um\n@b: dois\n@c: tr\xc3\xaas") && !strstr(prompt, "%"));
+  CHECK(x_grok_catchup_prompt(prompt, sizeof prompt, "", "German") == -1);
+  CHECK(x_grok_catchup_prompt(prompt, 80, "@a: um", "German") == -1 && !prompt[0]);
+
   CHECK(!x_grok_request(url, sizeof url, body, sizeof body, X_GROK_HOST, "1890", X_GROK_MODEL, "ol\xc3\xa1 \"x\"\n") &&
         !strcmp(url, "https://grok.x.com/2/grok/add_response.json") &&
         !strncmp(body, "{\"responses\":[{\"message\":\"ol\xc3\xa1 \\\"x\\\"\\n\",\"sender\":1,", 46) &&
@@ -1480,6 +1706,7 @@ main(int argc, char **argv) {
   test_session();
   test_url();
   test_timeline(argv[1]);
+  test_long_note();
   test_rich(argv[2]);
   test_errors();
   test_time();
@@ -1497,6 +1724,7 @@ main(int argc, char **argv) {
   test_schedule();
   test_tls();
   test_grok();
+  test_space();
   test_playing();
   test_damaged(argv[1]);
   test_damaged(argv[2]);

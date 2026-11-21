@@ -244,6 +244,109 @@ encode_block(out_t *o, float b[64], const uint8_t q[64], const huff_t *dc, const
 }
 
 
+static void
+put_jfif(out_t *o) {
+  put16(o, 0xffd8);
+  put16(o, 0xffe0); // JFIF
+  put16(o, 16);
+  put_byte(o, 'J');
+  put_byte(o, 'F');
+  put_byte(o, 'I');
+  put_byte(o, 'F');
+  put_byte(o, 0);
+  put16(o, 0x0101);
+  put_byte(o, 0);
+  put16(o, 1);
+  put16(o, 1);
+  put16(o, 0);
+}
+
+
+/**
+ * the end of the entropy-coded data and of the picture; 0, or -1 without
+ * memory
+ **/
+static int
+put_end(out_t *o, uint8_t **out, size_t *len) {
+  if(o->count) {
+    put_bits(o, 0x7f, 7 - ((o->count - 1) & 7)); // the last byte filled with 1s
+  }
+  put16(o, 0xffd9);
+  if(o->failed) {
+    mem_free(o->buf);
+    return -1;
+  }
+  *out = o->buf;
+  *len = o->len;
+  return 0;
+}
+
+
+int
+jpeg_encode_gray(const uint8_t *gray, int w, int h, int quality, uint8_t **out, size_t *len) {
+  huff_t *dc, *ac;
+  uint8_t q[64];
+  float b[64];
+  int last = 0, ret;
+  out_t o;
+
+  *out = NULL;
+  *len = 0;
+  if(!gray || w < 1 || h < 1 || w > 65535 || h > 65535 || !(dc=mem_alloc(2 * sizeof *dc))) {
+    return -1;
+  }
+  ac = dc + 1;
+  quality = quality < 1 ? 1 : quality > 100 ? 100 : quality;
+  scale_table(g_luma_q, quality, q);
+  make_huff(dc, g_dc_luma_bits, g_dc_values);
+  make_huff(ac, g_ac_luma_bits, g_ac_luma_values);
+  memset(&o, 0, sizeof o);
+
+  put_jfif(&o);
+  put16(&o, 0xffdb);
+  put16(&o, 67);
+  put_byte(&o, 0);
+  for(int i=0; i<64; i++) {
+    put_byte(&o, q[g_zigzag[i]]);
+  }
+  put16(&o, 0xffc0); // one component, not subsampled
+  put16(&o, 11);
+  put_byte(&o, 8);
+  put16(&o, (unsigned)h);
+  put16(&o, (unsigned)w);
+  put_byte(&o, 1);
+  put_byte(&o, 1);
+  put_byte(&o, 0x11);
+  put_byte(&o, 0);
+  put_dht(&o, 0x00, g_dc_luma_bits, g_dc_values);
+  put_dht(&o, 0x10, g_ac_luma_bits, g_ac_luma_values);
+  put16(&o, 0xffda);
+  put16(&o, 8);
+  put_byte(&o, 1);
+  put_byte(&o, 1);
+  put_byte(&o, 0x00);
+  put_byte(&o, 0);
+  put_byte(&o, 63);
+  put_byte(&o, 0);
+
+  for(int by=0; by < h; by += 8) {
+    for(int bx=0; bx < w; bx += 8) {
+      for(int py=0; py<8; py++) {
+        int sy = by + py < h ? by + py : h - 1;
+        for(int px=0; px<8; px++) {
+          int sx = bx + px < w ? bx + px : w - 1;
+          b[py * 8 + px] = (float)gray[(size_t)sy * w + sx] - 128;
+        }
+      }
+      encode_block(&o, b, q, dc, ac, &last);
+    }
+  }
+  ret = put_end(&o, out, len);
+  mem_free(dc);
+  return ret;
+}
+
+
 int
 jpeg_encode(const uint32_t *pixels, int w, int h, int quality, uint8_t **out, size_t *len) {
   static huff_t dc_y, dc_c, ac_y, ac_c;
@@ -266,19 +369,7 @@ jpeg_encode(const uint32_t *pixels, int w, int h, int quality, uint8_t **out, si
   make_huff(&ac_c, g_ac_chroma_bits, g_ac_chroma_values);
   memset(&o, 0, sizeof o);
 
-  put16(&o, 0xffd8);
-  put16(&o, 0xffe0); // JFIF
-  put16(&o, 16);
-  put_byte(&o, 'J');
-  put_byte(&o, 'F');
-  put_byte(&o, 'I');
-  put_byte(&o, 'F');
-  put_byte(&o, 0);
-  put16(&o, 0x0101);
-  put_byte(&o, 0);
-  put16(&o, 1);
-  put16(&o, 1);
-  put16(&o, 0);
+  put_jfif(&o);
   for(int t=0; t<2; t++) {
     put16(&o, 0xffdb);
     put16(&o, 67);
@@ -341,15 +432,5 @@ jpeg_encode(const uint32_t *pixels, int w, int h, int quality, uint8_t **out, si
       encode_block(&o, cr, qc, &dc_c, &ac_c, &last[2]);
     }
   }
-  if(o.count) {
-    put_bits(&o, 0x7f, 7 - ((o.count - 1) & 7)); // the last byte filled with 1s
-  }
-  put16(&o, 0xffd9);
-  if(o.failed) {
-    mem_free(o.buf);
-    return -1;
-  }
-  *out = o.buf;
-  *len = o.len;
-  return 0;
+  return put_end(&o, out, len);
 }

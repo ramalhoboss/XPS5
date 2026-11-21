@@ -10,7 +10,7 @@ it cannot write there; the payload looks in both. */
 #define SETTINGS_PATH     "/data/TwitterPS5/settings.txt"
 #define SETTINGS_APP_PATH "/app0/settings.txt"                      // as the title sees it
 #define SETTINGS_DIR_PATH "/data/homebrew/TWPS00001/settings.txt"   // the same, for a payload
-#define SETTINGS_TEXT     1024
+#define SETTINGS_TEXT     1536
 #define SETTINGS_SEEN     64 // "id,id,id": the posts on top of Following the last time
 
 // X accounts: the first one's session is SETTINGS_SESSION_DIR "session.txt",
@@ -33,7 +33,7 @@ enum { SETTINGS_DAY, SETTINGS_NIGHT };
 #define SETTINGS_PAUSES {30, 60, 120}
 
 // how often the notifications are read, in seconds
-#define SETTINGS_EVERY_MIN 30
+#define SETTINGS_EVERY_MIN 15
 #define SETTINGS_EVERY_MAX 600
 
 typedef struct settings {
@@ -47,11 +47,17 @@ typedef struct settings {
   int theme;    // SETTINGS_DAY or SETTINGS_NIGHT
   int screen;   // the rows the title draws: 1080, 1440, 2160, or 0 for the TV's
   int spoilers; // posts about the game that runs stay covered until opened
+  int catchup;  // Grok sums up what came in Following since last time, when XPS5 opens
   int light;    // the controller's light bar takes the colour of the banner shown
+  int rumble;   // the controller vibrates on new notifications and messages, and at a list's end
+  int speaker;  // voice notes play on the controller's speaker
   int pause;    // minutes in XPS5 after which it suggests a break, or 0 for never
   int rising;   // the payload says when one of the user's posts is rising
+  int friends;  // the payload says when someone the user follows starts a game (play.h)
   int share;    // the payload offers the game's new captures and trophies for a post
   int playing;  // the payload puts the game that runs in the profile's location (play.h)
+  int online;   // and "On XPS5" in it while XPS5 is open with no game (play.h)
+  int quiet;    // the payload keeps its toasts during competitive games, and sums them up after (game.h)
   int account;  // 1 to SETTINGS_ACCOUNTS: whose session the app and the payload read
   char users[SETTINGS_ACCOUNTS][16]; // their screen names as last seen, or empty
   // the first posts of their Following the last time it was read, for "You

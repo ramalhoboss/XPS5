@@ -18,7 +18,7 @@ void
 settings_default(settings_t *s) {
   s->lang = LANG_SYSTEM;
   s->notify = 1;
-  s->every = 60;
+  s->every = 20;
   s->sound = 1;
   s->autoplay = 1;
   s->saver = 0;
@@ -26,11 +26,17 @@ settings_default(settings_t *s) {
   s->theme = SETTINGS_DAY;
   s->screen = 0;
   s->spoilers = 1;
+  s->catchup = 1;
   s->light = 1;
+  s->rumble = 1;
+  s->speaker = 0; // the TV's sound until the user picks the controller's
   s->pause = 0;
   s->rising = 1;
+  s->friends = 1;
   s->share = 1;
   s->playing = 0; // it changes what everyone sees of the profile: the user turns it on
+  s->online = 0;  // so does this
+  s->quiet = 1;
   s->account = 1;
   memset(s->users, 0, sizeof s->users);
   memset(s->seen, 0, sizeof s->seen);
@@ -175,16 +181,28 @@ settings_parse(settings_t *s, const char *text, size_t len) {
         } else if(!strcmp(key, "screen")) {
           s->screen = !strcmp(value, "auto") ? 0 : !strcmp(value, "1080p") ? 1080 :
                       !strcmp(value, "1440p") ? 1440 : !strcmp(value, "4k") ? 2160 : s->screen;
+        } else if(!strcmp(key, "catchup")) {
+          s->catchup = flag(value, s->catchup);
         } else if(!strcmp(key, "spoilers")) {
           s->spoilers = flag(value, s->spoilers);
         } else if(!strcmp(key, "light")) {
           s->light = flag(value, s->light);
+        } else if(!strcmp(key, "rumble")) {
+          s->rumble = flag(value, s->rumble);
+        } else if(!strcmp(key, "speaker")) {
+          s->speaker = flag(value, s->speaker);
         } else if(!strcmp(key, "rising")) {
           s->rising = flag(value, s->rising);
+        } else if(!strcmp(key, "quiet")) {
+          s->quiet = flag(value, s->quiet);
+        } else if(!strcmp(key, "friends")) {
+          s->friends = flag(value, s->friends);
         } else if(!strcmp(key, "share")) {
           s->share = flag(value, s->share);
         } else if(!strcmp(key, "playing")) {
           s->playing = flag(value, s->playing);
+        } else if(!strcmp(key, "online")) {
+          s->online = flag(value, s->online);
         } else if(!strcmp(key, "break")) {
           static const int pauses[] = SETTINGS_PAUSES;
           every = !strcmp(value, "off") ? 0 : number(value, -1);
@@ -225,10 +243,17 @@ settings_format(const settings_t *s, char *buf, size_t size) {
   if(n < 0 || (size_t)n >= size) {
     return -1;
   }
-  n += snprintf(buf + n, size - n, "screen=%s\nspoilers=%s\nlight=%s\nrising=%s\nshare=%s\nplaying=%s\n",
+  n += snprintf(buf + n, size - n,
+                "screen=%s\nspoilers=%s\nlight=%s\nrising=%s\nfriends=%s\nshare=%s\nplaying=%s\nonline=%s\n",
                 s->screen == 2160 ? "4k" : s->screen == 1440 ? "1440p" : s->screen == 1080 ? "1080p" : "auto",
                 s->spoilers ? "on" : "off", s->light ? "on" : "off", s->rising ? "on" : "off",
-                s->share ? "on" : "off", s->playing ? "on" : "off");
+                s->friends ? "on" : "off", s->share ? "on" : "off", s->playing ? "on" : "off",
+                s->online ? "on" : "off");
+  if((size_t)n >= size) {
+    return -1;
+  }
+  n += snprintf(buf + n, size - n, "rumble=%s\nspeaker=%s\ncatchup=%s\nquiet=%s\n", s->rumble ? "on" : "off",
+                s->speaker ? "on" : "off", s->catchup ? "on" : "off", s->quiet ? "on" : "off");
   if((size_t)n >= size) {
     return -1;
   }

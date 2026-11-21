@@ -26,25 +26,40 @@ context, so main never returns. */
 #include <unistd.h>
 
 #include "captures.h"
+#include "cards.h"
+#include "clip.h"
+#include "dictproto.h"
 #include "game.h"
 #include "https.h"
 #include "ime.h"
 #include "images.h"
 #include "jpeg.h"
+#include "jxr.h"
 #include "json.h"
 #include "link.h"
 #include "loginlink.h"
 #include "loginproto.h"
 #include "mem.h"
+#include "mic.h"
+#include "phone.h"
 #include "player.h"
+#include "seen.h"
+#include "sessions.h"
 #include "settings.h"
 #include "sound.h"
+#include "space.h"
 #include "text.h"
 #include "ui.h"
 #include "update.h"
 #include "video.h"
+#include "voice.h"
+#include "ultrahdr.h"
 #include "workers.h"
 #include "xapi.h"
+#include "xchat.h"
+#include "xchatopen.h"
+#include "xcrypt.h"
+#include "juicebox.h"
 #include "xsign.h"
 #include "xtid.h"
 
@@ -72,6 +87,9 @@ context, so main never returns. */
 
 #define PHOTO_SIDE    2560 // a screenshot over X's 5 MB is made this big at most, as a JPEG
 #define PHOTO_QUALITY 88
+#define HDR_QUALITY   92   // a .jxr screenshot made a JPEG: as sharp as fits in X's 5 MB
+#define GAIN_QUALITY  90   // its gain map's JPEG, for Ultra HDR
+#define ULTRAHDR_ROOM 4096 // what Ultra HDR's XMP and MPF take, at most
 #define PROCESS_LIMIT (10 * 60) // seconds X may take to process a video
 
 
@@ -89,6 +107,8 @@ int scePadOpen(int user, int type, int index, const void *param);
 int scePadReadState(int handle, void *data);
 int scePadSetLightBar(int handle, const void *param);
 int scePadResetLightBar(int handle);
+int scePadSetVibration(int handle, const void *param);    // {large motor, small motor}, 0 to 255
+int scePadSetTriggerEffect(int handle, const void *param); // pad_triggers_t
 
 
 enum { FETCH_IDLE, FETCH_RUNNING, FETCH_DONE };
@@ -104,7 +124,13 @@ typedef struct fetch {
   char         next[X_CURSOR_MAX]; // of the posts after these
   int          has_user;           // the profile req asked for came
   x_user_t     user;
+  x_post_t     party[UI_PARTY_MAX]; // of a conversation, its people (ui_party)
+  int          party_count;
+  seen_t       seen;               // with a look at the people the user follows, the
+  int          seen_ok;            // account's file of who was seen around (ui_seen_set)
 } fetch_t;
+
+static int seen_read(int account, seen_t *s);
 
 // a like, or a post or reply with its captures, sent on a thread of its own
 typedef struct action {
@@ -121,6 +147,7 @@ typedef struct action {
   long long sent;  // bytes of the media uploaded, atomic
   long long total; // of all of them
   long long at;    // when a scheduled post goes out, Unix time
+  size_t    ultra_hdr;  // the bytes of an Ultra HDR picture it uploaded, or 0
   int       poll_count; // the choices of a post's poll, or 0
   char      choices[X_POLL_MAX][X_POLL_LABEL];
   int       minutes;    // how long the poll stays open
@@ -130,7 +157,9 @@ typedef struct action {
   char      game[GAME_NAME];         // Grok's question is about it, in text
   int       fresh;                   // in a new conversation
   int       lang;                    // LANG_* it is answered in
-  char      answer[X_GROK_ANSWER];   // and its answer
+  char      answer[X_GROK_ANSWER];   // and its answer; of a Space, where its sound is
+  int       grok;                    // UI_GROK_*: a hint, a translation (of user's text), a catch-up
+  x_space_t space;                   // the Space UI_ACT_SPACE asked about
 } action_t;
 
 // the PS5's captures, listed on a thread of their own for the composer
@@ -145,6 +174,7 @@ typedef struct listing {
 
 // the game that runs beside the title, asked of the payload now and then
 #define GAME_EVERY 45 // seconds
+#define BADGE_EVERY 2 // seconds between the payload's counts for the bar (asked on 127.0.0.1: cheap)
 typedef struct game {
   int       state; // FETCH_*
   long long asked;
@@ -154,7 +184,23 @@ typedef struct game {
   capture_t shot;  // a new capture of the game the payload offered, path empty for none
   int       trophy; // a new trophy's grade (0 bronze to 3 platinum), -1 for none
   char      trophy_name[128];
+  // asked of it by the screen, before it starts: the week's sessions, and
+  // the game's trophies again
+  int       want_week, want_trophies;
+  // what came: a session that ended (session_ok), the week (week_ok 1, or
+  // -1 when it could not be read), and the game's trophies (troph_count:
+  // TROPHIES_NOT_READ, -1 for none, else how many troph_rows has)
+  int       session_ok;
+  session_t session;
+  int       week_ok;
+  week_t    week;
+  char      troph_id[GAME_ID];
+  long long troph_at;
+  int       troph_count;
+  ui_trophy_row_t *troph_rows;
 } game_t;
+#define TROPHIES_NOT_READ -2
+#define TROPHIES_EVERY    600 // seconds a game's trophies are read again, at most
 
 
 static text_surface_t g_screen;
@@ -166,6 +212,11 @@ static settings_t     g_settings;
 static int            g_https = -1; // 0 once https_init worked, else its error
 static int            g_pad = -1;
 static unsigned       g_frame;
+static int            g_mic_on, g_mic_shown; // the microphone's test: started, and its state on the screen
+
+_Static_assert(MIC_OFF == UI_MIC_OFF && MIC_OPENING == UI_MIC_OPENING && MIC_ON == UI_MIC_ON &&
+               MIC_FAILED == UI_MIC_FAILED && MIC_NO_DEVICE == UI_MIC_NO_DEVICE &&
+               MIC_PRIORITY_LOW == UI_MIC_PRIORITY_LOW, "the microphone's states as ui.h has them");
 
 
 static void
@@ -305,9 +356,9 @@ kept_set(int account, const x_session_t *s) {
 }
 
 static int
-read_session(x_session_t *s) {
+read_session_of(int account, x_session_t *s) {
   char path[64];
-  int account = g_account, ret, err, said;
+  int ret, err, said;
   struct stat st;
 
   if(settings_session_path(account, path, sizeof path)) {
@@ -346,6 +397,14 @@ read_session(x_session_t *s) {
   return ret;
 }
 
+/**
+ * the session of the account the Settings chose
+ **/
+static int
+read_session(x_session_t *s) {
+  return read_session_of(g_account, s);
+}
+
 
 /**
  * what the lists are called in the klog
@@ -358,6 +417,7 @@ feed_name(int feed) {
     [UI_CHAT] = "chat", [UI_CALLS] = "calls", [UI_GROK] = "grok", [UI_PREMIUM] = "subscription",
     [UI_HISTORY] = "history", [UI_ARTICLES] = "articles", [UI_USER] = "profile", [UI_POST] = "post",
     [UI_DM] = "conversation", [UI_LISTS] = "lists", [UI_LIST] = "list", [UI_GAME] = "game",
+    [UI_FRIENDS] = "friends",
   };
   return feed >= 0 && feed < UI_FEEDS ? names[feed] : "?";
 }
@@ -460,24 +520,24 @@ fetch_profile(fetch_t *f, const x_session_t *session, char *url, size_t size) {
 
 
 /**
- * the user's conversations (UI_CHAT, the user's number in f's id) or the
- * messages of one (UI_DM, its number in f's id), as x.com's Messages reads
- * them; only their count goes to the klog
- **/
-/**
  * a conversation just read is read up to its newest message (last), as
- * x.com marks it when it is opened; only how it went goes to the klog
+ * x.com marks it when it is opened; once for each newest message, as the
+ * conversation shown is read again and again; only how it went goes to the
+ * klog
  **/
 static void
 mark_read(const x_session_t *session, const char *conversation, const char *last, char *url, size_t usize,
           char *tid, size_t tsize) {
+  static char marked[2 * X_ID_MAX + 2]; // "<conversation> <message>" of the last one marked
   https_header_t headers[X_HEADER_COUNT + 2];
   https_response_t res = {0};
   x_request_t request;
-  char body[192];
+  char body[192], now[sizeof marked];
   int count = X_HEADER_COUNT, ret, signed_tid;
 
-  if(x_dm_read_request(url, usize, body, sizeof body, conversation, last)) {
+  snprintf(now, sizeof now, "%s %s", conversation ? conversation : "", last ? last : "");
+  if(!strcmp(now, marked) || x_dm_read_request(url, usize, body, sizeof body, conversation, last)) {
+    memset(now, 0, sizeof now);
     return;
   }
   signed_tid = sign(session, "POST", url, tid, tsize);
@@ -499,11 +559,602 @@ mark_read(const x_session_t *session, const char *conversation, const char *last
   memset(body, 0, sizeof body);
   log_line("conversation read: %d, HTTP %d", ret, ret ? 0 : res.status);
   if(!ret) {
+    if(res.status == 200) {
+      memcpy(marked, now, sizeof marked);
+    }
     mem_free(res.body);
+  }
+  memset(now, 0, sizeof now);
+}
+
+
+static unsigned random_byte(void);
+
+
+static int
+newer_chat(const void *a, const void *b) {
+  const x_post_t *x = a, *y = b;
+  return x->time != y->time ? (x->time < y->time ? 1 : -1) : 0;
+}
+
+
+/**
+ * X Chat's conversations, put among the inbox's in f, newest first: who
+ * wrote and when, as their words are encrypted; nothing changes when they
+ * do not come
+ **/
+static void
+add_xchat(fetch_t *f, const x_session_t *session, const char *me, char *url, size_t usize, char *tid,
+          size_t tsize) {
+  static char uuid[37];
+  https_header_t headers[XCHAT_HEADER_COUNT];
+  unsigned char bytes[16];
+  https_response_t res;
+  x_request_t request;
+  x_post_t *all;
+  json_doc_t *doc;
+  size_t off;
+  int heads, count, signed_tid, ret, total;
+
+  if(!me || !me[0] || xchat_inbox_url(url, usize)) {
+    return;
+  }
+  if(!uuid[0]) {
+    // the title's own, as a browser keeps one
+    for(size_t i=0; i < sizeof bytes; i++) {
+      bytes[i] = random_byte();
+    }
+    xchat_uuid(bytes, uuid);
+  }
+  signed_tid = sign(session, "GET", url, tid, tsize);
+  x_request_init(&request, session);
+  heads = xchat_headers(&request, uuid, signed_tid ? tid : NULL, headers);
+  ret = https_get(url, headers, heads, &res);
+  memset(&request, 0, sizeof request);
+  memset(headers, 0, sizeof headers);
+  if(ret) {
+    log_line("xchat: network 0x%08x", (unsigned)ret);
+    return;
+  }
+  log_line("xchat%s: HTTP %d, %zu bytes", signed_tid ? " (tid)" : "", res.status, res.len);
+  if(res.status != 200 || !(doc=json_parse(res.body, res.len, &off))) {
+    mem_free(res.body);
+    return;
+  }
+  count = xchat_inbox(json_root(doc), me, NULL, 0);
+  count = count > MAX_POSTS - f->count ? MAX_POSTS - f->count : count;
+  if(count > 0 && (all=mem_calloc(f->count + count, sizeof *all))) {
+    if(f->posts && f->count) {
+      memcpy(all, f->posts, f->count * sizeof *all);
+    }
+    count = xchat_inbox(json_root(doc), me, all + f->count, count);
+    count = count < 0 ? 0 : count;
+    mem_free(f->posts);
+    f->posts = all;
+    total = f->count + count;
+    f->count = xchat_merge(all, f->count, count);
+    log_line("xchat: %d in the inbox already", total - f->count);
+    qsort(all, f->count, sizeof *all, newer_chat);
+    if(f->count && f->error == ERR_EMPTY) {
+      f->error = ERR_NONE;
+    }
+  }
+  log_line("xchat: %d conversations", count < 0 ? 0 : count);
+  json_free(doc);
+  mem_free(res.body);
+}
+
+
+/*
+ * Reading X Chat's encrypted messages: the user's identity
+ * key, recovered from Juicebox with their PIN (juicebox.h), opens the
+ * conversations' keys and their words (xchatopen.h, src/xchat.c's hooks).
+ * The key is kept in /data, so the PIN is asked only once; the PIN itself is
+ * never written anywhere, only typed and wiped. The payload has none of this.
+ */
+#define XCHAT_KEY_DIR "/data/TwitterPS5"
+#define XCHAT_MIN_GUESSES 10 // below this, the recovery warns, so a typo cannot lock the account out
+#define XCHAT_PUBLIC_KEYS 16  // the user's public keys read from X's list
+#define XCHAT_PUBLIC_MAX  200 // the writing of one (the hex of an SPKI is 182)
+
+static const char *json_find(const json_node_t *node, const char *name, int depth, char *buf, size_t size);
+
+typedef struct jb_ctx {
+  const x_session_t *session;
+} jb_ctx_t;
+
+
+/**
+ * a Juicebox request: POST the CBOR body to a realm, with the version
+ * header and, when it has one, the realm's bearer token
+ **/
+static int
+jb_post(void *vctx, const char *url, const char *bearer, const uint8_t *body, size_t len,
+        int *status, uint8_t **answer, size_t *answer_len) {
+  https_header_t h[4];
+  https_response_t res;
+  char auth[768];
+  int n = 0, ret;
+
+  (void)vctx;
+  h[n++] = (https_header_t){"content-type", "application/octet-stream"};
+  h[n++] = (https_header_t){"x-juicebox-version", JB_VERSION};
+  if(bearer) {
+    snprintf(auth, sizeof auth, "Bearer %s", bearer);
+    h[n++] = (https_header_t){"authorization", auth};
+  }
+  ret = https_post_data(url, h, n, body, len, &res);
+  memset(auth, 0, sizeof auth);
+  if(ret) {
+    return -1;
+  }
+  *status = res.status;
+  *answer = (uint8_t *)res.body;
+  *answer_len = res.len;
+  return 0;
+}
+
+
+static void
+jb_release(void *vctx, uint8_t *answer) {
+  (void)vctx;
+  mem_free(answer);
+}
+
+
+/**
+ * the public keys in one of X's key entries, wherever in it X puts them:
+ * every string named public_key, identity_public_key or signing_public_key,
+ * signing[] saying which are signing keys ("public_key" is the identity's,
+ * X's SDK says, unless the entry names an identity_public_key too)
+ **/
+static void
+collect_public_keys(const json_node_t *node, int depth, int named_identity, char keys[][XCHAT_PUBLIC_MAX],
+                    int *signing, int *nkeys, int max) {
+  for(const json_node_t *m=node && depth > 0 ? node->child : NULL; m && *nkeys < max; m=m->next) {
+    if(m->type == JSON_OBJECT || m->type == JSON_ARRAY) {
+      collect_public_keys(m, depth - 1, named_identity, keys, signing, nkeys, max);
+    } else if(m->key && m->type == JSON_STRING &&
+              (!strcmp(m->key, "public_key") || !strcmp(m->key, "identity_public_key") ||
+               !strcmp(m->key, "signing_public_key"))) {
+      const char *s = json_string(m);
+      if(s && strlen(s) < XCHAT_PUBLIC_MAX) {
+        snprintf(keys[*nkeys], XCHAT_PUBLIC_MAX, "%s", s);
+        signing[*nkeys] = !strcmp(m->key, "signing_public_key") || (!strcmp(m->key, "public_key") && named_identity);
+        (*nkeys)++;
+      }
+    }
   }
 }
 
 
+/**
+ * the user's Juicebox config and the public keys X lists for them
+ * (GetPublicKeysQuery, with the juicebox tokens): cfg is filled, the public
+ * keys go into keys (at most max) with signing[] saying which sign, *nkeys
+ * set; 0, or -1
+ **/
+static int
+fetch_public_keys(const x_session_t *session, const char *me, jb_config_t *cfg, char keys[][XCHAT_PUBLIC_MAX],
+                  int *signing, int *nkeys, int max) {
+  static char url[1024], tid[XTID_HEADER_MAX];
+  https_header_t headers[XCHAT_HEADER_COUNT];
+  https_response_t res;
+  x_request_t request;
+  json_doc_t *doc;
+  const json_node_t *users, *list, *e;
+  size_t off;
+  int heads, signed_tid, ret, have_cfg = 0;
+
+  *nkeys = 0;
+  snprintf(url, sizeof url, "https://api.x.com/graphql/C-YphxeIcPLOGtFNGhkuOw/GetPublicKeysQuery"
+    "?variables=%%7B%%22ids%%22%%3A%%5B%%22%s%%22%%5D%%2C%%22include_juicebox_tokens%%22%%3Atrue%%7D", me);
+  signed_tid = sign(session, "GET", url, tid, sizeof tid);
+  x_request_init(&request, session);
+  heads = xchat_headers(&request, NULL, signed_tid ? tid : NULL, headers);
+  ret = https_get(url, headers, heads, &res);
+  memset(&request, 0, sizeof request);
+  memset(headers, 0, sizeof headers);
+  memset(tid, 0, sizeof tid);
+  if(ret) {
+    log_line("xchat keys: network 0x%08x", (unsigned)ret);
+    return -1;
+  }
+  log_line("xchat keys: HTTP %d, %zu bytes", res.status, res.len);
+  if(res.status != 200 || !(doc=json_parse(res.body, res.len, &off))) {
+    mem_free(res.body);
+    return -1;
+  }
+  users = json_path(json_root(doc), "data", "user_results_by_rest_ids", NULL);
+  for(const json_node_t *u=users ? users->child : NULL; u; u=u->next) {
+    list = json_path(u, "result", "get_public_keys", NULL);
+    list = json_get(list, "public_keys_with_token_map");
+    for(e=list ? list->child : NULL; e; e=e->next) {
+      const json_node_t *map = json_get(e, "token_map");
+      collect_public_keys(e, 5, json_find(e, "identity_public_key", 5, NULL, 0) != NULL, keys, signing, nkeys, max);
+      if(!have_cfg && map && !jb_config_read(map, cfg)) {
+        have_cfg = 1;
+      }
+    }
+  }
+  json_free(doc);
+  mem_free(res.body);
+  if(!have_cfg) {
+    log_line("xchat keys: no Juicebox config read (%d keys)", *nkeys);
+    return -1;
+  }
+  return 0;
+}
+
+
+/**
+ * the unlock worker: the PIN (a->text, wiped here) recovers the identity key
+ * and keeps it, so the messages open from now on. a->error says how it went,
+ * a->x_code carries the guesses left after a wrong PIN
+ **/
+static void
+send_unlock(action_t *a) {
+  x_session_t session;
+  jb_config_t cfg;
+  jb_net_t net;
+  jb_ctx_t ctx;
+  jb_result_t r;
+  uint8_t secret[JB_SECRET], identity[32];
+  char keys[XCHAT_PUBLIC_KEYS][XCHAT_PUBLIC_MAX];
+  const char *keyp[XCHAT_PUBLIC_KEYS];
+  int signing[XCHAT_PUBLIC_KEYS];
+  char path[XCHAT_KEY_FILE_MAX];
+  xchat_identity_t seen;
+  int ret, nkeys = 0, slen = 0;
+
+  memset(&cfg, 0, sizeof cfg);
+  memset(secret, 0, sizeof secret);
+  memset(identity, 0, sizeof identity);
+  if((ret=read_session(&session))) {
+    a->error = ret == -3 ? ERR_NO_SESSION : ERR_NO_COOKIE;
+    xcrypt_wipe(a->text, sizeof a->text);
+    return;
+  }
+  if(g_https) {
+    a->error = ERR_HTTPS;
+    a->code = g_https;
+    xcrypt_wipe(a->text, sizeof a->text);
+    memset(&session, 0, sizeof session);
+    return;
+  }
+  ctx.session = &session;
+  net = (jb_net_t){jb_post, jb_release, &ctx};
+
+  if(fetch_public_keys(&session, a->id, &cfg, keys, signing, &nkeys, XCHAT_PUBLIC_KEYS)) {
+    a->error = ERR_XCHAT_NET;
+    goto done;
+  }
+  for(int i=0; i < nkeys; i++) {
+    keyp[i] = keys[i];
+  }
+  log_line("xchat unlock: %d realms, threshold %d, max %d guesses, %d keys", cfg.count,
+           cfg.recover_threshold, cfg.max_guesses, nkeys);
+
+  // Recover1 first: whether the keys are there at all, with no guess counted
+  jb_check(&cfg, &net, &r);
+  log_line("xchat unlock: check %s, %d realms", jb_code_name(r.code), r.realms_ok);
+  if(r.code == JB_NOT_REGISTERED) {
+    a->error = ERR_XCHAT_NONE;
+    goto done;
+  }
+  if(r.code != JB_OK) {
+    a->error = ERR_XCHAT_NET;
+    a->code = r.code;
+    goto done;
+  }
+
+  // the PIN (one guess at the realms): the identity private key out of it
+  jb_recover(&cfg, &net, a->text, strlen(a->text), secret, &slen, &r);
+  xcrypt_wipe(a->text, sizeof a->text);
+  log_line("xchat unlock: recover %s, %d left, %d bytes", jb_code_name(r.code), r.guesses_left, slen);
+  a->code = r.code;
+  a->x_code = r.guesses_left; // the guesses left, for the wrong-PIN message
+  if(r.code == JB_WRONG_PIN) {
+    a->error = ERR_XCHAT_PIN;
+    goto done;
+  }
+  if(r.code == JB_NO_GUESSES) {
+    a->error = ERR_XCHAT_LOCKED;
+    goto done;
+  }
+  if(r.code != JB_OK) {
+    a->error = ERR_XCHAT_NET;
+    goto done;
+  }
+
+  // the secret is the identity (and signing) private key: it must be one X
+  // lists for this account, or it is not the key that opens their messages
+  ret = xchat_open_identity(secret, slen, keyp, signing, nkeys, identity, &seen);
+  xcrypt_wipe(secret, sizeof secret);
+  log_line("xchat unlock: identity %d; a secret of %d bytes, %d tried, %d keys listed, %d read, signing only %d", ret,
+           seen.secret, seen.tried, seen.keys, seen.points, seen.signing);
+  if(ret != 1) {
+    // sizes and counts only, for the message: what to look at next
+    a->error = ERR_XCHAT_IDENTITY;
+    a->code = seen.secret;
+    a->x_code = seen.keys * 100 + seen.points;
+    goto done;
+  }
+  xchat_open_set(a->id, identity);
+  if(!xchat_open_path(XCHAT_KEY_DIR, a->id, path, sizeof path)) {
+    if(xchat_open_save(path, identity)) {
+      log_line("xchat unlock: the key did not save to %s", path);
+    }
+  }
+  a->error = ERR_NONE;
+  log_line("xchat unlock: done, %d conversation keys", xchat_open_keys());
+
+done:
+  xcrypt_wipe(a->text, sizeof a->text);
+  xcrypt_wipe(secret, sizeof secret);
+  xcrypt_wipe(identity, sizeof identity);
+  jb_config_free(&cfg);
+  memset(&session, 0, sizeof session);
+}
+
+
+/**
+ * the identity key kept in /data for the account whose number is me, loaded
+ * so the messages open at once; forgotten when me has none (or is empty)
+ **/
+static void
+xchat_load_key(const char *me) {
+  char path[XCHAT_KEY_FILE_MAX];
+  uint8_t identity[32];
+
+  if(!me || !me[0]) {
+    xchat_open_forget();
+    return;
+  }
+  if(xchat_open_ready(me)) {
+    return; // already in hand
+  }
+  if(!xchat_open_path(XCHAT_KEY_DIR, me, path, sizeof path) && !xchat_open_load(path, identity)) {
+    xchat_open_set(me, identity);
+    log_line("xchat: identity for %s loaded", me);
+  } else {
+    xchat_open_forget();
+  }
+  xcrypt_wipe(identity, sizeof identity);
+}
+
+
+/*
+ * The senders' signing keys, which check their messages' signatures:
+ * asked of X with GetPublicKeysQuery, as the
+ * unlock asks for the user's own, never taken from a message. Public keys,
+ * but still only their count goes to the klog.
+ */
+#define SIGNERS_FETCH 8 // senders whose keys one conversation's page asks X for, at most
+
+/**
+ * the first member named name in node or below it (depth levels at most):
+ * a string's text, or a number's digits copied into buf; NULL when there is
+ * none
+ **/
+static const char *
+json_find(const json_node_t *node, const char *name, int depth, char *buf, size_t size) {
+  const char *found = NULL;
+
+  for(const json_node_t *m=node && depth > 0 ? node->child : NULL; m && !found; m=m->next) {
+    if(m->key && !strcmp(m->key, name) && m->type == JSON_STRING) {
+      found = json_string(m);
+    } else if(m->key && !strcmp(m->key, name) && m->type == JSON_NUMBER && buf && m->len < size) {
+      memcpy(buf, m->str, m->len);
+      buf[m->len] = 0;
+      found = buf;
+    } else if(m->type == JSON_OBJECT || m->type == JSON_ARRAY) {
+      found = json_find(m, name, depth - 1, buf, size);
+    }
+  }
+  return found;
+}
+
+
+/**
+ * the signing keys X lists for the sender user (their number), given to
+ * xchatopen.c: none when X does not answer, so they are asked for again
+ * later. url and tid are the caller's buffers
+ **/
+static void
+fetch_signer(const x_session_t *session, const char *user, char *url, size_t usize, char *tid, size_t tsize) {
+  https_header_t headers[XCHAT_HEADER_COUNT];
+  https_response_t res;
+  x_request_t request;
+  json_doc_t *doc = NULL;
+  const json_node_t *users, *list;
+  char versions[XCHAT_SIGNER_KEYS][32], keys[XCHAT_SIGNER_KEYS][128];
+  const char *vp[XCHAT_SIGNER_KEYS], *kp[XCHAT_SIGNER_KEYS];
+  size_t off, n = strlen(user);
+  int heads, signed_tid, ret, count = 0;
+
+  if(!n || n > 20 || strspn(user, "0123456789") != n) {
+    return; // only a number goes into the url
+  }
+  n = (size_t)snprintf(url, usize, "https://api.x.com/graphql/C-YphxeIcPLOGtFNGhkuOw/GetPublicKeysQuery"
+    "?variables=%%7B%%22ids%%22%%3A%%5B%%22%s%%22%%5D%%2C%%22include_juicebox_tokens%%22%%3Afalse%%7D", user);
+  if(n >= usize) {
+    return;
+  }
+  signed_tid = sign(session, "GET", url, tid, tsize);
+  x_request_init(&request, session);
+  heads = xchat_headers(&request, NULL, signed_tid ? tid : NULL, headers);
+  ret = https_get(url, headers, heads, &res);
+  memset(&request, 0, sizeof request);
+  memset(headers, 0, sizeof headers);
+  memset(tid, 0, tsize);
+  memset(url, 0, usize);
+  if(ret) {
+    log_line("xchat signing keys: network 0x%08x", (unsigned)ret);
+    xchat_open_signer(user, NULL, NULL, 0, (long long)time(NULL));
+    return;
+  }
+  if(res.status == 200) {
+    doc = json_parse(res.body, res.len, &off);
+  }
+  users = doc ? json_path(json_root(doc), "data", "user_results_by_rest_ids", NULL) : NULL;
+  for(const json_node_t *u=users ? users->child : NULL; u; u=u->next) {
+    list = json_get(json_path(u, "result", "get_public_keys", NULL), "public_keys_with_token_map");
+    for(const json_node_t *e=list ? list->child : NULL; e && count < XCHAT_SIGNER_KEYS; e=e->next) {
+      // each of the user's keys: its signing half and its version, wherever
+      // in the entry X puts them
+      const char *key = json_find(e, "signing_public_key", 4, NULL, 0);
+      const char *version = json_find(e, "public_key_version", 4, versions[count], sizeof versions[0]);
+      if(key && strlen(key) < sizeof keys[0]) {
+        snprintf(keys[count], sizeof keys[0], "%s", key);
+        if(version != versions[count]) {
+          snprintf(versions[count], sizeof versions[0], "%s", version ? version : "");
+        }
+        vp[count] = versions[count];
+        kp[count] = keys[count];
+        count++;
+      }
+    }
+  }
+  log_line("xchat signing keys: HTTP %d, %d", res.status, count);
+  xchat_open_signer(user, vp, kp, count, (long long)time(NULL));
+  if(doc) {
+    json_free(doc);
+  }
+  mem_free(res.body);
+}
+
+
+/**
+ * the messages of a conversation on X Chat (UI_DM with req.xchat), read from
+ * its page and opened with the account's key when it is in hand (else they
+ * stay sealed); oldest first, X_KIND_DM. Each one's signature is checked with
+ * its sender's keys as X lists them: those not in hand yet are asked for, and
+ * the page read again
+ **/
+static void
+fetch_xchat(fetch_t *f, const x_session_t *session, char *url, size_t usize, char *tid, size_t tsize) {
+  static char uuid[37];
+  https_header_t headers[XCHAT_HEADER_COUNT];
+  https_response_t res;
+  x_request_t request;
+  json_doc_t *doc;
+  const char *me = g_settings.ids[g_account - 1];
+  size_t off;
+  int heads, signed_tid, ret, total, n;
+
+  if(xchat_conversation_url(url, usize, f->req.id, NULL)) {
+    f->error = ERR_MEMORY;
+    return;
+  }
+  if(!uuid[0]) {
+    unsigned char bytes[16];
+    for(size_t i=0; i < sizeof bytes; i++) {
+      bytes[i] = (unsigned char)random_byte();
+    }
+    xchat_uuid(bytes, uuid);
+  }
+  signed_tid = sign(session, "GET", url, tid, tsize);
+  x_request_init(&request, session);
+  heads = xchat_headers(&request, uuid, signed_tid ? tid : NULL, headers);
+  ret = https_get(url, headers, heads, &res);
+  memset(&request, 0, sizeof request);
+  memset(headers, 0, sizeof headers);
+  if(ret) {
+    f->error = ERR_NETWORK;
+    f->code = ret;
+    log_line("xchat page: network 0x%08x", (unsigned)ret);
+    return;
+  }
+  log_line("xchat page%s: HTTP %d, %zu bytes", signed_tid ? " (tid)" : "", res.status, res.len);
+  if(res.status != 200 || !(doc=json_parse(res.body, res.len, &off))) {
+    f->error = res.status == 200 ? ERR_ANSWER : ERR_HTTP;
+    f->code = res.status;
+    mem_free(res.body);
+    return;
+  }
+  total = xchat_messages(json_root(doc), f->req.id, me, NULL, 0);
+  total = total < 1 ? 1 : total > MAX_POSTS ? MAX_POSTS : total;
+  if(!(f->posts=mem_calloc(total, sizeof *f->posts))) {
+    f->error = ERR_MEMORY;
+  } else if((n=xchat_messages(json_root(doc), f->req.id, me, f->posts, total)) <= 0) {
+    f->error = ERR_EMPTY;
+    mem_free(f->posts);
+    f->posts = NULL;
+  } else {
+    char users[SIGNERS_FETCH][24];
+    const int want = xchat_open_wanted((long long)time(NULL), users, SIGNERS_FETCH);
+    f->count = n;
+    // the senders whose signing keys are not in hand yet: asked of X, and
+    // the page read again so their messages' signatures are checked
+    for(int i=0; i < want; i++) {
+      fetch_signer(session, users[i], url, usize, tid, tsize);
+    }
+    if(want > 0 && (n=xchat_messages(json_root(doc), f->req.id, me, f->posts, total)) > 0) {
+      f->count = n;
+    }
+  }
+  log_line("xchat page: %d messages, %d keys in hand", f->count, xchat_open_keys());
+  json_free(doc);
+  mem_free(res.body);
+}
+
+
+static int
+older_first(const void *a, const void *b) {
+  const x_post_t *x = a, *y = b;
+  return x->time != y->time ? (x->time < y->time ? -1 : 1) : x->xchat - y->xchat;
+}
+
+
+/**
+ * a conversation of the inbox that goes on on X Chat (req.xchat_id, its
+ * number there): the messages of its X Chat page join the ones read, oldest
+ * first, the newest MAX_POSTS of them; opened when the keys are in hand,
+ * else sealed (✕ on one asks for the PIN)
+ **/
+static void
+join_xchat(fetch_t *f, const x_session_t *session, char *url, size_t usize, char *tid, size_t tsize) {
+  fetch_t *x = mem_calloc(1, sizeof *x);
+  x_post_t *all;
+  int n;
+
+  if(!x) {
+    return;
+  }
+  x->req = f->req;
+  snprintf(x->req.id, sizeof x->req.id, "%s", f->req.xchat_id);
+  x->req.xchat = 1;
+  fetch_xchat(x, session, url, usize, tid, tsize);
+  memset(url, 0, usize);
+  if(x->count > 0 && (all=mem_alloc((size_t)(f->count + x->count) * sizeof *all))) {
+    if(f->count) {
+      memcpy(all, f->posts, (size_t)f->count * sizeof *all);
+    }
+    memcpy(all + f->count, x->posts, (size_t)x->count * sizeof *all);
+    n = f->count + x->count;
+    qsort(all, (size_t)n, sizeof *all, older_first);
+    if(n > MAX_POSTS) {
+      memmove(all, all + n - MAX_POSTS, MAX_POSTS * sizeof *all);
+      n = MAX_POSTS;
+    }
+    mem_free(f->posts);
+    f->posts = all;
+    f->count = n;
+    f->error = ERR_NONE; // X Chat answered, whatever the inbox's page did
+    f->code = 0;
+  }
+  log_line("dm: %d of X Chat's joined", x->count);
+  mem_free(x->posts);
+  mem_free(x);
+}
+
+
+/**
+ * the user's conversations (UI_CHAT, the user's number in f's id) or the
+ * messages of one (UI_DM, its number in f's id), as x.com's Messages reads
+ * them; only their count goes to the klog
+ **/
 static void
 fetch_dm(fetch_t *f, const x_session_t *session, char *url, size_t usize, char *tid, size_t tsize) {
   int inbox = f->req.feed == UI_CHAT, total, signed_tid;
@@ -511,6 +1162,12 @@ fetch_dm(fetch_t *f, const x_session_t *session, char *url, size_t usize, char *
   https_response_t res;
   json_doc_t *doc;
 
+  if(!inbox && f->req.xchat) {
+    // a conversation on X Chat: its own page, encrypted
+    fetch_xchat(f, session, url, usize, tid, tsize);
+    memset(url, 0, usize);
+    return;
+  }
   if(inbox ? x_dm_inbox_url(url, usize) : x_dm_conversation_url(url, usize, f->req.id)) {
     f->error = ERR_MEMORY;
     return;
@@ -522,6 +1179,9 @@ fetch_dm(fetch_t *f, const x_session_t *session, char *url, size_t usize, char *
     forget_tid(); // a new page's key next time
   }
   if(!doc) {
+    if(!inbox && f->req.xchat_id[0]) {
+      join_xchat(f, session, url, usize, tid, tsize); // it may go on on X Chat only now
+    }
     return;
   }
   me = f->req.id[0] ? f->req.id : NULL;
@@ -536,11 +1196,22 @@ fetch_dm(fetch_t *f, const x_session_t *session, char *url, size_t usize, char *
     mem_free(f->posts);
     f->posts = NULL;
   }
-  log_line("%s: %d", feed_name(f->req.feed), f->count);
+  if(!inbox) {
+    // who is in it, with what their profiles say they play: a group's side card
+    f->party_count = x_dm_members(json_root(doc), f->req.id, NULL, f->party, UI_PARTY_MAX);
+  }
+  log_line("%s: %d, %d people", feed_name(f->req.feed), f->count, f->party_count);
   json_free(doc);
   mem_free(res.body);
+  if(inbox) {
+    // the conversations started on X Chat are not among them
+    add_xchat(f, session, me, url, usize, tid, tsize);
+  }
   if(!inbox && f->count) {
     mark_read(session, f->req.id, f->posts[f->count - 1].id, url, usize, tid, tsize);
+  }
+  if(!inbox && f->req.xchat_id[0]) {
+    join_xchat(f, session, url, usize, tid, tsize);
   }
 }
 
@@ -585,6 +1256,95 @@ fetch_scheduled(fetch_t *f, x_session_t *session, char *url, size_t usize) {
 }
 
 
+/**
+ * the notifications of every account with a session, in one list newest
+ * first, each marked with its account (Notifications' second tab): the
+ * accounts' own lists merged, so each keeps its order. An account whose
+ * reading fails is left out; only when none reads is its failure the list's.
+ * The klog has the counts, not whose accounts
+ **/
+static void
+fetch_all_notices(fetch_t *f, char *url, size_t size) {
+  enum { EACH = 40 };
+  x_post_t *all = NULL, *one, *merged;
+  https_response_t res;
+  x_session_t session;
+  json_doc_t *doc;
+  int count = 0, got, total, accounts = 0, error = ERR_NO_SESSION, code = -3, x_code = -1, i, j, k;
+
+  for(int a=1; a <= SETTINGS_ACCOUNTS && count < MAX_POSTS; a++) {
+    if(read_session_of(a, &session)) {
+      continue; // none linked there
+    }
+    if(x_feed_url(url, size, X_FEED_NOTIFICATIONS, NULL, EACH, NULL)) {
+      memset(&session, 0, sizeof session);
+      error = ERR_MEMORY;
+      break;
+    }
+    f->error = ERR_NONE;
+    f->code = 0;
+    doc = get_json(f, url, &session, &res, "notifications of an account", NULL);
+    memset(&session, 0, sizeof session);
+    if(!doc) {
+      error = f->error;
+      code = f->code;
+      x_code = f->x_code;
+      continue;
+    }
+    total = 0;
+    x_timeline_posts(json_root(doc), NULL, 0, &total);
+    total = total < 1 ? 1 : total > EACH * 2 ? EACH * 2 : total;
+    one = mem_calloc(total, sizeof *one);
+    got = one ? x_timeline_posts(json_root(doc), one, total, &total) : 0;
+    json_free(doc);
+    mem_free(res.body);
+    if(!one) {
+      error = ERR_MEMORY;
+      break;
+    }
+    accounts++;
+    // into what the accounts before had, by time, the earlier ones first on a tie
+    if(got && !(merged=mem_calloc((size_t)(count + got), sizeof *merged))) {
+      mem_free(one);
+      error = ERR_MEMORY;
+      break;
+    }
+    for(i=j=k=0; got && (i < count || j < got); k++) {
+      if(j >= got || (i < count && all[i].time >= one[j].time)) {
+        merged[k] = all[i++];
+      } else {
+        merged[k] = one[j++];
+        merged[k].account = a;
+      }
+    }
+    if(got) {
+      mem_free(all);
+      all = merged;
+      count += got;
+    }
+    mem_free(one);
+  }
+  memset(url, 0, size);
+  if(count > MAX_POSTS) {
+    count = MAX_POSTS; // the oldest go
+  }
+  if(!count) {
+    mem_free(all);
+    f->error = accounts ? ERR_EMPTY : error;
+    f->code = accounts ? 200 : code;
+    f->x_code = accounts ? -1 : x_code;
+    log_line("notifications of every account: none (%d read)", accounts);
+    return;
+  }
+  f->error = ERR_NONE;
+  f->code = 200;
+  f->x_code = -1;
+  f->posts = all;
+  f->count = count;
+  log_line("notifications of every account: %d accounts, %d posts", accounts, count);
+}
+
+
 static void
 fetch_timeline(fetch_t *f) {
   static char url[8192], tid[XTID_HEADER_MAX];
@@ -594,7 +1354,7 @@ fetch_timeline(fetch_t *f) {
     [UI_NOTIFICATIONS] = X_FEED_NOTIFICATIONS, [UI_BOOKMARKS] = X_FEED_BOOKMARKS, [UI_ME] = X_FEED_USER,
     [UI_CHAT] = -1, [UI_CALLS] = -1, [UI_GROK] = -1, [UI_PREMIUM] = -1, [UI_HISTORY] = -1,
     [UI_ARTICLES] = X_FEED_ARTICLES, [UI_USER] = X_FEED_USER, [UI_POST] = X_FEED_POST, [UI_DM] = -1,
-    [UI_LISTS] = X_FEED_LISTS, [UI_LIST] = X_FEED_LIST, [UI_GAME] = -1,
+    [UI_LISTS] = X_FEED_LISTS, [UI_LIST] = X_FEED_LIST, [UI_GAME] = -1, [UI_FRIENDS] = X_FEED_FRIENDS,
   };
   const char *id = f->req.id;
   https_response_t res;
@@ -614,6 +1374,11 @@ fetch_timeline(fetch_t *f) {
     memset(&session, 0, sizeof session);
     f->error = ERR_HTTPS;
     f->code = g_https;
+    return;
+  }
+  if(f->req.feed == UI_NOTIFICATIONS && f->req.latest && !f->req.side && !f->req.cursor[0]) {
+    memset(&session, 0, sizeof session);
+    fetch_all_notices(f, url, sizeof url); // every account's, in one
     return;
   }
   if(f->req.feed == UI_CHAT || f->req.feed == UI_DM) {
@@ -651,7 +1416,8 @@ fetch_timeline(fetch_t *f) {
     feed = X_FEED_FRIENDS; // the newest of the people the user follows
   }
   if(feed < 0 || x_feed_url(url, sizeof url, feed, id[0] ? id : NULL,
-                           f->req.side == UI_SIDE_WHO ? 6 : f->req.side == UI_SIDE_PLAYING ? 100 : TIMELINE_COUNT,
+                           f->req.side == UI_SIDE_WHO ? 6 :
+                           f->req.side == UI_SIDE_PLAYING || f->req.feed == UI_FRIENDS ? 100 : TIMELINE_COUNT,
                            f->req.cursor)) {
     memset(&session, 0, sizeof session);
     f->error = ERR_MEMORY;
@@ -659,7 +1425,8 @@ fetch_timeline(fetch_t *f) {
   }
 
   // a search and Explore carry the header, as x.com's do; the timelines go without
-  signed_tid = (search || explore || f->req.side) && sign(&session, "GET", url, tid, sizeof tid);
+  signed_tid = (search || explore || f->req.side || f->req.feed == UI_FRIENDS) &&
+               sign(&session, "GET", url, tid, sizeof tid);
   doc = get_json(f, url, &session, &res, f->req.side == UI_SIDE_WHO ? "who to follow" :
                  f->req.side == UI_SIDE_PLAYING ? "playing now" :
                  f->req.side ? "side trends" : feed_name(f->req.feed), signed_tid ? tid : NULL);
@@ -684,6 +1451,11 @@ fetch_timeline(fetch_t *f) {
     f->posts = NULL;
   } else {
     x_timeline_cursor(json_root(doc), f->next, sizeof f->next);
+    // a look at the people the user follows: the file it is noted into, as
+    // it is now (the payload notes its looks into it too)
+    if(f->req.side == UI_SIDE_PLAYING || (f->req.feed == UI_FRIENDS && !f->req.cursor[0])) {
+      f->seen_ok = !seen_read(g_account, &f->seen);
+    }
   }
   log_line("%s%s: %d posts, kept %d%s", f->req.side == UI_SIDE_WHO ? "who to follow" :
            f->req.side == UI_SIDE_PLAYING ? "playing now" :
@@ -814,6 +1586,7 @@ forget_tid(void) {
  * number nor a capture's path goes to the klog.
  */
 
+static int       kept_kind(const char *path);
 static long long capture_read(const char *path, long long off, void *buf, size_t len,
                               long long *total);
 static long long capture_load(const char *path, void *buf, long long len);
@@ -883,6 +1656,91 @@ upload_step(action_t *a, const x_session_t *session, const char *url, int get, c
 
 
 /**
+ * a screenshot the PS5 saved as JPEG XR (file, which it frees) as a JPEG X
+ * takes: at its whole size and HDR_QUALITY first, less of either until it
+ * fits in 5 MB. An HDR one with light over SDR's white goes as Ultra HDR,
+ * its gain map behind the SDR picture (a->ultra_hdr set)
+ **/
+static uint8_t *
+hdr_photo(action_t *a, uint8_t *file, size_t flen, size_t *len, const char **type) {
+  unsigned long start = (unsigned long)sceKernelGetProcessTime();
+  int w = 0, h = 0, format = 0, error = 0, quality = HDR_QUALITY, sw, sh, gw = 0, gh = 0;
+  float gain_max = 0;
+  uint8_t *gain = NULL, *gain_jpeg = NULL, *jpeg = NULL, *joined;
+  uint32_t *pixels = jxr_decode_hdr(file, flen, &w, &h, &format, &gain, &gw, &gh, &gain_max, &error), *smaller;
+  size_t jlen = 0, glen = 0, room = X_UPLOAD_PHOTO, total;
+
+  mem_free(file);
+  if(!pixels) {
+    log_line("upload: a .jxr screenshot not read, error %d, pixel format 0x%x", error, format);
+    a->error = error == -2 ? ERR_MEMORY : ERR_CAPTURE;
+    a->code = error;
+    return NULL;
+  }
+  if(gain) {
+    if(jpeg_encode_gray(gain, gw, gh, GAIN_QUALITY, &gain_jpeg, &glen) ||
+       glen + ULTRAHDR_ROOM > X_UPLOAD_PHOTO / 4) {
+      mem_free(gain_jpeg);
+      gain_jpeg = NULL;
+    } else {
+      room = X_UPLOAD_PHOTO - glen - ULTRAHDR_ROOM; // the SDR picture gets the rest
+    }
+    mem_free(gain);
+  }
+  for(int tries=0; tries < 6 && !jpeg; tries++) {
+    if(jpeg_encode(pixels, w, h, quality, &jpeg, &jlen)) {
+      jpeg = NULL;
+      break;
+    }
+    if(jlen <= room) {
+      break;
+    }
+    mem_free(jpeg);
+    jpeg = NULL;
+    if(quality > 80) {
+      quality -= 6;
+      continue;
+    }
+    sw = w * 3 / 4;
+    sh = h * 3 / 4;
+    if(!(smaller=image_fit_pixels(pixels, w, h, sw, sh))) {
+      break;
+    }
+    mem_free(pixels);
+    pixels = smaller;
+    w = sw;
+    h = sh;
+  }
+  mem_free(pixels);
+  log_line("upload: a .jxr screenshot (pixel format 0x%x, %s) made a %dx%d JPEG at %d, %zu bytes, in %lu ms",
+           format, jxr_format_hdr(format) ? "HDR" : "SDR", w, h, quality, jpeg ? jlen : 0,
+           ((unsigned long)sceKernelGetProcessTime() - start) / 1000);
+  if(jpeg && gain_jpeg) {
+    if(!ultrahdr_join(jpeg, jlen, gain_jpeg, glen, gain_max, &joined, &total)) {
+      mem_free(jpeg);
+      jpeg = joined;
+      jlen = total;
+      a->ultra_hdr = total;
+      log_line("upload: Ultra HDR, a gain map of %dx%d (%zu bytes) up to %.2f stops, %zu bytes in all", gw, gh,
+               glen, (double)gain_max, total);
+    } else {
+      log_line("upload: Ultra HDR not made, the SDR picture goes alone");
+    }
+  } else if(jpeg && jxr_format_hdr(format)) {
+    log_line("upload: no gain map (%s)", gw ? "it did not fit" : "no light over SDR's white");
+  }
+  mem_free(gain_jpeg);
+  if(!jpeg) {
+    a->error = ERR_TOO_BIG;
+    return NULL;
+  }
+  *len = jlen;
+  *type = "image/jpeg";
+  return jpeg;
+}
+
+
+/**
  * a picture as X takes it: the capture as it is, when it is up to 5 MB,
  * else made smaller, as a JPEG; *type is its content-type. Returns the bytes
  * (mem_free them), or NULL with a's error set
@@ -913,6 +1771,9 @@ photo_bytes(action_t *a, const capture_t *c, size_t *len, const char **type) {
     a->error = ERR_CAPTURE;
     a->code = (int)(n < 0 ? n : -1);
     return NULL;
+  }
+  if(c->kind == CAPTURE_JXR) {
+    return hdr_photo(a, file, (size_t)total, len, type);
   }
   if(total <= X_UPLOAD_PHOTO) {
     *len = (size_t)total;
@@ -948,6 +1809,108 @@ photo_bytes(action_t *a, const capture_t *c, size_t *len, const char **type) {
 
 
 /**
+ * the part c->clip of the video c, total bytes long, cut into clip
+ * (clip.h): its moov found by the top-level boxes' headers alone, then read
+ * whole; 0, or -1 with a's error set
+ **/
+static int
+clip_capture(action_t *a, const capture_t *c, long long total, clip_t *clip) {
+  uint8_t box[16], *moov;
+  uint64_t at = 0, size = 0, moov_at = 0, moov_size = 0;
+  unsigned head_len;
+  uint32_t type;
+  long long n;
+  int64_t from, to;
+  mp4_t m;
+  int ret;
+
+  memset(clip, 0, sizeof *clip);
+  while(at + 8 <= (uint64_t)total) {
+    size_t want = (uint64_t)total - at < sizeof box ? (size_t)((uint64_t)total - at) : sizeof box;
+    if((n=capture_read(c->path, (long long)at, box, want, NULL)) < 8 ||
+       clip_box(box, (size_t)n, at, (uint64_t)total, &type, &size, &head_len)) {
+      break;
+    }
+    if(type == CLIP_FOURCC('m', 'o', 'o', 'v')) {
+      moov_at = at;
+      moov_size = size;
+      break;
+    }
+    at += size;
+  }
+  if(!moov_size || moov_size > CLIP_MOOV_MOST) {
+    log_line("upload: the video has no moov to cut it by (%llu bytes)", (unsigned long long)moov_size);
+    a->error = ERR_CLIP;
+    a->code = MP4_NO_MOOV;
+    return -1;
+  }
+  if(!(moov=mem_alloc((size_t)moov_size))) {
+    a->error = ERR_MEMORY;
+    return -1;
+  }
+  for(uint64_t got=0; got < moov_size; got += (uint64_t)n) {
+    size_t want = moov_size - got < X_UPLOAD_PART ? (size_t)(moov_size - got) : X_UPLOAD_PART;
+    if((n=capture_read(c->path, (long long)(moov_at + got), moov + got, want, NULL)) <= 0) {
+      mem_free(moov);
+      a->error = ERR_CAPTURE;
+      a->code = n < 0 ? (int)n : -1;
+      return -1;
+    }
+  }
+  if(!(ret=mp4_parse_moov(&m, moov, (size_t)moov_size, (uint64_t)total))) {
+    clip_span(c->clip, m.duration_ms, &from, &to);
+    // the codes of clip.h past mp4.h's
+    ret = clip_make(&m, from, to, clip) - 10 * (clip->head == NULL);
+    log_line("upload: the video's part %d: %lld ms from %lld ms of %lld, %s", c->clip, (long long)clip->length_ms,
+             (long long)clip->start_ms, (long long)m.duration_ms, ret ? "not cut" : "cut");
+    mp4_free(&m);
+  } else {
+    log_line("upload: the video's moov not read, %d", ret);
+  }
+  mem_free(moov);
+  if(ret) {
+    clip_free(clip);
+    a->error = ret == MP4_MEMORY || ret == CLIP_MEMORY - 10 ? ERR_MEMORY : ERR_CLIP;
+    a->code = ret;
+    return -1;
+  }
+  return 0;
+}
+
+
+/**
+ * len bytes at off of the video that goes: the capture's, or its clip's
+ * (the head, then the capture's range); how many, or a negative error
+ **/
+static long long
+video_read(const capture_t *c, const clip_t *clip, long long off, uint8_t *buf, size_t len) {
+  size_t done = 0, k;
+  long long n;
+
+  if(!clip) {
+    return capture_read(c->path, off, buf, len, NULL);
+  }
+  if(off < 0 || (uint64_t)off + len > clip_size(clip)) {
+    return -1;
+  }
+  if((uint64_t)off < clip->head_len) {
+    k = clip->head_len - (size_t)off < len ? clip->head_len - (size_t)off : len;
+    memcpy(buf, clip->head + off, k);
+    done = k;
+  }
+  while(done < len) {
+    n = capture_read(c->path, (long long)clip->from + off + (long long)done - (long long)clip->head_len, buf + done,
+                     len - done, NULL);
+    if(n <= 0) {
+      return n < 0 ? n : -1;
+    }
+    done += (size_t)n;
+  }
+  return (long long)done;
+}
+
+
+/**
  * upload one capture, whose size counts from base in a's progress; on 0,
  * media_id holds the number X gave it, else a's error is set
  **/
@@ -957,7 +1920,7 @@ upload_media(action_t *a, const x_session_t *session, const capture_t *c, long l
   static char url[512];
   char boundary[40], head[256], tail[96], form[128];
   long long total = 0, off, n, weight = c->size > 0 ? c->size : 1;
-  int ret, wait = 1, state = -1, last = -1, segment = 0, count, waited = 0;
+  int ret, wait = 1, state = -1, last = -1, segment = 0, count, waited = 0, cut = 0;
   https_header_t headers[X_HEADER_COUNT + 2];
   const char *type = "video/mp4";
   uint8_t *photo = NULL, *part = NULL;
@@ -965,8 +1928,10 @@ upload_media(action_t *a, const x_session_t *session, const capture_t *c, long l
   https_response_t res;
   x_request_t request;
   json_doc_t *doc;
+  clip_t clip;
 
   memset(media_id, 0, size);
+  memset(&clip, 0, sizeof clip);
   if(c->kind == CAPTURE_WEBM) {
     a->error = ERR_PROCESSING; // X takes no WebM, which the composer tells first
     return -1;
@@ -977,7 +1942,16 @@ upload_media(action_t *a, const x_session_t *session, const capture_t *c, long l
       a->code = (int)n;
       return -1;
     }
+    // a part of it: a head made here, then a range of its bytes
+    if(c->clip > CLIP_WHOLE && c->clip < CLIP_KINDS) {
+      if(clip_capture(a, c, total, &clip)) {
+        return -1;
+      }
+      cut = 1;
+      total = (long long)clip_size(&clip);
+    }
     if(total > X_UPLOAD_VIDEO) {
+      clip_free(&clip);
       a->error = ERR_TOO_BIG;
       return -1;
     }
@@ -989,7 +1963,7 @@ upload_media(action_t *a, const x_session_t *session, const capture_t *c, long l
 
   // INIT
   if(x_upload_url(url, sizeof url, X_UPLOAD_INIT, NULL, total, type,
-                  a->kind == UI_ACT_SHARE_DM ? X_UPLOAD_FOR_DM : 0)) {
+                  a->kind == UI_ACT_SHARE_DM || a->kind == UI_ACT_VOICE_DM ? X_UPLOAD_FOR_DM : 0)) {
     a->error = ERR_MEMORY;
     goto fail;
   }
@@ -1020,7 +1994,7 @@ upload_media(action_t *a, const x_session_t *session, const capture_t *c, long l
     memcpy(part, head, hlen);
     if(photo) {
       memcpy(part + hlen, photo + off, (size_t)n);
-    } else if((ret=(int)capture_read(c->path, off, part + hlen, (size_t)n, NULL)) != n) {
+    } else if((ret=(int)video_read(c, cut ? &clip : NULL, off, part + hlen, (size_t)n)) != n) {
       a->error = ERR_CAPTURE;
       a->code = ret < 0 ? ret : -1;
       goto fail;
@@ -1052,6 +2026,7 @@ upload_media(action_t *a, const x_session_t *session, const capture_t *c, long l
   mem_free(part);
   mem_free(photo);
   part = photo = NULL;
+  clip_free(&clip);
 
   // FINALIZE, then STATUS while X processes a video
   if(x_upload_url(url, sizeof url, X_UPLOAD_FINALIZE, media_id, 0, NULL, 0)) {
@@ -1091,6 +2066,7 @@ upload_media(action_t *a, const x_session_t *session, const capture_t *c, long l
  fail:
   mem_free(part);
   mem_free(photo);
+  clip_free(&clip);
   memset(media_id, 0, size);
   return -1;
 }
@@ -1244,11 +2220,13 @@ grok_post(const x_session_t *session, const char *url, const char *body, https_r
 
 /**
  * a's question to Grok, in a new conversation when it asks or none is
- * open; its answer into a->answer. The klog has codes and sizes only
+ * open (a translation or a catch-up always in one of its own, so the
+ * hints' conversation goes on without them); its answer into a->answer.
+ * The klog has codes and sizes only, never the words
  **/
 static void
 send_grok(action_t *a) {
-  static char url[512], body[8192], prompt[2048];
+  static char url[512], body[2 * X_GROK_PROMPT + 1024], prompt[X_GROK_PROMPT], own[X_GROK_ID_MAX];
   static const char *const hosts[2] = {X_GROK_HOST, X_GROK_HOST_OLD};
   const char *message;
   https_response_t res;
@@ -1256,6 +2234,7 @@ send_grok(action_t *a) {
   json_doc_t *doc;
   size_t err_off;
   int ret, why, signed_tid = 0, parts = 0, h = g_grok_host, host_tried = 0, model_tried = 0;
+  char *conv = a->grok == UI_GROK_HINT ? g_grok_conv : own;
 
   if((ret=read_session(&session))) {
     a->error = ret == -3 ? ERR_NO_SESSION : ERR_NO_COOKIE;
@@ -1267,8 +2246,8 @@ send_grok(action_t *a) {
     a->code = g_https;
     return;
   }
-  if(a->fresh || !g_grok_conv[0]) {
-    g_grok_conv[0] = 0;
+  if(a->fresh || a->grok != UI_GROK_HINT || !conv[0]) {
+    conv[0] = 0;
     if(x_grok_create_request(url, sizeof url, body, sizeof body)) {
       memset(&session, 0, sizeof session);
       a->error = ERR_MEMORY;
@@ -1283,15 +2262,15 @@ send_grok(action_t *a) {
     }
     a->code = res.status;
     if((doc=json_parse_why(res.body, res.len, &err_off, &why))) {
-      if(x_grok_conversation(json_root(doc), g_grok_conv, sizeof g_grok_conv)) {
+      if(x_grok_conversation(json_root(doc), conv, X_GROK_ID_MAX)) {
         a->x_code = x_first_error(json_root(doc), &message);
       }
       json_free(doc);
     }
     log_line("grok: new conversation%s: HTTP %d, %s, X says %d", signed_tid ? " (tid)" : "", res.status,
-             g_grok_conv[0] ? "opened" : "no id", a->x_code);
+             conv[0] ? "opened" : "no id", a->x_code);
     mem_free(res.body);
-    if(!g_grok_conv[0]) {
+    if(!conv[0]) {
       memset(&session, 0, sizeof session);
       if(signed_tid && (res.status == 404 || a->x_code == 226)) {
         forget_tid();
@@ -1300,7 +2279,10 @@ send_grok(action_t *a) {
       return;
     }
   }
-  ret = x_grok_prompt(prompt, sizeof prompt, a->game, a->text, lang_name(a->lang));
+  ret = a->grok == UI_GROK_TRANSLATE ? x_grok_translate_prompt(prompt, sizeof prompt, a->user, a->text,
+                                                               lang_name(a->lang)) :
+        a->grok == UI_GROK_CATCHUP ? x_grok_catchup_prompt(prompt, sizeof prompt, a->text, lang_name(a->lang)) :
+        x_grok_prompt(prompt, sizeof prompt, a->game, a->text, lang_name(a->lang));
   memset(a->text, 0, sizeof a->text);
   if(ret) {
     memset(&session, 0, sizeof session);
@@ -1310,7 +2292,7 @@ send_grok(action_t *a) {
   // grok.x.com, or api.x.com when it cannot be reached; the model named, or
   // X's own when it is refused
   for(;;) {
-    if(x_grok_request(url, sizeof url, body, sizeof body, hosts[h], g_grok_conv,
+    if(x_grok_request(url, sizeof url, body, sizeof body, hosts[h], conv,
                       g_grok_no_model ? NULL : X_GROK_MODEL, prompt)) {
       ret = -1;
       break;
@@ -1336,7 +2318,7 @@ send_grok(action_t *a) {
   if(ret) {
     a->error = ret < 0 ? ERR_MEMORY : ERR_NETWORK;
     a->code = ret;
-    g_grok_conv[0] = 0;
+    conv[0] = 0;
     return;
   }
   g_grok_host = h;
@@ -1360,7 +2342,7 @@ send_grok(action_t *a) {
     return;
   }
   memset(a->answer, 0, sizeof a->answer);
-  g_grok_conv[0] = 0; // a new conversation next time
+  conv[0] = 0; // a new conversation next time
   a->error = res.status == 200 && a->x_code <= 0 ? ERR_ANSWER : ERR_HTTP;
 }
 
@@ -1371,6 +2353,80 @@ send_grok(action_t *a) {
  **/
 static int ask_payload(const char *cmd, char *line, size_t size);
 int sceNetSocketClose(int s);
+
+/**
+ * a Space to hear (UI_ACT_SPACE): how it stands (AudioSpaceById), then
+ * where its sound is (live_video_stream/status), both asked of X with the
+ * session as x.com asks them. The playlist's address goes back in
+ * a->answer for space.c, which fetches it with no session; neither it nor
+ * the Space's media key goes to the klog
+ **/
+static void
+send_space(action_t *a) {
+  static char url[1024];
+  const char *message;
+  https_response_t res;
+  x_session_t session;
+  x_request_t request;
+  json_doc_t *doc;
+  size_t err_off;
+  int ret, why;
+
+  if((ret=read_session(&session))) {
+    a->error = ret == -3 ? ERR_NO_SESSION : ERR_NO_COOKIE;
+    return;
+  }
+  if(g_https) {
+    memset(&session, 0, sizeof session);
+    a->error = ERR_HTTPS;
+    a->code = g_https;
+    return;
+  }
+  if(x_space_url(url, sizeof url, a->id)) {
+    memset(&session, 0, sizeof session);
+    a->error = ERR_MEMORY;
+    return;
+  }
+  for(int step=0; step < 2 && !a->error; step++) {
+    x_request_init(&request, &session);
+    ret = https_get(url, request.headers, X_HEADER_COUNT, &res);
+    memset(&request, 0, sizeof request);
+    memset(url, 0, sizeof url);
+    if(ret) {
+      a->error = ERR_NETWORK;
+      a->code = ret;
+      break;
+    }
+    log_line("space: %s, HTTP %d, %zu bytes", step ? "where its sound is" : "how it stands", res.status, res.len);
+    a->code = res.status;
+    if(!(doc=json_parse_why(res.body, res.len, &err_off, &why))) {
+      a->error = res.status == 200 ? ERR_ANSWER : ERR_HTTP;
+    } else if(res.status != 200) {
+      a->x_code = x_first_error(json_root(doc), &message);
+      a->error = ERR_HTTP;
+    } else if(!step) {
+      if(x_space_parse(json_root(doc), &a->space)) {
+        a->error = ERR_ANSWER;
+      } else if(a->space.state != X_SPACE_LIVE && !(a->space.state == X_SPACE_ENDED && a->space.replay)) {
+        a->error = ERR_SPACE_OFF; // not started yet, or over with no recording
+        a->code = a->space.state;
+      } else if(x_space_stream_url(url, sizeof url, a->space.media_key)) {
+        a->error = ERR_MEMORY;
+      }
+      log_line("space: %s, %d speaker(s)", a->space.state == X_SPACE_LIVE ? "on the air" :
+               a->space.state == X_SPACE_SOON ? "not started" : a->space.state == X_SPACE_ENDED ?
+               (a->space.replay ? "over, recorded" : "over") : "unknown", a->space.speakers);
+      memset(a->space.media_key, 0, sizeof a->space.media_key);
+    } else if(x_space_stream_parse(json_root(doc), a->answer, sizeof a->answer)) {
+      a->error = ERR_ANSWER;
+    }
+    json_free(doc);
+    mem_free(res.body);
+  }
+  memset(&session, 0, sizeof session);
+  memset(url, 0, sizeof url);
+}
+
 
 static void
 send_launch(action_t *a) {
@@ -1402,6 +2458,28 @@ send_launch(action_t *a) {
 }
 
 
+/**
+ * what X kept of an Ultra HDR picture just posted (ours bytes): its copy at
+ * the whole size, fetched once, logged as counts only
+ **/
+static void
+look_at_copy(const char *url, size_t ours) {
+  https_response_t res;
+  ultrahdr_info_t info;
+  int ret;
+
+  memset(&res, 0, sizeof res);
+  if((ret=https_get(url, NULL, 0, &res))) {
+    log_line("ultra hdr: X's copy not fetched (%d)", ret);
+    return;
+  }
+  ultrahdr_inspect(res.status == 200 ? (const uint8_t *)res.body : NULL, res.len, &info);
+  log_line("ultra hdr: X's copy, HTTP %d, %zu bytes (ours %zu): %d picture(s), XMP %d, MPF %d, gain map %d, "
+           "ISO %d", res.status, res.len, ours, info.pictures, info.xmp, info.mpf, info.gain, info.iso);
+  mem_free(res.body);
+}
+
+
 static void
 send_action(action_t *a) {
   static const char *const names[] = {
@@ -1412,9 +2490,10 @@ send_action(action_t *a) {
     [UI_ACT_UNPIN] = "unpin", [UI_ACT_FOLLOW] = "follow", [UI_ACT_UNFOLLOW] = "unfollow", [UI_ACT_MUTE] = "mute",
     [UI_ACT_UNMUTE] = "unmute", [UI_ACT_BLOCK] = "block", [UI_ACT_UNBLOCK] = "unblock",
     [UI_ACT_SCHEDULE] = "schedule", [UI_ACT_UNSCHEDULE] = "unschedule", [UI_ACT_VOTE] = "vote",
-    [UI_ACT_INVITE] = "invite", [UI_ACT_SHARE_DM] = "message with media",
+    [UI_ACT_INVITE] = "invite", [UI_ACT_SHARE_DM] = "message with media", [UI_ACT_VOICE_DM] = "voice message",
   };
   static char url[1024], body[X_BODY_MAX], tid[XTID_HEADER_MAX], ids[UI_MEDIA_MAX][32], card[64];
+  static char copy_url[512];
   char request_id[40];
   int composed = a->kind == UI_ACT_REPLY || a->kind == UI_ACT_POST || a->kind == UI_ACT_QUOTE ||
                  a->kind == UI_ACT_EDIT;
@@ -1430,7 +2509,7 @@ send_action(action_t *a) {
   x_request_t request;
   json_doc_t *doc;
   size_t err_off;
-  int ret, why, done = -1, count = X_HEADER_COUNT, signed_tid = 0;
+  int ret, why, done = -1, count = X_HEADER_COUNT, signed_tid = 0, copy = 0;
 
   if(a->kind == UI_ACT_GROK) {
     send_grok(a);
@@ -1440,12 +2519,20 @@ send_action(action_t *a) {
     send_launch(a);
     return;
   }
+  if(a->kind == UI_ACT_XCHAT_UNLOCK) {
+    send_unlock(a);
+    return;
+  }
+  if(a->kind == UI_ACT_SPACE) {
+    send_space(a);
+    return;
+  }
   if((ret=read_session(&session))) {
     a->error = ret == -3 ? ERR_NO_SESSION : ERR_NO_COOKIE;
     return;
   }
   if((a->kind == UI_ACT_REPLY || a->kind == UI_ACT_POST || a->kind == UI_ACT_QUOTE ||
-      a->kind == UI_ACT_SCHEDULE || a->kind == UI_ACT_SHARE_DM) && a->count) {
+      a->kind == UI_ACT_SCHEDULE || a->kind == UI_ACT_SHARE_DM || a->kind == UI_ACT_VOICE_DM) && a->count) {
     // the captures first: the post names them
     if(g_https) {
       memset(&session, 0, sizeof session);
@@ -1503,7 +2590,8 @@ send_action(action_t *a) {
     ret = x_unschedule_request(url, sizeof url, body, sizeof body, a->id);
   } else if(a->kind == UI_ACT_VOTE) {
     ret = x_vote_request(url, sizeof url, body, sizeof body, a->card, a->id, a->card_name, a->choice);
-  } else if(a->kind == UI_ACT_DM || a->kind == UI_ACT_INVITE || a->kind == UI_ACT_SHARE_DM) {
+  } else if(a->kind == UI_ACT_DM || a->kind == UI_ACT_INVITE || a->kind == UI_ACT_SHARE_DM ||
+            a->kind == UI_ACT_VOICE_DM) {
     // a new UUID (version 4) names the message, as x.com's does
     unsigned char b[16];
     for(int i=0; i < 16; i++) {
@@ -1514,7 +2602,7 @@ send_action(action_t *a) {
     snprintf(request_id, sizeof request_id,
              "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x", b[0], b[1], b[2],
              b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
-    ret = a->kind == UI_ACT_SHARE_DM ?
+    ret = a->kind == UI_ACT_SHARE_DM || a->kind == UI_ACT_VOICE_DM ?
           x_dm_media_request(url, sizeof url, body, sizeof body, a->id, a->text, a->count ? ids[0] : NULL,
                              request_id) :
           x_dm_send_request(url, sizeof url, body, sizeof body, a->id, a->text, request_id);
@@ -1564,6 +2652,9 @@ send_action(action_t *a) {
   a->code = res.status;
   if((doc=json_parse_why(res.body, res.len, &err_off, &why))) {
     done = x_action_done(json_root(doc), &message);
+    // one Ultra HDR picture posted: X's copy of it looked at, below
+    copy = composed && a->ultra_hdr && a->count == 1 && res.status == 200 && !done &&
+           !x_created_media_url(json_root(doc), copy_url, sizeof copy_url);
     json_free(doc);
   }
   log_line("%s%s%s: HTTP %d, %zu bytes, X says %d", what, a->count ? " with media" : "",
@@ -1578,6 +2669,9 @@ send_action(action_t *a) {
   if(res.status == 200 && (!done || (a->kind == UI_ACT_LIKE && done == 139) ||
                            (a->kind == UI_ACT_REPOST && done == 327) ||
                            ((caps || a->kind == UI_ACT_UNSCHEDULE) && done == -1))) {
+    if(copy) {
+      look_at_copy(copy_url, a->ultra_hdr);
+    }
     return;
   }
   a->x_code = done;
@@ -1625,13 +2719,36 @@ start_action(int kind, const char *id, const char *user) {
     // a message carries one picture or one video: the first
     g_action.count = ui_compose_get(g_action.text, sizeof g_action.text, g_action.media, UI_MEDIA_MAX);
     g_action.count = g_action.count > 1 ? 1 : g_action.count;
+  } else if(kind == UI_ACT_VOICE_DM) {
+    g_action.text[0] = 0; // the note alone
+    g_action.count = ui_voice_dm_get(&g_action.media[0]);
   } else if(kind == UI_ACT_LAUNCH) {
     ui_launch_get(g_action.id, sizeof g_action.id, g_action.game, sizeof g_action.game);
   } else if(kind == UI_ACT_GROK) {
-    ui_grok_get(g_action.text, sizeof g_action.text, g_action.game, sizeof g_action.game, &g_action.fresh);
+    ui_grok_get(g_action.text, sizeof g_action.text, g_action.game, sizeof g_action.game, &g_action.fresh,
+                &g_action.grok, g_action.user, sizeof g_action.user);
     g_action.lang = ui_lang();
   }
   if(!start_thread(action_main, &g_action, 1 << 20)) {
+    g_action.error = ERR_MEMORY;
+    g_action.state = FETCH_DONE;
+  }
+}
+
+
+/**
+ * the X Chat unlock on its own thread: the PIN recovers the identity key
+ * (send_unlock); the PIN is held only here and wiped once it is used
+ **/
+static void
+start_unlock(const char *me, const char *pin) {
+  memset(&g_action, 0, sizeof g_action);
+  g_action.state = FETCH_RUNNING;
+  g_action.kind = UI_ACT_XCHAT_UNLOCK;
+  snprintf(g_action.id, sizeof g_action.id, "%s", me);
+  snprintf(g_action.text, sizeof g_action.text, "%s", pin);
+  if(!start_thread(action_main, &g_action, 1 << 20)) {
+    xcrypt_wipe(g_action.text, sizeof g_action.text);
     g_action.error = ERR_MEMORY;
     g_action.state = FETCH_DONE;
   }
@@ -1660,28 +2777,89 @@ loader_main(void *arg) {
     if(!strncmp(url, "file://", 7)) {
       long long total = 0;
       void *data = NULL;
-      int kind = captures_kind(url + 7);
+      int kind = kept_kind(url + 7);
 
-      if((kind == CAPTURE_JPEG || kind == CAPTURE_PNG) &&
+      if((kind == CAPTURE_JPEG || kind == CAPTURE_PNG || kind == CAPTURE_JXR) &&
          capture_read(url + 7, 0, NULL, 0, &total) >= 0 && total > 0 && total <= CAPTURE_PHOTO_MAX &&
          (data=mem_alloc((size_t)total)) && capture_load(url + 7, data, total) != total) {
         mem_free(data);
         data = NULL;
       }
+      if(kind == CAPTURE_JXR) {
+        // a .jxr screenshot: from the smaller size its bands keep, in SDR;
+        // the screen labels the HDR ones
+        static int told;
+        uint32_t *pixels = NULL, *fit = NULL;
+        int jw = 0, jh = 0, format = 0, error = -1;
+        unsigned long start = (unsigned long)sceKernelGetProcessTime();
+        if(data && (pixels=jxr_decode(data, (size_t)total, w, h, &jw, &jh, &format, &error))) {
+          fit = image_fit_pixels(pixels, jw, jh, w, h);
+          mem_free(pixels);
+        }
+        if(fit && jxr_format_hdr(format)) {
+          ui_capture_hdr(url + 7);
+        }
+        if(__atomic_fetch_add(&told, 1, __ATOMIC_RELAXED) < 3) {
+          log_line("picture: a .jxr screenshot, pixel format 0x%x (%s), %dx%d for %dx%d, %s in %lu ms", format,
+                   jxr_format_hdr(format) ? "HDR" : "SDR", jw, jh, w, h, fit ? "drawn" : "not read",
+                   ((unsigned long)sceKernelGetProcessTime() - start) / 1000);
+          if(!fit) {
+            log_line("picture: the .jxr screenshot's error %d", error);
+          }
+        }
+        mem_free(data);
+        images_done_pixels(url, w, h, fit);
+        continue;
+      }
       images_done(url, w, h, data, data ? (size_t)total : 0);
       mem_free(data);
       continue;
     }
-    ret = https_get(url, NULL, 0, &res);
-    if(!ret && res.status == 200) {
-      images_done(url, w, h, res.body, res.len);
-    } else {
-      if(!ret && __atomic_fetch_add(&reported, 1, __ATOMIC_RELAXED) < 5) {
-        log_line("picture: HTTP %d", res.status);
+    // a picture of X Chat is encrypted: fetched with the session (it may be
+    // private) and opened before it is decoded
+    {
+      uint8_t key[32];
+      x_session_t session;
+      x_request_t req;
+      int enc = images_key(url, w, h, key);
+      const https_header_t *hdr = NULL;
+      int nhdr = 0;
+
+      memset(&session, 0, sizeof session);
+      memset(&req, 0, sizeof req);
+      if(enc && !read_session(&session)) {
+        x_request_init(&req, &session);
+        hdr = req.headers;
+        nhdr = X_HEADER_COUNT;
       }
-      images_done(url, w, h, NULL, 0);
+      ret = https_get(url, hdr, nhdr, &res);
+      memset(&session, 0, sizeof session);
+      memset(&req, 0, sizeof req);
+      if(!ret && res.status == 200 && enc) {
+        unsigned char *plain = res.len ? mem_alloc(res.len) : NULL;
+        size_t plen = 0;
+        // opened, and its bytes the ones its message says (their SHA-256)
+        if(plain && !xcrypt_media_open(key, (const uint8_t *)res.body, res.len, plain, res.len, &plen) &&
+           !xchat_open_check(url, plain, plen)) {
+          images_done(url, w, h, plain, plen);
+        } else {
+          if(__atomic_fetch_add(&reported, 1, __ATOMIC_RELAXED) < 5) {
+            log_line("picture: X Chat media (%zu bytes) did not open, or not as its message says", res.len);
+          }
+          images_done(url, w, h, NULL, 0);
+        }
+        mem_free(plain);
+      } else if(!ret && res.status == 200) {
+        images_done(url, w, h, res.body, res.len);
+      } else {
+        if(!ret && __atomic_fetch_add(&reported, 1, __ATOMIC_RELAXED) < 5) {
+          log_line("picture:%s HTTP %d", enc ? " X Chat" : "", res.status);
+        }
+        images_done(url, w, h, NULL, 0);
+      }
+      xcrypt_wipe(key, sizeof key);
+      mem_free(res.body);
     }
-    mem_free(res.body);
   }
   return NULL;
 }
@@ -1690,6 +2868,14 @@ loader_main(void *arg) {
 /*
  * The controller.
  */
+
+// the PS5's own screens have the controller (its control center, over the
+// app that still runs): the bit it sets among the buttons
+#define PAD_INTERCEPTED 0x80000000u
+
+static int g_pad_taken;  // the PS5's screens have the controller
+static int g_pad_back;   // it came back from them, to be seen once
+static int g_pad_keyboard; // it was the PS5's keyboard that had it, not its control center
 
 /**
  * the keys pressed this frame, with held ones repeating, and where the
@@ -1724,6 +2910,11 @@ read_pad(int sticks[4]) {
     return 0;
   }
   memcpy(&buttons, state, sizeof buttons);
+  if(!!(buttons & PAD_INTERCEPTED) != g_pad_taken) {
+    g_pad_taken = !g_pad_taken;
+    g_pad_back |= !g_pad_taken;
+    log_line("pad: %s", g_pad_taken ? "the PS5's screens have it" : "back");
+  }
   // the sticks, bytes 4 to 7, 128 in the middle
   for(int i=0; i<4; i++) {
     sticks[i] = state[4 + i] - 128;
@@ -1742,6 +2933,247 @@ read_pad(int sticks[4]) {
     }
   }
   return pressed;
+}
+
+
+/**
+ * the microphone's test on Calls: started and stopped as the screen asks,
+ * for the signed-in user, and its meter on the screen while it runs
+ **/
+static void
+test_mic(int *dirty) {
+  mic_status_t status;
+  int retry, want = ui_mic_wanted(&retry), user, ret;
+
+  if(g_mic_on && (!want || retry)) {
+    mic_stop();
+    g_mic_on = 0;
+  }
+  if(want && !g_mic_on) {
+    if((ret=sceUserServiceGetInitialUser(&user))) {
+      log_line("mic: no user 0x%08x, the system's then", (unsigned)ret);
+      user = 0xff;
+    }
+    g_mic_on = !mic_start(user, log_line); // else the last test still ends: the next frame
+  }
+  if(!want) {
+    // the microphone may go on for a voice note: the test shows it off
+    if(g_mic_shown != MIC_OFF) {
+      ui_mic(MIC_OFF, 0, 0, 0, 0);
+      g_mic_shown = MIC_OFF;
+      *dirty = 1;
+    }
+    return;
+  }
+  mic_get(&status);
+  ui_mic(status.state, status.code, status.silent, status.level, status.peak);
+  *dirty |= want || status.state != g_mic_shown;
+  g_mic_shown = status.state;
+}
+
+
+/**
+ * a voice note's tape: the microphone on for it while its sheet wants it,
+ * the samples in the title's memory, and once ✕ stops it their loudness to
+ * the screen for the note's card, and the sound kept for its MP4
+ **/
+static int16_t *g_voice_pcm; // the note taped last, until the card's job takes it
+static size_t   g_voice_n;
+
+static int dictate_begin(int16_t *pcm, size_t n);
+
+
+/**
+ * a tape of room samples wiped (it may hold a dictation) and freed
+ **/
+static void
+tape_free(int16_t *tape, size_t room) {
+  if(tape) {
+    memset(tape, 0, room * sizeof *tape);
+    mem_free(tape);
+  }
+}
+
+static void
+tape_voice(int *dirty) {
+  static int16_t *tape;
+  static int on, shown = MIC_OFF;
+  const size_t room = (size_t)VOICE_RATE * VOICE_MAX_SECONDS;
+  float bars[CARD_VOICE_BARS];
+  mic_status_t status;
+  int retry, want, user, ret;
+  size_t n;
+
+  if(ui_voice_take()) {
+    n = on ? mic_tape_end() : 0;
+    if(on) {
+      mic_stop();
+      on = 0;
+    }
+    shown = MIC_OFF;
+    log_line("voice: %zu samples taped", n);
+    if(ui_voice_dictating()) {
+      // the words, made by the dictation payload: the job takes the tape
+      n = n < DICT_MAX_SAMPLES ? n : DICT_MAX_SAMPLES;
+      if(tape && n >= (size_t)VOICE_RATE * VOICE_MIN_SECONDS && !dictate_begin(tape, n)) {
+        tape = NULL;
+      } else {
+        ui_dictated(DICT_FAILED, NULL);
+      }
+      tape_free(tape, room);
+      tape = NULL;
+      *dirty = 1;
+      return;
+    }
+    mem_free(g_voice_pcm);
+    g_voice_pcm = NULL;
+    if(tape && n >= (size_t)VOICE_RATE * VOICE_MIN_SECONDS) {
+      voice_bars(tape, n, bars, CARD_VOICE_BARS);
+      if(ui_voice_card(bars, CARD_VOICE_BARS, (int)(n / VOICE_RATE))) {
+        g_voice_pcm = tape;
+        g_voice_n = n;
+        tape = NULL;
+      }
+    } else {
+      ui_voice_card(NULL, 0, 0);
+    }
+    tape_free(tape, room);
+    tape = NULL;
+    *dirty = 1;
+    return;
+  }
+  want = ui_voice_wanted(&retry);
+  if(on && (!want || retry)) {
+    mic_tape_end();
+    mic_stop();
+    on = 0;
+  }
+  if(!want && tape) {
+    tape_free(tape, room);
+    tape = NULL;
+  }
+  if(want && !on && !g_mic_on) {
+    if(!tape && !(tape=mem_alloc(room * sizeof *tape))) {
+      log_line("voice: no memory for the tape");
+      ui_voice_heard(MIC_FAILED, 0, 0, 0, 0);
+      *dirty = 1;
+      return;
+    }
+    if((ret=sceUserServiceGetInitialUser(&user))) {
+      log_line("voice: no user 0x%08x, the system's then", (unsigned)ret);
+      user = 0xff;
+    }
+    if(!mic_start(user, log_line)) { // else the last one still ends: the next frame
+      mic_tape(tape, room);
+      on = 1;
+    }
+  }
+  if(!want && shown == MIC_OFF) {
+    return;
+  }
+  mic_get(&status);
+  ui_voice_heard(status.state, status.code, status.silent, status.level, on ? mic_taped() : 0);
+  *dirty |= want || status.state != shown;
+  shown = want ? status.state : MIC_OFF;
+}
+
+
+/*
+ * The DualSense's motors and adaptive triggers, for what the screen says
+ * (ui_rumble): a pattern of steps, each the strength of the two motors for
+ * some milliseconds; the triggers push back for a moment at a list's end.
+ */
+
+// the SDK's ScePadTriggerEffectParam: which triggers (L2 1, R2 2), then a
+// command for each, its mode and 48 bytes of what the mode takes
+enum { PAD_TRIGGER_OFF, PAD_TRIGGER_FEEDBACK };
+typedef struct {
+  uint8_t mask;
+  uint8_t pad[7];
+  struct {
+    int32_t mode;
+    uint8_t pad[4];
+    uint8_t data[48]; // FEEDBACK: the place it starts (0 to 9) and its strength (1 to 8)
+  } command[2];
+} pad_triggers_t;
+_Static_assert(sizeof(pad_triggers_t) == 120, "ScePadTriggerEffectParam is 120 bytes");
+
+typedef struct {
+  uint8_t large, small;
+  uint16_t ms;
+} rumble_step_t;
+
+static const rumble_step_t g_tick[] = {{0, 90, 35}};
+static const rumble_step_t g_news[] = {{140, 40, 70}, {0, 0, 90}, {140, 40, 70}};
+static const rumble_step_t g_sent[] = {{0, 60, 40}, {0, 0, 40}, {40, 110, 50}, {0, 0, 40}, {120, 160, 70}};
+static const rumble_step_t g_edge[] = {{60, 0, 60}};
+static const rumble_step_t g_error[] = {{200, 60, 160}};
+
+static void
+set_triggers(int strength) {
+  static int logged;
+  pad_triggers_t t;
+  int ret;
+
+  memset(&t, 0, sizeof t);
+  t.mask = 1 | 2;
+  for(int i=0; i<2; i++) {
+    t.command[i].mode = strength ? PAD_TRIGGER_FEEDBACK : PAD_TRIGGER_OFF;
+    t.command[i].data[0] = 0;
+    t.command[i].data[1] = (uint8_t)strength;
+  }
+  if((ret=scePadSetTriggerEffect(g_pad, &t)) && !logged++) {
+    log_line("pad: triggers 0x%08x", (unsigned)ret);
+  }
+}
+
+/**
+ * every frame: the next step of the pattern under way, or a new one
+ **/
+static void
+rumble_pad(void) {
+  static const rumble_step_t *steps;
+  static int count, at, logged, triggers;
+  static unsigned long until, triggers_until;
+  unsigned long now = (unsigned long)sceKernelGetProcessTime();
+  uint8_t motors[2];
+  int r, ret;
+
+  r = ui_rumble();
+  if(g_pad < 0 || g_pad_taken) {
+    steps = NULL;
+    return;
+  }
+  if(r != UI_RUMBLE_NONE) {
+    steps = r == UI_RUMBLE_TICK ? g_tick : r == UI_RUMBLE_NEWS ? g_news : r == UI_RUMBLE_SENT ? g_sent :
+            r == UI_RUMBLE_EDGE ? g_edge : g_error;
+    count = r == UI_RUMBLE_TICK ? 1 : r == UI_RUMBLE_NEWS ? 3 : r == UI_RUMBLE_SENT ? 5 : 1;
+    at = -1;
+    until = 0;
+    if(r == UI_RUMBLE_EDGE) {
+      set_triggers(6);
+      triggers = 1;
+      triggers_until = now + 350000;
+    }
+  }
+  if(triggers && now >= triggers_until) {
+    set_triggers(0);
+    triggers = 0;
+  }
+  if(!steps || now < until) {
+    return;
+  }
+  if(++at >= count) {
+    motors[0] = motors[1] = 0;
+    steps = NULL;
+  } else {
+    motors[0] = steps[at].large;
+    motors[1] = steps[at].small;
+    until = now + steps[at].ms * 1000ul;
+  }
+  if((ret=scePadSetVibration(g_pad, motors)) && !logged++) {
+    log_line("pad: vibration 0x%08x", (unsigned)ret);
+  }
 }
 
 
@@ -1802,6 +3234,10 @@ open_keyboard(int kind, const char *user) {
                     ui_text("Palavras, #temas ou @pessoas", "Words, #topics or @people"), NULL,
                     SEARCH_CHARS);
   }
+  if(kind == UI_ACT_XCHAT_PIN) {
+    // masked, like a password: the PIN is never shown or kept
+    return ime_open_field(id, ui_text("PIN do X Chat", "X Chat PIN"), "", NULL, 64, IME_FIELD_PASSWORD);
+  }
   if(kind == UI_ACT_DM_TEXT) {
     ui_dm_get(text, sizeof text);
     if(user[0]) {
@@ -1851,7 +3287,7 @@ open_keyboard(int kind, const char *user) {
 #define NOTIFY_ELF  "/app0/notify.elf"
 #define NOTIFY_PORT 9047        // where a copy that runs answers (src/notify.c)
 #define LOADER_PORT 9021        // the ELF loader of etaHEN
-#define NOTIFY_MAX  (4 << 20)
+#define NOTIFY_MAX  (8 << 20)  // the most a payload beside the eboot may be
 
 #define NET_AF_INET     2
 #define NET_SOCK_STREAM 1
@@ -1891,8 +3327,12 @@ local_connect(const char *name, int port, int seconds) {
   if((s=sceNetSocket(name, NET_AF_INET, NET_SOCK_STREAM, 0)) < 0) {
     return s;
   }
-  sceNetSetsockopt(s, NET_SOL_SOCKET, NET_SO_SNDTIMEO, &usec, sizeof usec);
-  sceNetSetsockopt(s, NET_SOL_SOCKET, NET_SO_RCVTIMEO, &usec, sizeof usec);
+  static int told; // said once: the PS5 refused the waits (a wait of 10 s for the loader went on for good)
+  const int snd = sceNetSetsockopt(s, NET_SOL_SOCKET, NET_SO_SNDTIMEO, &usec, sizeof usec),
+            rcv = sceNetSetsockopt(s, NET_SOL_SOCKET, NET_SO_RCVTIMEO, &usec, sizeof usec);
+  if((snd < 0 || rcv < 0) && !__atomic_exchange_n(&told, 1, __ATOMIC_ACQ_REL)) {
+    log_line("net: the wait of %d s not set (0x%08x, 0x%08x)", seconds, (unsigned)snd, (unsigned)rcv);
+  }
   memset(&a, 0, sizeof a);
   a.len = sizeof a;
   a.family = NET_AF_INET;
@@ -2021,6 +3461,252 @@ load_payload(void) {
   ret = send_elf(elf, len, "notify");
   free(elf);
   return ret;
+}
+
+
+/*
+ * Dictation (src/dictproto.h): the voice sheet's tape, once ✕ stops it for a
+ * dictation, goes to the dictation payload beside the eboot (src/dictated.c),
+ * handed to the ELF loader the first time; its words go into the post
+ * (ui_dictated). The payload runs whisper.cpp, which the title cannot (C++
+ * with exceptions), and keeps the model's memory out of the title's. The
+ * sound is wiped once sent and the words once shown; the log gets counts
+ * and codes only. ○ on the sheet closes the connection, which stops the
+ * payload's work.
+ */
+
+#define DICTATE_ELF  "/app0/dictate.elf"
+#define DICTATE_WAIT 90 // seconds for the words, the model's first reading included
+
+static struct {
+  int      state;  // FETCH_*, atomic
+  int      cancel; // atomic: the sheet let go of it
+  int16_t *pcm;    // the tape, n samples
+  size_t   n;
+  char     lang[DICT_LANG];
+  int      status; // DICT_*
+  char     text[DICT_TEXT_MAX + 1];
+} g_dictate;
+
+
+static int
+dictate_cancelled(void) {
+  return __atomic_load_n(&g_dictate.cancel, __ATOMIC_ACQUIRE);
+}
+
+
+/**
+ * the dictation's socket made to wait a second at a time, which
+ * dictate_send and dictate_recv count (up to DICTATE_WAIT, or until ○): the
+ * PS5 refuses local_connect's microseconds (0x80410116), so FreeBSD's
+ * struct timeval; whether it took is said once in the klog
+ **/
+static int
+dictate_waits(int s) {
+  static int told;
+  const struct { int64_t sec, usec; } second = {1, 0};
+  const int snd = sceNetSetsockopt(s, NET_SOL_SOCKET, NET_SO_SNDTIMEO, &second, sizeof second),
+            rcv = sceNetSetsockopt(s, NET_SOL_SOCKET, NET_SO_RCVTIMEO, &second, sizeof second);
+
+  if(!__atomic_exchange_n(&told, 1, __ATOMIC_ACQ_REL)) {
+    log_line("dictate: waits of a second %s (0x%08x, 0x%08x)", snd < 0 || rcv < 0 ? "not set" : "set",
+             (unsigned)snd, (unsigned)rcv);
+  }
+  return s;
+}
+
+
+/**
+ * a connection to the payload, handed to the ELF loader first when none
+ * answers; a socket, or -1
+ **/
+static int
+dictate_connect(void) {
+  unsigned char *elf;
+  size_t len;
+  int s;
+
+  if((s=local_connect("XPS5 dictate", DICT_PORT, 1)) >= 0) {
+    return dictate_waits(s);
+  }
+  if(!(elf=read_whole(DICTATE_ELF, &len))) {
+    log_line("dictate: no payload beside the eboot");
+    return -1;
+  }
+  s = send_elf(elf, len, "dictate");
+  free(elf);
+  if(s) {
+    return -1;
+  }
+  for(int i=0; i < 50 && !dictate_cancelled(); i++) {
+    usleep(100 * 1000);
+    if((s=local_connect("XPS5 dictate", DICT_PORT, 1)) >= 0) {
+      return dictate_waits(s);
+    }
+  }
+  log_line("dictate: the payload does not answer (0x%08x)", (unsigned)s);
+  return -1;
+}
+
+
+/**
+ * len bytes to the payload, waiting a second at a time, up to DICTATE_WAIT
+ * with the answer's, for as long as the sheet wants them; 0 or -1
+ **/
+static int
+dictate_send(int s, const void *buf, size_t len, int *waited) {
+  size_t off = 0;
+  int n;
+
+  while(off < len && !dictate_cancelled()) {
+    if((n=sceNetSend(s, (const char *)buf + off, len - off, 0)) > 0) {
+      off += (size_t)n;
+    } else if((unsigned)n != 0x80410123u || ++*waited >= DICTATE_WAIT) { // EAGAIN: the second's wait
+      return -1;
+    }
+  }
+  return off == len ? 0 : -1;
+}
+
+
+/**
+ * len bytes of the answer, waiting a second at a time, up to DICTATE_WAIT,
+ * for as long as the sheet wants them; 0 or -1
+ **/
+static int
+dictate_recv(int s, void *buf, size_t len, int *waited) {
+  size_t got = 0;
+  int n;
+
+  while(got < len && !dictate_cancelled()) {
+    if((n=sceNetRecv(s, (char *)buf + got, len - got, 0)) > 0) {
+      got += (size_t)n;
+    } else if(((unsigned)n != 0x80410123u && (unsigned)n != 0x8041013cu) || ++*waited >= DICTATE_WAIT) {
+      return -1; // closed, broken, or too long
+    }
+  }
+  return got == len ? 0 : -1;
+}
+
+
+/**
+ * one request: the tape, then the words; a DICT_* status, or DICT_OLD when
+ * the payload that answered is of another version (it goes)
+ **/
+static int
+dictate_ask(int s) {
+  unsigned char head[DICT_HEAD], answer[DICT_ANSWER];
+  const uint32_t version = DICT_VERSION, n = (uint32_t)g_dictate.n;
+  uint32_t theirs, len;
+  int32_t status;
+  int waited = 0;
+
+  memcpy(head, DICT_MAGIC, 8);
+  memcpy(head + 8, &version, 4);
+  memcpy(head + 12, g_dictate.lang, DICT_LANG);
+  memcpy(head + 12 + DICT_LANG, &n, 4);
+  if(dictate_send(s, head, sizeof head, &waited) ||
+     dictate_send(s, g_dictate.pcm, g_dictate.n * sizeof *g_dictate.pcm, &waited) ||
+     dictate_recv(s, answer, sizeof answer, &waited)) {
+    return DICT_FAILED;
+  }
+  memcpy(&theirs, answer, 4);
+  memcpy(&status, answer + 4, 4);
+  memcpy(&len, answer + 8, 4);
+  if(status == DICT_OLD || theirs != DICT_VERSION) {
+    log_line("dictate: the payload is of version %u, the title %u", (unsigned)theirs, DICT_VERSION);
+    return DICT_OLD;
+  }
+  if(len > DICT_TEXT_MAX || (len && dictate_recv(s, g_dictate.text, len, &waited))) {
+    return DICT_FAILED;
+  }
+  g_dictate.text[len] = 0;
+  return status;
+}
+
+
+static void *
+dictate_main(void *arg) {
+  long long began = (long long)time(NULL);
+  int s, status = DICT_FAILED;
+
+  (void)arg;
+  // twice: a payload of another version goes when asked, and the new one
+  // is handed to the loader
+  for(int i=0; i < 2 && !dictate_cancelled(); i++) {
+    if((s=dictate_connect()) < 0) {
+      status = DICT_FAILED;
+      break;
+    }
+    status = dictate_ask(s);
+    sceNetSocketClose(s);
+    if(status != DICT_OLD) {
+      break;
+    }
+    usleep(500 * 1000); // its port let go of
+  }
+  memset(g_dictate.pcm, 0, g_dictate.n * sizeof *g_dictate.pcm);
+  mem_free(g_dictate.pcm);
+  g_dictate.pcm = NULL;
+  g_dictate.status = status == DICT_OLD ? DICT_FAILED : status;
+  log_line("dictate: %zu samples, status %d, %zu bytes, %lld s%s", g_dictate.n, g_dictate.status,
+           g_dictate.status == DICT_OK ? strlen(g_dictate.text) : (size_t)0, (long long)time(NULL) - began,
+           dictate_cancelled() ? ", let go of" : "");
+  __atomic_store_n(&g_dictate.state, FETCH_DONE, __ATOMIC_RELEASE);
+  return NULL;
+}
+
+
+/**
+ * the tape of n samples handed to the dictation's thread, which wipes and
+ * frees it; 0, or -1 when it did not start (the tape stays the caller's)
+ **/
+static int
+dictate_begin(int16_t *pcm, size_t n) {
+  if(__atomic_load_n(&g_dictate.state, __ATOMIC_ACQUIRE) != FETCH_IDLE) {
+    log_line("dictate: one is under way");
+    return -1;
+  }
+  g_dictate.pcm = pcm;
+  g_dictate.n = n;
+  // English, always (the user's choice, 2026-11-21): the tiny model guessed
+  // European Portuguese badly and wrote it badly, and the screen's
+  // language is no hint of what is spoken. "" would have the payload guess
+  memset(g_dictate.lang, 0, sizeof g_dictate.lang);
+  memcpy(g_dictate.lang, "en", 2);
+  g_dictate.text[0] = 0;
+  __atomic_store_n(&g_dictate.cancel, 0, __ATOMIC_RELEASE);
+  __atomic_store_n(&g_dictate.state, FETCH_RUNNING, __ATOMIC_RELEASE);
+  if(!start_thread(dictate_main, NULL, 128 << 10)) {
+    g_dictate.pcm = NULL;
+    __atomic_store_n(&g_dictate.state, FETCH_IDLE, __ATOMIC_RELEASE);
+    log_line("dictate: no thread");
+    return -1;
+  }
+  return 0;
+}
+
+
+/**
+ * the dictation's words to the sheet once they come, wiped after; the
+ * thread told to let go when the sheet did
+ **/
+static void
+dictate_step(int *dirty) {
+  const int state = __atomic_load_n(&g_dictate.state, __ATOMIC_ACQUIRE);
+
+  if(state == FETCH_RUNNING && !ui_voice_dictating()) {
+    __atomic_store_n(&g_dictate.cancel, 1, __ATOMIC_RELEASE);
+  }
+  if(state != FETCH_DONE) {
+    return;
+  }
+  if(!dictate_cancelled()) {
+    ui_dictated(g_dictate.status, g_dictate.text);
+    *dirty = 1;
+  }
+  memset(g_dictate.text, 0, sizeof g_dictate.text);
+  __atomic_store_n(&g_dictate.state, FETCH_IDLE, __ATOMIC_RELEASE);
 }
 
 
@@ -2165,7 +3851,7 @@ tell_payload(const char *cmd, char *answer, size_t size) {
  * before "link", and so on: the number of its "on N" answer, which a new
  * install's PAYLOAD_VERSION has to reach (a plain "on" is the first)
  **/
-#define PAYLOAD_VERSION 11
+#define PAYLOAD_VERSION 27
 static int
 payload_version(void) {
   char answer[16];
@@ -2332,6 +4018,93 @@ payload_read(const char *path, long long off, void *buf, size_t len, long long *
 }
 
 
+/*
+ * The cards made for a post (title/cards.h), JPEGs kept in memory under
+ * paths of their own, which the composer carries as captures: with a game
+ * suspended behind it the title may not reach /data (errno 2). A voice
+ * note's MP4 is kept the same way.
+ */
+
+#define CARD_KEPT   4
+#define CARD_PREFIX "/xps5-cards/"
+static struct {
+  char     path[48];
+  uint8_t *data;
+  size_t   len;
+} g_cards[CARD_KEPT];
+static pthread_mutex_t g_cards_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned        g_card_serial;
+
+/**
+ * a JPEG, or a voice note's MP4 (kind CAPTURE_MP4), kept under a new path
+ * (the oldest kept goes); its path into c
+ **/
+static void
+card_keep(uint8_t *data, size_t len, int kind, capture_t *c) {
+  pthread_mutex_lock(&g_cards_lock);
+  const unsigned n = g_card_serial++;
+  mem_free(g_cards[n % CARD_KEPT].data);
+  snprintf(g_cards[n % CARD_KEPT].path, sizeof g_cards[0].path, CARD_PREFIX "%s-%u.%s",
+           kind == CAPTURE_MP4 ? "voice" : "card", n + 1, kind == CAPTURE_MP4 ? "mp4" : "jpg");
+  g_cards[n % CARD_KEPT].data = data;
+  g_cards[n % CARD_KEPT].len = len;
+  memset(c, 0, sizeof *c);
+  snprintf(c->path, sizeof c->path, "%s", g_cards[n % CARD_KEPT].path);
+  pthread_mutex_unlock(&g_cards_lock);
+  c->kind = kind;
+  c->size = (long long)len;
+  c->time = (long long)time(NULL);
+}
+
+
+/**
+ * CAPTURE_* of a path a capture is read by: one of the PS5's (captures.h),
+ * or a card kept, by the name card_keep gives it; -1 for any other
+ **/
+static int
+kept_kind(const char *path) {
+  const char *name;
+  size_t n;
+
+  if(!path || strncmp(path, CARD_PREFIX, sizeof CARD_PREFIX - 1)) {
+    return captures_kind(path);
+  }
+  name = path + sizeof CARD_PREFIX - 1;
+  n = strlen(name);
+  if(n < 5 || n >= sizeof g_cards[0].path - (sizeof CARD_PREFIX - 1) || strchr(name, '/')) {
+    return -1;
+  }
+  return !strcmp(name + n - 4, ".jpg") ? CAPTURE_JPEG : !strcmp(name + n - 4, ".mp4") ? CAPTURE_MP4 : -1;
+}
+
+
+/**
+ * capture_read of a card or voice note kept: returns how many bytes, or -2 (ENOENT) when
+ * it is not kept any more
+ **/
+static long long
+card_read(const char *path, long long off, void *buf, size_t len, long long *total) {
+  long long n = -2;
+
+  pthread_mutex_lock(&g_cards_lock);
+  for(int i=0; i < CARD_KEPT; i++) {
+    if(g_cards[i].data && !strcmp(g_cards[i].path, path)) {
+      n = off >= (long long)g_cards[i].len ? 0 : (long long)g_cards[i].len - off;
+      n = n > (long long)len ? (long long)len : n;
+      if(n > 0 && buf) {
+        memcpy(buf, g_cards[i].data + off, (size_t)n);
+      }
+      if(total) {
+        *total = (long long)g_cards[i].len;
+      }
+      break;
+    }
+  }
+  pthread_mutex_unlock(&g_cards_lock);
+  return n;
+}
+
+
 /**
  * up to len bytes at off of a capture into buf, and its size into *total
  * unless it is NULL; returns how many, or a negative error
@@ -2340,13 +4113,138 @@ static long long
 capture_read(const char *path, long long off, void *buf, size_t len, long long *total) {
   long long n;
 
-  if(captures_kind(path) < 0 || off < 0) {
+  if(kept_kind(path) < 0 || off < 0) {
     return -1;
+  }
+  if(!strncmp(path, CARD_PREFIX, sizeof CARD_PREFIX - 1)) {
+    return card_read(path, off, buf, len, total);
   }
   if((n=direct_read(path, off, buf, len, total)) >= 0) {
     return n;
   }
   return payload_read(path, off, buf, len, total);
+}
+
+
+/*
+ * X Chat's encrypted videos, GIFs and voice notes for the player: a post's
+ * video_url "file://xchat/<16 hex>" (xchat_media_token) is read here. At its
+ * first read its bytes are fetched with the session (they may be private)
+ * and opened (xcrypt_media_open); then they go out a part at a time, and are
+ * let go of once the last part was read (the player keeps its own copy).
+ */
+#define XCHAT_MEDIA_PREFIX "xchat/"
+#define XCHAT_MEDIA_MAX    (128 << 20) // bytes of an encrypted video, at most
+
+static pthread_mutex_t g_xmedia_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+  char           token[XCHAT_TOKEN];
+  unsigned char *data;
+  size_t         len;
+} g_xmedia;
+
+
+/**
+ * the attachment named token fetched and opened into g_xmedia; 0, or a
+ * negative error. Under g_xmedia_lock
+ **/
+static int
+xchat_media_fetch(const char *token) {
+  https_response_t res;
+  x_session_t session;
+  x_request_t req;
+  uint8_t key[32];
+  char url[256];
+  unsigned char *plain = NULL;
+  size_t plen = 0;
+  int ret;
+
+  mem_free(g_xmedia.data);
+  memset(&g_xmedia, 0, sizeof g_xmedia);
+  if(xchat_open_media(token, url, sizeof url, key)) {
+    log_line("player: X Chat media unknown (not opened in this run)");
+    return -2;
+  }
+  memset(&res, 0, sizeof res);
+  memset(&req, 0, sizeof req);
+  if((ret=read_session(&session))) {
+    xcrypt_wipe(key, sizeof key);
+    return ret < 0 ? ret : -1;
+  }
+  x_request_init(&req, &session);
+  ret = https_get_big(url, req.headers, X_HEADER_COUNT, XCHAT_MEDIA_MAX, &res);
+  memset(&session, 0, sizeof session);
+  memset(&req, 0, sizeof req);
+  if(ret || res.status != 200) {
+    log_line("player: X Chat media %s %d", ret ? "network" : "HTTP", ret ? ret : res.status);
+    mem_free(res.body);
+    xcrypt_wipe(key, sizeof key);
+    return ret < 0 ? ret : -1;
+  }
+  if(!res.len || !(plain=mem_alloc(res.len)) ||
+     xcrypt_media_open(key, (const uint8_t *)res.body, res.len, plain, res.len, &plen) || !plen ||
+     xchat_open_check(url, plain, plen)) {
+    log_line("player: X Chat media (%zu bytes) did not open, or not as its message says", res.len);
+    mem_free(plain);
+    mem_free(res.body);
+    xcrypt_wipe(key, sizeof key);
+    return -1;
+  }
+  log_line("player: X Chat media opened, %zu KiB", plen >> 10);
+  mem_free(res.body);
+  xcrypt_wipe(key, sizeof key);
+  snprintf(g_xmedia.token, sizeof g_xmedia.token, "%s", token);
+  g_xmedia.data = plain;
+  g_xmedia.len = plen;
+  return 0;
+}
+
+
+/**
+ * capture_read of X Chat's media (path its token): fetched and opened at
+ * its first read (off 0)
+ **/
+static long long
+xchat_media_read(const char *token, long long off, void *buf, size_t len, long long *total) {
+  long long n;
+  int ret;
+
+  if(off < 0) {
+    return -1;
+  }
+  pthread_mutex_lock(&g_xmedia_lock);
+  if(!g_xmedia.data || strcmp(g_xmedia.token, token)) {
+    if(off || (ret=xchat_media_fetch(token))) {
+      pthread_mutex_unlock(&g_xmedia_lock);
+      return off ? -2 : ret;
+    }
+  }
+  n = off >= (long long)g_xmedia.len ? 0 : (long long)g_xmedia.len - off;
+  n = n > (long long)len ? (long long)len : n;
+  if(n > 0 && buf) {
+    memcpy(buf, g_xmedia.data + off, (size_t)n);
+  }
+  if(total) {
+    *total = (long long)g_xmedia.len;
+  }
+  if(buf && off + n >= (long long)g_xmedia.len) {
+    mem_free(g_xmedia.data); // all of it read
+    memset(&g_xmedia, 0, sizeof g_xmedia);
+  }
+  pthread_mutex_unlock(&g_xmedia_lock);
+  return n;
+}
+
+
+/**
+ * what the player reads by "file://": X Chat's media, or a capture
+ **/
+static long long
+media_read(const char *path, long long off, void *buf, size_t len, long long *total) {
+  if(!strncmp(path, XCHAT_MEDIA_PREFIX, sizeof XCHAT_MEDIA_PREFIX - 1)) {
+    return xchat_media_read(path, off, buf, len, total);
+  }
+  return capture_read(path, off, buf, len, total);
 }
 
 
@@ -2474,9 +4372,212 @@ ask_trophy(game_t *g) {
 }
 
 
+/**
+ * the rest of the payload's answer on s, to its end (the payload closes
+ * it), at most most bytes; mem_alloc'd with a NUL after it, or NULL
+ **/
+static char *
+recv_rest(int s, size_t most, size_t *len) {
+  size_t size = 16 << 10, got = 0;
+  char *buf = mem_alloc(size + 1), *bigger;
+  int n;
+
+  while(buf && (n=sceNetRecv(s, buf + got, size - got, 0)) > 0) {
+    got += (size_t)n;
+    if(got == size) {
+      if(size >= most || !(bigger=mem_alloc(size * 2 + 1))) {
+        mem_free(buf);
+        return NULL;
+      }
+      memcpy(bigger, buf, got);
+      mem_free(buf);
+      buf = bigger;
+      size *= 2;
+    }
+  }
+  if(buf) {
+    buf[got] = 0;
+    *len = got;
+  }
+  return buf;
+}
+
+
+/**
+ * the line of text that starts at *at (cut at its '\n', which goes), and
+ * *at moved past it; NULL at the end
+ **/
+static char *
+next_line(char **at) {
+  char *line = *at, *end;
+
+  if(!line || !*line) {
+    return NULL;
+  }
+  if((end=strchr(line, '\n'))) {
+    *end = 0;
+    *at = end + 1;
+  } else {
+    *at = line + strlen(line);
+  }
+  line[strcspn(line, "\r")] = 0;
+  return line;
+}
+
+
+/**
+ * the session of play that ended, once, into g->session (session_ok)
+ **/
+static void
+ask_session(game_t *g) {
+  char line[16], *text, *at, *l;
+  size_t len = 0;
+  int s;
+
+  g->session_ok = 0;
+  if((s=ask_payload("session\n", line, sizeof line)) < 0) {
+    return;
+  }
+  text = strcmp(line, "ok") ? NULL : recv_rest(s, 64 << 10, &len);
+  sceNetSocketClose(s);
+  at = text;
+  if((l=next_line(&at)) && !session_parse(l, &g->session)) {
+    while((l=next_line(&at)) && strcmp(l, "end")) {
+      if(!strncmp(l, "best\t", 5)) {
+        session_text(l + 5, g->session.best, sizeof g->session.best);
+      } else if(!strncmp(l, "pic\t", 4) && g->session.pic_count < SESSION_PICS && captures_kind(l + 4) >= 0) {
+        snprintf(g->session.pics[g->session.pic_count++], sizeof g->session.pics[0], "%s", l + 4);
+      }
+    }
+    g->session_ok = 1;
+    log_line("sessions: one came, %d screenshots", g->session.pic_count);
+  }
+  mem_free(text);
+}
+
+
+/**
+ * the sessions of the last seven days, into g->week (week_ok)
+ **/
+static void
+ask_week(game_t *g) {
+  const long long now = (long long)time(NULL);
+  char line[16], *text = NULL;
+  size_t len = 0;
+  int s, n = -1;
+
+  memset(&g->week, 0, sizeof g->week);
+  g->week_ok = -1;
+  if((s=ask_payload("week\n", line, sizeof line)) >= 0) {
+    text = strcmp(line, "ok") ? NULL : recv_rest(s, 1 << 20, &len);
+    sceNetSocketClose(s);
+  }
+  if(text) {
+    n = week_add_file(&g->week, text, len, now - WEEK_SECONDS, now + 60);
+    g->week_ok = 1;
+  }
+  log_line("sessions: the week's came %d, %d of them", g->week_ok, n);
+  mem_free(text);
+}
+
+
+/**
+ * the trophies of the game g->id, into g->troph_rows (troph_count)
+ **/
+static void
+ask_trophies(game_t *g) {
+  char cmd[GAME_ID + 16], line[48], *text = NULL, *at, *l, *f[6];
+  int s, earned = 0, all = 0, n = 0;
+  size_t len = 0;
+
+  g->troph_count = TROPHIES_NOT_READ;
+  snprintf(cmd, sizeof cmd, "trophies %s\n", g->id);
+  if((s=ask_payload(cmd, line, sizeof line)) < 0) {
+    return;
+  }
+  snprintf(g->troph_id, sizeof g->troph_id, "%s", g->id);
+  g->troph_at = (long long)time(NULL);
+  if(!strcmp(line, "none")) {
+    sceNetSocketClose(s);
+    g->troph_count = -1;
+    log_line("trophies: the game has none listed");
+    return;
+  }
+  if(sscanf(line, "ok %d %d", &earned, &all) == 2 && all > 0 && all <= UI_TROPHIES_MAX &&
+     (g->troph_rows=mem_alloc((size_t)all * sizeof *g->troph_rows))) {
+    text = recv_rest(s, 1 << 20, &len);
+  }
+  sceNetSocketClose(s);
+  at = text;
+  while(text && n < all && (l=next_line(&at)) && strcmp(l, "end")) {
+    // id, grade, hidden, earned, name and description, between tabs
+    ui_trophy_row_t *r = &g->troph_rows[n];
+    int k = 0;
+    for(f[k++]=l; k < 6 && (l=strchr(l, '\t')); f[k++]=++l) {
+      *l = 0;
+    }
+    if(k == 6) {
+      memset(r, 0, sizeof *r);
+      r->id = atoi(f[0]);
+      r->grade = atoi(f[1]) & 3;
+      r->hidden = atoi(f[2]) != 0;
+      r->earned = atoi(f[3]) != 0;
+      session_text(f[4], r->name, sizeof r->name);
+      session_text(f[5], r->detail, sizeof r->detail);
+      n++;
+    }
+  }
+  mem_free(text);
+  if(n > 0) {
+    g->troph_count = n;
+  } else {
+    mem_free(g->troph_rows);
+    g->troph_rows = NULL;
+  }
+  log_line("trophies: %d listed, %d earned", n, earned);
+}
+
+
+// the counts of the bar, and what a toast's Open was for, as the payload says
+static struct {
+  int  state;                    // FETCH_*
+  int  seen, back;               // asked with: the lists the user looks at, and back in front,
+  char conv[2][X_ID_MAX];        // and the conversation open (its id, its X Chat id), read
+  int  ok, notices, chats, open; // the answer; chats: messages; open: 0, 1 the notifications, 2 Chat
+  int  news;                     // the open conversation had new messages
+  int  want_back;                // came to the front (or started): asked so at once
+  long long asked;
+} g_badge;
+
+
+static void *
+badge_main(void *arg) {
+  char cmd[32 + 2 * X_ID_MAX], line[80], open[16];
+  int s, notices, chats, news = 0, got;
+
+  (void)arg;
+  g_badge.ok = g_badge.open = g_badge.news = 0;
+  snprintf(cmd, sizeof cmd, "badges %d %d %s %s\n", g_badge.seen, g_badge.back,
+           g_badge.conv[0][0] ? g_badge.conv[0] : "-", g_badge.conv[1][0] ? g_badge.conv[1] : "-");
+  if((s=ask_payload(cmd, line, sizeof line)) >= 0) {
+    sceNetSocketClose(s);
+    if((got=sscanf(line, "badges %d %d %15s %d", &notices, &chats, open, &news)) >= 3) {
+      g_badge.notices = notices;
+      g_badge.chats = chats;
+      g_badge.open = !strcmp(open, "notifications") ? 1 : !strcmp(open, "chat") ? 2 : 0;
+      g_badge.news = got == 4 && news;
+      g_badge.ok = 1;
+    }
+  }
+  __atomic_store_n(&g_badge.state, FETCH_DONE, __ATOMIC_RELEASE);
+  return NULL;
+}
+
+
 static void *
 game_main(void *arg) {
   game_t *g = arg;
+  const long long now = (long long)time(NULL);
 
   ask_game(g->id, g->name);
   g->trophy = -1;
@@ -2484,8 +4585,149 @@ game_main(void *arg) {
     ask_trophy(g);
     ask_shot(&g->shot);
   }
+  ask_session(g);
+  g->week_ok = 0;
+  if(g->want_week) {
+    ask_week(g);
+  }
+  g->troph_count = TROPHIES_NOT_READ;
+  if(game_id_ok(g->id) && (g->want_trophies || g->trophy >= 0 || strcmp(g->id, g->troph_id) ||
+                           now - g->troph_at >= TROPHIES_EVERY)) {
+    ask_trophies(g);
+  }
   __atomic_store_n(&g->state, FETCH_DONE, __ATOMIC_RELEASE);
   return NULL;
+}
+
+
+/*
+ * A card the screen drew, turned into a JPEG by a thread of its own; or a
+ * voice note's, the picture of its MP4 with the sound taped.
+ */
+
+static struct {
+  int       state; // FETCH_*
+  int       kind;  // UI_CARD_*
+  uint32_t *pixels;
+  int       w, h, ok;
+  int16_t  *pcm;   // a voice note's sound, n samples at VOICE_RATE
+  size_t    n;
+  capture_t c;
+} g_card_job;
+
+
+/**
+ * w x h pixels at the voice note's VOICE_W x VOICE_H, each the average of
+ * the area it covers (mem_alloc'd), or NULL
+ **/
+static uint32_t *
+voice_picture(const uint32_t *src, int w, int h) {
+  const float sx = (float)w / VOICE_W, sy = (float)h / VOICE_H, area = sx * sy;
+  uint32_t *out = mem_alloc((size_t)VOICE_W * VOICE_H * sizeof *out);
+  float *acc = mem_alloc((size_t)VOICE_W * 3 * sizeof *acc);
+
+  if(!out || !acc || w < VOICE_W || h < VOICE_H) {
+    mem_free(out);
+    mem_free(acc);
+    return NULL;
+  }
+  for(int y=0; y < VOICE_H; y++) {
+    const float top = y * sy, bottom = top + sy;
+    memset(acc, 0, (size_t)VOICE_W * 3 * sizeof *acc);
+    for(int r=(int)top; r < h && r < bottom; r++) {
+      const float wy = (r + 1 < bottom ? r + 1 : bottom) - (r > top ? r : top);
+      const uint32_t *row = src + (size_t)r * (size_t)w;
+      for(int x=0; x < VOICE_W; x++) {
+        const float left = x * sx, right = left + sx;
+        float c[3] = {0, 0, 0};
+        for(int i=(int)left; i < w && i < right; i++) {
+          const float wx = (i + 1 < right ? i + 1 : right) - (i > left ? i : left);
+          c[0] += wx * (float)(row[i] & 0xff);
+          c[1] += wx * (float)(row[i] >> 8 & 0xff);
+          c[2] += wx * (float)(row[i] >> 16 & 0xff);
+        }
+        for(int k=0; k<3; k++) {
+          acc[x * 3 + k] += wy * c[k];
+        }
+      }
+    }
+    for(int x=0; x < VOICE_W; x++) {
+      uint32_t p = 0xff000000u;
+      for(int k=0; k<3; k++) {
+        const float v = acc[x * 3 + k] / area + 0.5f;
+        p |= (uint32_t)(v < 0 ? 0 : v > 255 ? 255 : v) << (8 * k);
+      }
+      out[(size_t)y * VOICE_W + (size_t)x] = p;
+    }
+  }
+  mem_free(acc);
+  return out;
+}
+
+
+static void *
+card_main(void *arg) {
+  const int voice = g_card_job.kind == UI_CARD_VOICE;
+  uint8_t *data = NULL;
+  size_t len = 0;
+
+  (void)arg;
+  if(voice) {
+    uint32_t *picture = voice_picture(g_card_job.pixels, g_card_job.w, g_card_job.h);
+    g_card_job.ok = picture && !voice_mp4(g_card_job.pcm, g_card_job.n, picture, &data, &len);
+    mem_free(picture);
+    mem_free(g_card_job.pcm);
+    g_card_job.pcm = NULL;
+  } else {
+    g_card_job.ok = !jpeg_encode(g_card_job.pixels, g_card_job.w, g_card_job.h, 92, &data, &len);
+  }
+  mem_free(g_card_job.pixels);
+  g_card_job.pixels = NULL;
+  if(g_card_job.ok) {
+    card_keep(data, len, voice ? CAPTURE_MP4 : CAPTURE_JPEG, &g_card_job.c);
+  }
+  log_line("card: %dx%d, %s of %zu bytes %d", g_card_job.w, g_card_job.h, voice ? "a voice note's MP4" : "a JPEG",
+           len, g_card_job.ok);
+  __atomic_store_n(&g_card_job.state, FETCH_DONE, __ATOMIC_RELEASE);
+  return NULL;
+}
+
+
+/**
+ * the frame's part of the cards: one made handed to the screen, or one
+ * drawn handed to the thread (a voice note's with its sound)
+ **/
+static void
+card_job_step(int *dirty) {
+  int kind;
+
+  if(__atomic_load_n(&g_card_job.state, __ATOMIC_ACQUIRE) == FETCH_DONE) {
+    ui_card_done(g_card_job.ok ? &g_card_job.c : NULL);
+    __atomic_store_n(&g_card_job.state, FETCH_IDLE, __ATOMIC_RELEASE);
+    *dirty = 1;
+    return;
+  }
+  if(__atomic_load_n(&g_card_job.state, __ATOMIC_ACQUIRE) != FETCH_IDLE ||
+     !(kind=ui_card_take(&g_card_job.pixels, &g_card_job.w, &g_card_job.h))) {
+    return;
+  }
+  g_card_job.kind = kind;
+  g_card_job.pcm = NULL;
+  if(kind == UI_CARD_VOICE) {
+    g_card_job.pcm = g_voice_pcm;
+    g_card_job.n = g_voice_n;
+    g_voice_pcm = NULL;
+  }
+  g_card_job.state = FETCH_RUNNING;
+  if((kind == UI_CARD_VOICE && !g_card_job.pcm) || !start_thread(card_main, NULL, 256 << 10)) {
+    mem_free(g_card_job.pixels);
+    g_card_job.pixels = NULL;
+    mem_free(g_card_job.pcm);
+    g_card_job.pcm = NULL;
+    g_card_job.state = FETCH_IDLE;
+    ui_card_done(NULL);
+    *dirty = 1;
+  }
 }
 
 
@@ -2726,6 +4968,190 @@ link_frame(void) {
   shown = st;
   ui_link_status(&st);
   return 1;
+}
+
+
+/*
+ * Writing on the phone (src/phone.h): while its window is open, the payload
+ * is asked every PHONE_ASK_MS where its server is and what the phone wrote,
+ * the draft going with the question until the phone writes.
+ */
+
+#define PHONE_ASK_MS   300
+#define PHONE_PATIENT  10 // questions without an answer before the window says so
+
+static struct {
+  pthread_mutex_t lock;
+  int             running, stop; // the thread's, atomic
+  unsigned        window;        // the window it serves (ui_phone_wanted)
+  unsigned        screen;        // its number for the payload
+  int             max;
+  char            what[8];
+  char            lang[4];
+  char            draft[PHONE_TEXT_MAX + 1];
+  ui_phone_t      st;
+  char            text[PHONE_TEXT_MAX + 1];
+  int             fresh;         // text came, and its Send
+  int             done;
+} g_phonew = {.lock = PTHREAD_MUTEX_INITIALIZER};
+
+
+/**
+ * one question: its state line into st, and the text that follows it into
+ * text (size bytes, ended) with its length into len; 0, or -1
+ **/
+static int
+phone_ask(const char *cmd, phone_state_t *st, char *text, size_t size, size_t *len) {
+  char line[160];
+  int s, ret = 0;
+
+  *len = 0;
+  text[0] = 0;
+  if((s=local_connect("TwitterPS5 phone", NOTIFY_PORT, 2)) < 0) {
+    return -1;
+  }
+  sceNetSend(s, cmd, strlen(cmd), 0);
+  if(recv_line(s, line, sizeof line) || phone_state_parse(line, st, len) || *len >= size ||
+     (*len && recv_all(s, text, *len) != *len)) {
+    ret = -1;
+    *len = 0;
+  }
+  text[*len] = 0;
+  sceNetSocketClose(s);
+  return ret;
+}
+
+
+static void *
+phone_main(void *arg) {
+  static char cmd[96 + 2 * PHONE_TEXT_MAX], hex[2 * PHONE_TEXT_MAX + 2], text[PHONE_TEXT_MAX + 1];
+  phone_state_t ps;
+  ui_phone_t st;
+  unsigned seq = 0;
+  size_t len;
+  int missed = 0;
+
+  (void)arg;
+  if(!reach_payload(1)) {
+    log_line("phone: the payload does not run");
+    pthread_mutex_lock(&g_phonew.lock);
+    g_phonew.st.state = UI_PHONE_NO_HELPER;
+    pthread_mutex_unlock(&g_phonew.lock);
+    __atomic_store_n(&g_phonew.running, 0, __ATOMIC_RELEASE);
+    return NULL;
+  }
+  log_line("phone: asking the payload");
+  while(!__atomic_load_n(&g_phonew.stop, __ATOMIC_ACQUIRE)) {
+    pthread_mutex_lock(&g_phonew.lock);
+    if(seq || phone_hex(g_phonew.draft, hex, sizeof hex) < 0) {
+      snprintf(hex, sizeof hex, "-"); // the phone writes now: no draft
+    }
+    snprintf(cmd, sizeof cmd, "type %u %u %d %s %s %s\n", g_phonew.screen, seq, g_phonew.max, g_phonew.what,
+             g_phonew.lang, hex);
+    pthread_mutex_unlock(&g_phonew.lock);
+    if(!phone_ask(cmd, &ps, text, sizeof text, &len)) {
+      missed = 0;
+      memset(&st, 0, sizeof st);
+      st.state = ps.state == PHONE_WAITING ? UI_PHONE_WAITING : ps.state == PHONE_NO_NETWORK ?
+                 UI_PHONE_NO_NETWORK : UI_PHONE_STARTING;
+      st.seen = ps.seen;
+      snprintf(st.ip, sizeof st.ip, "%s", ps.ip);
+      snprintf(st.token, sizeof st.token, "%s", ps.token);
+      pthread_mutex_lock(&g_phonew.lock);
+      g_phonew.st = st;
+      if(ps.seq && ps.seq != seq) {
+        seq = ps.seq;
+        memcpy(g_phonew.text, text, len + 1);
+        g_phonew.fresh = 1;
+        g_phonew.done = ps.done;
+      }
+      pthread_mutex_unlock(&g_phonew.lock);
+    } else if(++missed == PHONE_PATIENT) {
+      log_line("phone: the payload does not answer");
+      pthread_mutex_lock(&g_phonew.lock);
+      g_phonew.st.state = UI_PHONE_NO_HELPER;
+      pthread_mutex_unlock(&g_phonew.lock);
+    }
+    memset(text, 0, sizeof text);
+    memset(cmd, 0, sizeof cmd);
+    sceKernelUsleep(PHONE_ASK_MS * 1000);
+  }
+  tell_payload("untype\n", hex, 16);
+  memset(hex, 0, sizeof hex);
+  log_line("phone: closed");
+  __atomic_store_n(&g_phonew.running, 0, __ATOMIC_RELEASE);
+  return NULL;
+}
+
+
+/**
+ * each frame: the thread started for a new window and stopped when it
+ * closes, its state and what the phone wrote handed to the window; returns
+ * whether something changed on screen
+ **/
+static int
+phone_frame(void) {
+  static char draft[PHONE_TEXT_MAX + 1], text[PHONE_TEXT_MAX + 1];
+  static unsigned screens;
+  static ui_phone_t shown;
+  char what[8];
+  unsigned window;
+  int max, running = __atomic_load_n(&g_phonew.running, __ATOMIC_ACQUIRE), fresh, done, changed = 0;
+  ui_phone_t st;
+
+  window = ui_phone_wanted(draft, sizeof draft, &max, what, sizeof what);
+  if(!window || window != g_phonew.window) {
+    if(running) {
+      __atomic_store_n(&g_phonew.stop, 1, __ATOMIC_RELEASE);
+      return 0; // a new window once that one stopped
+    }
+    if(!window) {
+      g_phonew.window = 0;
+      return 0;
+    }
+    if(!screens) {
+      screens = (unsigned)sceKernelGetProcessTime() ^ (unsigned)time(NULL) << 8;
+    }
+    pthread_mutex_lock(&g_phonew.lock);
+    g_phonew.window = window;
+    g_phonew.screen = ++screens;
+    g_phonew.max = max;
+    snprintf(g_phonew.what, sizeof g_phonew.what, "%s", what);
+    snprintf(g_phonew.lang, sizeof g_phonew.lang, "%s", settings_lang_code(ui_lang()));
+    snprintf(g_phonew.draft, sizeof g_phonew.draft, "%s", draft);
+    memset(&g_phonew.st, 0, sizeof g_phonew.st);
+    g_phonew.fresh = 0;
+    pthread_mutex_unlock(&g_phonew.lock);
+    memset(&shown, 0, sizeof shown);
+    __atomic_store_n(&g_phonew.stop, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_phonew.running, 1, __ATOMIC_RELEASE);
+    if(!start_thread(phone_main, NULL, 128 << 10)) {
+      __atomic_store_n(&g_phonew.running, 0, __ATOMIC_RELEASE);
+      pthread_mutex_lock(&g_phonew.lock);
+      g_phonew.st.state = UI_PHONE_NO_HELPER;
+      pthread_mutex_unlock(&g_phonew.lock);
+    }
+  }
+  pthread_mutex_lock(&g_phonew.lock);
+  st = g_phonew.st;
+  fresh = g_phonew.fresh;
+  done = g_phonew.done;
+  if(fresh) {
+    memcpy(text, g_phonew.text, sizeof text);
+    g_phonew.fresh = 0;
+  }
+  pthread_mutex_unlock(&g_phonew.lock);
+  if(memcmp(&st, &shown, sizeof st)) {
+    shown = st;
+    ui_phone_status(&st);
+    changed = 1;
+  }
+  if(fresh) {
+    ui_phone_text(text, done);
+    memset(text, 0, sizeof text);
+    changed = 1;
+  }
+  return changed;
 }
 
 
@@ -3181,7 +5607,6 @@ login_frame(void) {
 
 #define HISTORY_PATH  "/data/TwitterPS5/history.bin"
 #define HISTORY_APP_PATH "/app0/history.bin" // when /data is lost, as back from a game
-static const char *const g_history_paths[] = {HISTORY_PATH, HISTORY_APP_PATH};
 #define HISTORY_MAGIC 0x31485754u // "TWH1"
 
 typedef struct history_head {
@@ -3224,6 +5649,107 @@ write_all(int fd, const void *buf, size_t size) {
 }
 
 
+/*
+ * The people the user follows as XPS5 saw them around (src/seen.h): the
+ * account's file, which the payload notes its looks into too, read before
+ * the screen notes one of its own and kept after.
+ */
+
+/**
+ * the account's file into s: 0, also when there is none yet; -1 when it
+ * could not be read (/data out of reach, with a game behind)
+ **/
+static int
+seen_read(int account, seen_t *s) {
+  char path[64], *text;
+  struct stat st;
+  ssize_t n;
+  size_t len = 0;
+  int fd;
+
+  memset(s, 0, sizeof *s);
+  if(seen_path(account, path, sizeof path)) {
+    return -1;
+  }
+  if((fd=open(path, O_RDONLY)) < 0) {
+    return errno == ENOENT && !stat(SETTINGS_SESSION_DIR, &st) ? 0 : -1;
+  }
+  if(!(text=mem_alloc(SEEN_MOST))) {
+    close(fd);
+    return -1;
+  }
+  while(len < SEEN_MOST && (n=read(fd, text + len, SEEN_MOST - len)) > 0) {
+    len += (size_t)n;
+  }
+  close(fd);
+  seen_parse(s, text, len);
+  memset(text, 0, SEEN_MOST);
+  mem_free(text);
+  return 0;
+}
+
+
+/**
+ * what the screen noted, kept in the account's file (written beside it,
+ * then put in its place); only errno goes to the klog
+ **/
+static void
+save_seen(void) {
+  static char out[SEEN_MOST];
+  const seen_t *s;
+  char path[64], fresh[72];
+  long long n;
+  int fd, ok = 0;
+
+  if(!ui_seen_get(&s) || seen_path(g_account, path, sizeof path) ||
+     snprintf(fresh, sizeof fresh, "%s.new", path) >= (int)sizeof fresh) {
+    return;
+  }
+  if((n=seen_format(s, out, sizeof out)) > 0 && (fd=open(fresh, O_WRONLY | O_CREAT | O_TRUNC, 0666)) >= 0) {
+    ok = !write_all(fd, out, (size_t)n);
+    close(fd);
+    ok = ok && !rename(fresh, path);
+    if(!ok) {
+      unlink(fresh);
+    }
+  }
+  if(!ok) {
+    log_line("seen: not kept (errno %d)", errno);
+  }
+  memset(out, 0, sizeof out);
+}
+
+
+/**
+ * the account's file for the screen, as it starts and when the account
+ * changes
+ **/
+static void
+load_seen(void) {
+  static seen_t s;
+
+  ui_seen_set(seen_read(g_account, &s) ? NULL : &s);
+  log_line("seen: %d people, %d changes", s.count, s.events);
+  memset(&s, 0, sizeof s);
+}
+
+
+/**
+ * an account logged out: who was seen around goes with its session
+ **/
+static void
+forget_seen(int account) {
+  char path[64];
+
+  if(!seen_path(account, path, sizeof path) && unlink(path) && errno != ENOENT) {
+    log_line("seen: the file of account %d stays (errno %d)", account, errno);
+  }
+  if(account == g_account) {
+    ui_seen_set(NULL);
+  }
+}
+
+
 #define ENDS(f) (memchr((f), 0, sizeof (f)) != NULL)
 
 /**
@@ -3258,52 +5784,86 @@ history_post_ok(const x_post_t *p) {
 }
 
 
+/**
+ * History, and Read later (its second tab), as files of whole posts: the
+ * one in /data, or in /app0 when /data is lost (as back from a game)
+ **/
+typedef struct kept_list {
+  const char *what;
+  const char *paths[2];
+  uint32_t    magic;
+  int         max;
+  int       (*get)(const x_post_t **posts, int *changed);
+  void      (*set)(const x_post_t *posts, int count);
+} kept_list_t;
+
+static const kept_list_t g_lists[2] = {
+  {"history", {HISTORY_PATH, HISTORY_APP_PATH}, HISTORY_MAGIC, UI_HISTORY_MAX, ui_history_get, ui_history_set},
+  {"read later", {"/data/TwitterPS5/later.bin", "/app0/later.bin"}, 0x314c5754u /* "TWL1" */, UI_LATER_MAX,
+   ui_later_get, ui_later_set},
+};
+
+
 static void
-load_history(void) {
+load_kept(const kept_list_t *k) {
   history_head_t head;
   x_post_t *posts = NULL;
-  int fd, n = 0, at = settings_newest(g_history_paths, 2); // the one written last
+  int fd, n = 0, at = settings_newest(k->paths, 2); // the one written last
 
-  if(at < 0 || (fd=open(g_history_paths[at], O_RDONLY)) < 0) {
+  if(at < 0 || (fd=open(k->paths[at], O_RDONLY)) < 0) {
     return;
   }
-  if(!read_all(fd, &head, sizeof head) && head.magic == HISTORY_MAGIC && head.size == sizeof *posts &&
-     head.count > 0 && head.count <= UI_HISTORY_MAX && (posts=mem_calloc(head.count, sizeof *posts)) &&
+  if(!read_all(fd, &head, sizeof head) && head.magic == k->magic && head.size == sizeof *posts &&
+     head.count > 0 && head.count <= (uint32_t)k->max && (posts=mem_calloc(head.count, sizeof *posts)) &&
      !read_all(fd, posts, head.count * sizeof *posts)) {
     for(uint32_t i=0; i < head.count; i++) {
       if(history_post_ok(&posts[i])) {
         posts[n++] = posts[i];
       }
     }
-    ui_history_set(posts, n);
+    k->set(posts, n);
   }
   mem_free(posts);
   close(fd);
-  log_line("history: %d posts kept", n);
+  log_line("%s: %d posts kept", k->what, n);
 }
 
 
 static void
-save_history(void) {
+save_kept(const kept_list_t *k) {
   const x_post_t *posts;
-  history_head_t head = {HISTORY_MAGIC, sizeof *posts, 0, 0};
+  history_head_t head = {k->magic, sizeof *posts, 0, 0};
   int changed, fd, ok;
 
-  head.count = (uint32_t)ui_history_get(&posts, &changed);
+  head.count = (uint32_t)k->get(&posts, &changed);
   if(!changed) {
     return;
   }
   mkdir("/data/TwitterPS5", 0777);
-  if((fd=open(HISTORY_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0666)) < 0 &&
-     (fd=open(HISTORY_APP_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0666)) < 0) {
-    log_line("history: not kept (%d)", errno);
+  if((fd=open(k->paths[0], O_WRONLY | O_CREAT | O_TRUNC, 0666)) < 0 &&
+     (fd=open(k->paths[1], O_WRONLY | O_CREAT | O_TRUNC, 0666)) < 0) {
+    log_line("%s: not kept (%d)", k->what, errno);
     return;
   }
   ok = !write_all(fd, &head, sizeof head) && (!head.count || !write_all(fd, posts, head.count * sizeof *posts));
   close(fd);
   if(!ok) {
-    log_line("history: not kept (%d)", errno);
+    log_line("%s: not kept (%d)", k->what, errno);
   }
+}
+
+
+static void
+load_history(void) {
+  load_kept(&g_lists[0]);
+  load_kept(&g_lists[1]);
+}
+
+
+static void
+save_history(void) {
+  save_kept(&g_lists[0]);
+  save_kept(&g_lists[1]);
 }
 
 
@@ -3320,6 +5880,8 @@ main(void) {
   unsigned keys;
   int lang = 0, ret, kind, loaders = 0, dirty = 1, budget, replying = 0, sticks[4];
   int tv_w = 0, tv_h = 0, workers;
+  int want_week = 0, want_trophies = 0; // for the game's thread, when it starts next
+  int week_card = 0; // the week asked for is for its card
   float scale;
   uint64_t tick, ticked;
 
@@ -3327,6 +5889,8 @@ main(void) {
   pthread_mutex_init(&g_tid_lock, NULL);
   pthread_mutex_init(&g_notify_lock, NULL);
   mem_use(map_flexible, unmap_flexible);
+  xcrypt_init(login_random); // X Chat's cryptography (nonces, blinding) from the system random
+  xchat_open_install();      // so xchat.c opens the messages once the account's key is in hand
   sceSystemServiceParamGetInt(1, &lang);
   ret = settings_load(&g_settings, settings_paths, 2);
   log_line("settings: file %d, language %d of the PS5's %d", ret, g_settings.lang, lang);
@@ -3348,6 +5912,7 @@ main(void) {
   if(ui_init(&g_settings, settings_lang_of_system(lang))) {
     halt("fonts", -1);
   }
+  ui_motion(); // XPS5's letters on the way in, and the pages' transitions
   x_set_language(settings_lang_code(ui_lang()));
   {
     // the login window, while its engine is on the console
@@ -3360,10 +5925,14 @@ main(void) {
   scePadInit();
   ime_set_log(log_line);
   player_init(log_line);
+  player_files(media_read); // the composer plays a clip of the PS5's; X Chat's videos and voice notes
   sound_init(log_line);
+  space_init(log_line, tell_payload); // the payload plays it when it can: over a game too
   g_account = g_settings.account;
   session_info();
   load_history();
+  load_seen();
+  xchat_load_key(g_settings.ids[g_account - 1]); // the account's X Chat key, when it was kept
 
   // the pictures get an eighth of the flexible memory left, up to
   // IMAGE_BUDGET for each 1080p's worth of pixels
@@ -3391,6 +5960,7 @@ main(void) {
     ui_update(XPS5_UPDATE_URL[0] ? UI_UPDATE_NONE : UI_UPDATE_OFF, NULL, 0, ERR_NONE, 0);
   }
 
+  g_badge.want_back = 1; // opened by a toast's Open, maybe
   ticked = sceKernelGetProcessTime();
   for(;;) {
     g_frame++;
@@ -3400,15 +5970,53 @@ main(void) {
     ticked = tick;
     // the keyboard has the controller while it is up
     keys = read_pad(sticks);
+    // the PS5's keyboard has the controller too: coming back from it is no toast's Open
+    g_pad_keyboard |= g_pad_taken && replying;
     if(!replying && ((keys && ui_keys(keys)) | ui_sticks(sticks[0], sticks[1], sticks[2], sticks[3]))) {
       dirty = 1;
+    }
+    // a Space in the background goes quiet while a video plays its sound
+    {
+      player_status_t ps;
+      player_status(&ps);
+      space_hush(ps.sound && ps.has_audio && (ps.state == PLAYER_PLAYING || ps.state == PLAYER_LOADING));
+    }
+    // a Space the payload kept playing while XPS5 was closed: the one playing
+    {
+      x_space_t found;
+      if(space_found(&found)) {
+        ui_space(&found);
+        dirty = 1;
+      }
     }
     // the game that runs, now and then, once the payload answers
     // back in front after the game (the PS5 stops an app behind another):
     // the game and a capture it offered, asked at once
     if((long long)time(NULL) - g_game.seen >= 3) {
       g_game.asked = 0;
+      g_badge.want_back = 1; // maybe by a toast's Open
     }
+    if(g_pad_back) {
+      // back from the PS5's control center, which a toast's Open goes through
+      g_badge.want_back |= !g_pad_keyboard;
+      g_pad_back = g_pad_keyboard = 0;
+    }
+    // the week's card and the trophies' sheet: asked at once; the week for
+    // the card of the user's own profile too
+    if(ui_week_wanted()) {
+      want_week = week_card = 1;
+      g_game.asked = 0;
+    }
+    if(ui_week_info_wanted()) {
+      want_week = 1;
+      g_game.asked = 0;
+    }
+    if(ui_trophies_wanted()) {
+      want_trophies = 1;
+      g_game.asked = 0;
+    }
+    // a card drawn: a JPEG (or a voice note's MP4), kept for the composer
+    card_job_step(&dirty);
     g_game.seen = (long long)time(NULL);
     if(__atomic_load_n(&g_game.state, __ATOMIC_ACQUIRE) == FETCH_DONE) {
       ui_game(g_game.id, g_game.name);
@@ -3422,6 +6030,23 @@ main(void) {
         ui_shot(&g_game.shot);
         memset(&g_game.shot, 0, sizeof g_game.shot);
       }
+      if(g_game.troph_count != TROPHIES_NOT_READ) {
+        ui_trophies(g_game.troph_id, g_game.troph_rows, g_game.troph_count);
+        mem_free(g_game.troph_rows);
+        g_game.troph_rows = NULL;
+      }
+      if(g_game.session_ok) {
+        ui_session(&g_game.session);
+        g_game.session_ok = 0;
+      }
+      if(g_game.week_ok) {
+        ui_week_info(g_game.week_ok > 0 ? &g_game.week : NULL);
+        if(week_card) {
+          ui_week(g_game.week_ok > 0 ? &g_game.week : NULL);
+          week_card = 0;
+        }
+        g_game.week_ok = 0;
+      }
       __atomic_store_n(&g_game.state, FETCH_IDLE, __ATOMIC_RELEASE);
       dirty = 1;
     } else if(__atomic_load_n(&g_game.state, __ATOMIC_ACQUIRE) == FETCH_IDLE &&
@@ -3429,14 +6054,46 @@ main(void) {
               (long long)time(NULL) - g_game.asked >= GAME_EVERY) {
       g_game.asked = (long long)time(NULL);
       g_game.share = g_settings.share;
+      g_game.want_week = want_week;
+      g_game.want_trophies = want_trophies;
+      want_week = want_trophies = 0;
       g_game.state = FETCH_RUNNING;
       if(!start_thread(game_main, &g_game, 64 << 10)) {
         g_game.state = FETCH_IDLE;
       }
     }
+    // the bar's counts, often (the payload is on this PS5). Coming back, the
+    // app stays where it was left: the PS5 does not say whether a toast's
+    // Open brought it, and a toast in the last minute and a half sent the
+    // user to Chat each time they came back (2026-11-21), so the payload's
+    // guess is only logged
+    if(__atomic_load_n(&g_badge.state, __ATOMIC_ACQUIRE) == FETCH_DONE) {
+      if(g_badge.ok) {
+        ui_badges(g_badge.notices, g_badge.chats, g_badge.news);
+        if(g_badge.open) {
+          log_line("back after a toast of %s: staying", g_badge.open == 1 ? "notifications" : "chat");
+        }
+        dirty = 1;
+      }
+      __atomic_store_n(&g_badge.state, FETCH_IDLE, __ATOMIC_RELEASE);
+    } else if(__atomic_load_n(&g_badge.state, __ATOMIC_ACQUIRE) == FETCH_IDLE &&
+              __atomic_load_n(&g_payload_ready, __ATOMIC_ACQUIRE) &&
+              (g_badge.want_back || (long long)time(NULL) - g_badge.asked >= BADGE_EVERY)) {
+      g_badge.asked = (long long)time(NULL);
+      g_badge.seen = ui_badges_seen();
+      ui_badges_open(g_badge.conv[0], g_badge.conv[1], sizeof g_badge.conv[0]);
+      g_badge.back = g_badge.want_back;
+      g_badge.state = FETCH_RUNNING;
+      if(start_thread(badge_main, &g_badge, 32 << 10)) {
+        g_badge.want_back = 0;
+      } else {
+        g_badge.state = FETCH_IDLE;
+      }
+    }
     if((ret=ui_logout_take())) {
       // logged out from the bar's menu, before anything is read with that session again
       login_forget(ret);
+      forget_seen(ret);
       dirty = 1;
     }
     if(ui_account() != g_account) {
@@ -3444,12 +6101,21 @@ main(void) {
       g_account = ui_account();
       log_line("account %d", g_account);
       session_info();
+      load_seen();
+      xchat_load_key(g_settings.ids[g_account - 1]); // its own X Chat key, or none
     }
     if(__atomic_load_n(&g_fetch.state, __ATOMIC_ACQUIRE) == FETCH_DONE) {
+      if(g_fetch.req.feed == UI_DM && g_fetch.party_count) {
+        ui_party(g_fetch.req.id, g_fetch.party, g_fetch.party_count);
+      }
+      if(g_fetch.seen_ok) {
+        ui_seen_set(&g_fetch.seen); // as the payload left it, for the look to be noted into
+      }
       ui_result(&g_fetch.req, g_fetch.posts, g_fetch.count, g_fetch.next,
                 g_fetch.has_user ? &g_fetch.user : NULL, g_fetch.error, g_fetch.code, g_fetch.x_code,
                 time(NULL));
       g_fetch.posts = NULL;
+      save_seen();
       __atomic_store_n(&g_fetch.state, FETCH_IDLE, __ATOMIC_RELEASE);
       dirty = 1;
     }
@@ -3467,7 +6133,7 @@ main(void) {
       if(kind == UI_ACT_CAPTURES) {
         start_listing();
       } else if(kind != UI_ACT_SEARCH && kind != UI_ACT_COMPOSE_TEXT && kind != UI_ACT_DM_TEXT &&
-                kind != UI_ACT_POLL_TEXT && kind != UI_ACT_GROK_TEXT) {
+                kind != UI_ACT_POLL_TEXT && kind != UI_ACT_GROK_TEXT && kind != UI_ACT_XCHAT_PIN) {
         start_action(kind, id, user);
         sent = -1;
       } else if((ret=open_keyboard(kind, user))) {
@@ -3491,10 +6157,14 @@ main(void) {
         ui_dm_text(reply); // sent next, when it has words
       } else if(ret == IME_DONE && replying == UI_ACT_GROK_TEXT) {
         ui_grok_text(reply); // asked next, when it has words
+      } else if(ret == IME_DONE && replying == UI_ACT_XCHAT_PIN && reply[0]) {
+        start_unlock(id, reply); // recovers the X Chat keys on its thread
+        sent = -1;
       } else {
         ui_action_done(ret == IME_FAILED ? ERR_KEYBOARD : ERR_CANCELLED, 0, -1);
       }
       replying = 0;
+      xcrypt_wipe(reply, sizeof reply); // the PIN is not left in the buffer
       memset(reply, 0, sizeof reply);
       dirty = 1;
     }
@@ -3537,6 +6207,16 @@ main(void) {
         ui_grok_answer(g_action.answer);
         memset(g_action.answer, 0, sizeof g_action.answer);
       }
+      if(g_action.kind == UI_ACT_SPACE) {
+        if(!g_action.error) {
+          // its sound from X's video CDN, with no X session (space.h)
+          space_play(g_action.answer, g_action.space.state == X_SPACE_LIVE,
+                     g_action.space.id[0] ? g_action.space.id : g_action.id, g_action.space.host);
+          ui_space(&g_action.space);
+        }
+        memset(g_action.answer, 0, sizeof g_action.answer);
+        memset(&g_action.space, 0, sizeof g_action.space);
+      }
       ui_action_done(g_action.error, g_action.code, g_action.x_code);
       memset(g_action.text, 0, sizeof g_action.text);
       __atomic_store_n(&g_action.state, FETCH_IDLE, __ATOMIC_RELEASE);
@@ -3562,6 +6242,10 @@ main(void) {
     if(link_frame()) {
       dirty = 1;
     }
+    // what the phone writes, while its window is open
+    if(phone_frame()) {
+      dirty = 1;
+    }
     // the login window, while it is open
     if(login_frame()) {
       dirty = 1;
@@ -3579,9 +6263,13 @@ main(void) {
     if(g_frame % 4 == 0) { // the light bar after the banner
       light_pad();
     }
+    rumble_pad(); // its motors, to the millisecond
     if(g_frame % 600 == 300) { // a session file put there by FTP, every ten seconds
       session_info();
     }
+    test_mic(&dirty);
+    tape_voice(&dirty);
+    dictate_step(&dirty);
 
     if(dirty) {
       float pan;

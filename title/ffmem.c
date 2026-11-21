@@ -2,7 +2,8 @@
 a few MiB, which one H.264 decoder alone outgrows, and a thread whose creator
 names no stack size gets 64 KiB on the PS5 (BrowserPS5 found both). So
 build-title.sh renames FFmpeg's calls of malloc, realloc, free,
-posix_memalign and pthread_create, in its copy of the archives, to these:
+posix_memalign and pthread_create, in its copy of the archives, to these
+(and jxrlib's malloc, calloc, realloc and free, for the HDR screenshots):
 the memory comes through mem.h (the big blocks from the flexible memory), and
 each thread FFmpeg starts gets 512 KiB. */
 
@@ -25,6 +26,7 @@ typedef struct head {
 
 void *ff_sys_malloc(size_t size);
 void *ff_sys_realloc(void *p, size_t size);
+void *ff_sys_calloc(size_t count, size_t size);
 void ff_sys_free(void *p);
 int ff_sys_posix_memalign(void **out, size_t align, size_t size);
 int ff_sys_pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*fn)(void *),
@@ -85,6 +87,20 @@ ff_sys_realloc(void *p, size_t size) {
   memcpy(q, p, old < size ? old : size);
   ff_sys_free(p);
   return q;
+}
+
+
+void *
+ff_sys_calloc(size_t count, size_t size) {
+  void *p;
+
+  if(size && count > SIZE_MAX / size) {
+    return NULL;
+  }
+  if((p=ff_sys_malloc(count * size))) {
+    memset(p, 0, count * size);
+  }
+  return p;
 }
 
 

@@ -1,0 +1,156 @@
+/* The colours of XPS5 (see src/linkpage/link.css): a warm dark glass with
+   an orange accent, and a light version. */
+:root {
+  color-scheme: dark;
+  --bg: #241d19;
+  --panel: #382f29;
+  --line: rgba(255, 255, 255, 0.14);
+  --fg: #f8f5f2;
+  --grey: #c8beb6;
+  --accent: #f27a1a;
+  --on-accent: #ffffff;
+  --bad: #ff6b5b;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+    --bg: #f4ede6;
+    --panel: #fffaf6;
+    --line: rgba(56, 47, 41, 0.16);
+    --fg: #2a211c;
+    --grey: #6b5f57;
+    --accent: #c85a00;
+    --bad: #b3261e;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 17px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+main {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: max(16px, env(safe-area-inset-top)) 16px max(24px, env(safe-area-inset-bottom));
+}
+
+header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.brand {
+  margin: 0;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: var(--accent);
+}
+
+.status {
+  margin: 0;
+  font-size: 14px;
+  color: var(--grey);
+  text-align: right;
+}
+
+.status.on::before {
+  content: "";
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: #2fbf71;
+  vertical-align: 1px;
+}
+
+h1 {
+  margin: 16px 0 12px;
+  font-size: 24px;
+  line-height: 1.25;
+}
+
+.box { display: block; }
+
+textarea {
+  display: block;
+  width: 100%;
+  min-height: 40vh;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--panel);
+  color: var(--fg);
+  font: inherit;
+  font-size: 18px;
+  resize: vertical;
+}
+
+textarea:focus {
+  outline: 3px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.count {
+  font-variant-numeric: tabular-nums;
+  color: var(--grey);
+}
+
+.count.over { color: var(--bad); font-weight: 700; }
+
+.send {
+  min-height: 48px;
+  padding: 0 22px;
+  border: 0;
+  border-radius: 24px;
+  background: var(--accent);
+  color: var(--on-accent);
+  font: inherit;
+  font-weight: 700;
+}
+
+.send:disabled { opacity: 0.45; }
+
+.send:focus-visible {
+  outline: 3px solid var(--fg);
+  outline-offset: 2px;
+}
+
+.hint {
+  margin: 16px 0 0;
+  font-size: 15px;
+  color: var(--grey);
+}
+
+.error {
+  margin: 12px 0 0;
+  color: var(--bad);
+  font-weight: 600;
+}
+
+.sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}

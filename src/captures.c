@@ -1,6 +1,9 @@
-/* The PS5's captures, see captures.h. The folders are walked with getdents,
-which libkernel has for the title and the payloads alike, and lstat; the
-host tests walk theirs with readdir (CAPTURES_HOST_DIR). */
+/* The PS5's captures, see captures.h. The folders are walked with readdir
+in the payloads (CAPTURES_READDIR) and in the host tests (CAPTURES_HOST_DIR),
+and with getdents, which libkernel has, in the title, which keeps clear of
+the system libc's opendir; lstat says what each name is. On the console,
+getdents with the walk's 16 KiB answered EINVAL in /user/av_contents' folders
+(2026-11-13), and the payload's readdir reads them. */
 
 #define _DEFAULT_SOURCE // lstat on the host
 
@@ -13,7 +16,8 @@ host tests walk theirs with readdir (CAPTURES_HOST_DIR). */
 
 #include <sys/stat.h>
 
-#ifdef CAPTURES_HOST_DIR
+#if defined(CAPTURES_HOST_DIR) || defined(CAPTURES_READDIR)
+#define CAPTURES_DIRENT
 #include <dirent.h>
 #endif
 
@@ -130,6 +134,9 @@ kind_under(const char *root, const char *path) {
   if(ends_with(path, ".webm")) {
     return CAPTURE_WEBM;
   }
+  if(ends_with(path, ".jxr")) {
+    return CAPTURE_JXR; // the PS5's screenshot of a game in HDR
+  }
   return -1;
 }
 
@@ -148,7 +155,10 @@ typedef struct walk {
   const char *root;
   capture_t  *list;
   int         count, max;
-#ifdef CAPTURES_HOST_DIR
+  void      (*each)(void *ctx, const capture_t *c); // when set, every file goes there, not to list
+  void       *ctx;
+  capture_t   one;
+#ifdef CAPTURES_DIRENT
   DIR        *dir;
 #else
   int         fd, n, at;
@@ -157,7 +167,7 @@ typedef struct walk {
 } walk_t;
 
 
-#ifdef CAPTURES_HOST_DIR
+#ifdef CAPTURES_DIRENT
 
 static int
 dir_open(walk_t *w, const char *dir) {
@@ -167,9 +177,13 @@ dir_open(walk_t *w, const char *dir) {
 
 static int
 dir_next(walk_t *w, const char **name, size_t *len) {
-  struct dirent *e = readdir(w->dir);
+  struct dirent *e;
 
-  if(!e) {
+  errno = 0;
+  if(!(e=readdir(w->dir))) {
+    if(errno) {
+      captures_stats.error = errno;
+    }
     return 0;
   }
   *name = e->d_name;
@@ -316,7 +330,16 @@ walk(walk_t *w, const char *dir, int depth, int skip_thumbnails) {
       used += len + 1;
     } else if(S_ISREG(st.st_mode)) {
       captures_stats.files++;
-      if((kind=kind_under(w->root, path)) >= 0) {
+      kind = kind_under(w->root, path);
+      if(w->each) {
+        memset(&w->one, 0, sizeof w->one);
+        snprintf(w->one.path, sizeof w->one.path, "%s", path);
+        w->one.time = (long long)st.st_mtime;
+        w->one.size = (long long)st.st_size;
+        w->one.kind = kind;
+        captures_stats.kept += kind >= 0;
+        w->each(w->ctx, &w->one);
+      } else if(kind >= 0) {
         keep(w, path, &st, kind);
       }
     }
@@ -372,18 +395,17 @@ captures_list(capture_t *list, int max) {
 }
 
 
-int
-captures_newest_of(const char *root, const char *game, capture_t *out) {
+/**
+ * the newest capture in root's photo/<below> and video/<below> (all of
+ * them for an empty below), their folders taken as depth deep
+ **/
+static int
+newest_under(const char *root, const char *below, int depth, capture_t *out) {
   static const char *const kinds[] = {"photo", "video"};
-  size_t len = strlen(game);
   char dir[CAPTURE_PATH];
   walk_t *w;
   int found;
 
-  memset(out, 0, sizeof *out);
-  if(len < 4 || len > 16 || strspn(game, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") != len) {
-    return -1;
-  }
   if(!(w=calloc(1, sizeof *w)) || !(w->list=malloc(sizeof *w->list))) {
     free(w);
     return -1;
@@ -392,8 +414,8 @@ captures_newest_of(const char *root, const char *game, capture_t *out) {
   w->max = 1; // keep() holds the newest
   memset(&captures_stats, 0, sizeof captures_stats);
   for(size_t i=0; i < sizeof kinds / sizeof kinds[0]; i++) {
-    snprintf(dir, sizeof dir, "%s/%s/%s/%s", root, kinds[i], CAPTURES_APP, game);
-    walk(w, dir, 3, 0);
+    snprintf(dir, sizeof dir, "%s/%s%s%s", root, kinds[i], below[0] ? "/" : "", below);
+    walk(w, dir, depth, 0);
   }
   found = w->count > 0;
   if(found) {
@@ -402,6 +424,59 @@ captures_newest_of(const char *root, const char *game, capture_t *out) {
   free(w->list);
   free(w);
   return found;
+}
+
+
+int
+captures_newest_of(const char *root, const char *game, capture_t *out) {
+  size_t len = strlen(game);
+  char below[64];
+
+  memset(out, 0, sizeof *out);
+  if(len < 4 || len > 16 || strspn(game, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") != len) {
+    return -1;
+  }
+  snprintf(below, sizeof below, "%s/%s", CAPTURES_APP, game);
+  return newest_under(root, below, 3, out);
+}
+
+
+int
+captures_newest_any(const char *root, capture_t *out) {
+  memset(out, 0, sizeof *out);
+  return newest_under(root, "", 1, out);
+}
+
+
+int
+captures_each(const char *root, void (*each)(void *ctx, const capture_t *c), void *ctx) {
+  char dir[CAPTURE_PATH];
+  struct stat st;
+  walk_t *w;
+  int files;
+
+  memset(&captures_stats, 0, sizeof captures_stats);
+  if(stat(root, &st)) {
+    captures_stats.error = errno;
+    return -1;
+  }
+  if(!(w=calloc(1, sizeof *w))) {
+    return -1;
+  }
+  w->root = root;
+  w->each = each;
+  w->ctx = ctx;
+  snprintf(dir, sizeof dir, "%s/photo", root);
+  walk(w, dir, 1, 0);
+  snprintf(dir, sizeof dir, "%s/video", root);
+  walk(w, dir, 1, 0);
+  if(!captures_stats.folders) {
+    walk(w, root, 0, 1);
+  }
+  files = captures_stats.files;
+  memset(w, 0, sizeof *w);
+  free(w);
+  return files;
 }
 
 

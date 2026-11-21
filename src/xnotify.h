@@ -57,6 +57,29 @@ int xnotify_fresh(xnotify_t *n, const x_post_t *posts, int count, int *fresh, in
 void xnotify_toast(const x_post_t *p, int lang, xnotify_toast_t *t);
 
 /**
+ * the conversations of an inbox (x_dm_inbox's, newest first, count of them)
+ * whose last message came from someone else, is unread and came since the
+ * last reading: the ones that cannot be news (read, the user's own last,
+ * message requests) are dropped from chats, which keeps the rest in their
+ * order and their number in count; up to max of their indexes in fresh,
+ * newest first; returns how many are new. The first reading only remembers.
+ **/
+int xnotify_dm_fresh(xnotify_t *n, x_post_t *chats, int *count, int *fresh, int max);
+
+/**
+ * how many of posts (count of them) came after since, X's time: a count of
+ * the app's bar; the newest time among them is kept in *newest when later
+ **/
+int xnotify_newer(const x_post_t *posts, int count, long long since, long long *newest);
+
+/**
+ * what the toast for the last message of the conversation p says, in lang
+ * (LANG_* of settings.h): who wrote and what, a game's invite and a request
+ * to join by their game
+ **/
+void xnotify_dm_toast(const x_post_t *p, int lang, xnotify_toast_t *t);
+
+/**
  * among posts (count, as UserTweets answers), the one of the user with the
  * number user_id rising at the Unix time now, and not said before: under a
  * day old, with 50 likes or more, and getting likes, reposts and replies

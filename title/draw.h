@@ -64,6 +64,10 @@ enum {
   ICON_EYE_OFF,   // an eye crossed out: a post covered for its spoilers
   ICON_LIGHT,     // a bulb: the controller's light bar
   ICON_CUP,       // a cup with its steam: a break
+  ICON_TROPHY,    // a cup with two handles on its foot: the trophies
+  ICON_MIC,       // a microphone on its stand: a voice note
+  ICON_PHONE,     // a phone: writing on it (phone.h)
+  ICON_DICTATE,   // a small microphone beside lines of text: dictation
   ICON_PAD_BODY,  // a DualSense-like controller, in layers of their own colours:
   ICON_PAD_CORE,  //   its body; the black middle; the sticks and the PS button;
   ICON_PAD_STICKS,//   the D-pad and the face buttons; the light bar beside the
@@ -150,3 +154,35 @@ void draw_arc(const text_surface_t *dst, float cx, float cy, float r, float t,
  * an icon filling the size x size square at x, y; at most 256 pixels
  **/
 void draw_icon(const text_surface_t *dst, int icon, int x, int y, int size, uint32_t color);
+
+/**
+ * the picture's pixels, w x h, with their colour times their alpha
+ * (premultiplied), as draw_picture_zoom takes them
+ **/
+void draw_premultiply(uint32_t *pixels, int w, int h);
+
+/**
+ * a premultiplied picture of w x h at half its size, (w + 1) / 2 x
+ * (h + 1) / 2, each pixel the mean of the four under it; malloc'd, or NULL
+ **/
+uint32_t *draw_half(const uint32_t *pixels, int w, int h);
+
+/**
+ * a premultiplied picture of pw x ph pixels over a box of w x h pixels
+ * whose middle is the pixel cx, cy (the box may be far bigger than the
+ * screen): each pixel mixes the picture's four under it, and the whole is
+ * seen through alpha, 0..256
+ **/
+void draw_picture_zoom(const text_surface_t *dst, float cx, float cy, float w, float h,
+                       const uint32_t *pixels, int pw, int ph, unsigned alpha);
+
+/**
+ * the box x, y, w, h (points) of dst, a frame just drawn, mixed with old,
+ * the frame before (both the screen's size in pixels): old weighs 256 - a,
+ * the new frame a, which comes shifted by dx, dy pixels. back, when not
+ * NULL, is what the new frame was drawn on, so the shift moves only what
+ * differs from it; scratch (the screen's size) keeps the new frame's box
+ * while it is shifted, needed only for a shift
+ **/
+void draw_mix(const text_surface_t *dst, int x, int y, int w, int h, const uint32_t *old,
+              const uint32_t *back, uint32_t *scratch, int dx, int dy, unsigned a);
